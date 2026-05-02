@@ -64,6 +64,20 @@ python -m banger run ./test_photos -r --output ~/Pictures/bangers/2026-05-02 --t
 
 Writes top-N (default 10, env `BANGER_TOP_N`) developed JPEGs into the directory along with a `manifest.json` recording rank, source path, scores, picked preset, and which develop method was used. Filenames are `NN_subdir__stem.jpg` so the directory listing IS the ranked output.
 
+`--output` defaults to `$BANGER_OUTPUT_DIR`; if the env value ends in `/`, `\` or `bangers`, a `YYYY-MM-DD/` subdir is appended so the canonical setup `BANGER_OUTPUT_DIR=~/Pictures/bangers` produces a fresh dated folder per run.
+
+### Face-aware sharpness gate (opt-in)
+
+```sh
+python -m banger run ./test_photos -r --face-gate
+```
+
+Adds a second sharpness check: for any frame where a face is detected, the *sharpest face crop* must also pass `face.FACE_SHARPNESS_THRESHOLD` (default 50). Catches the classic missed-focus portrait that the global Laplacian gate lets through because the background is sharp.
+
+### Re-run speed
+
+The first `banger run` over a folder loads previews, computes Laplacian variance, embeds via CLIP, computes pHash + EXIF timestamp + (optionally) face data, and caches everything keyed by sha256. Subsequent runs over the same content skip preview decoding entirely and run in ~1/7th the wall-clock time. Delete `~/.local/share/banger-pipeline/metadata/` to force re-compute.
+
 ### CLI alternative for labelling
 
 If you'd rather label from the terminal:
@@ -88,8 +102,8 @@ Python 3.11+, gphoto2 (Linux), rawpy, PyTorch + CUDA, transformers (CLIP ViT-B/3
 - `CLAUDE.md` — design doc, scope, non-goals, risks.
 - `plan.md` — execution plan, ordered. ✓ marks done, ✗ deferred.
 - `presets/` — hand-tuned darktable `.xmp` sidecars, one per treatment prompt. Build these in darktable and drop them in here.
-- `src/banger/` — pipeline modules: `preview`, `frames`, `sharpness`, `aesthetic`, `dedup`, `scenes`, `develop`, `taste_head`, `state`, `report`, `server`, `cli`.
-- `tests/` — pytest suite (62 tests, ~4 s).
+- `src/banger/` — pipeline modules: `preview`, `frames`, `sharpness`, `aesthetic`, `dedup`, `scenes`, `face`, `develop`, `taste_head`, `state`, `report`, `server`, `cli`.
+- `tests/` — pytest suite (89 tests, ~6 s).
 
 ## Running tests
 

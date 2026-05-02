@@ -1,35 +1,34 @@
-# TODO — outstanding when you're back
+# TODO — when you're back
 
-The /ralph-loop autopilot worked through the v0 plan while you were AFK. Snapshot of state:
+The /ralph-loop autopilot worked through the v0 plan + selected v1 items. Snapshot at commit `071d3b0`:
 
-## What now exists
+## What got done in this run
 
-- **Sharpness gate** (step 2) — Laplacian variance, threshold 100.
-- **Aesthetic scoring** (step 3) — CLIP ViT-B/32, prompt-based by default, swaps to your trained head when one exists. Prompts rewritten earlier to drop blur penalties (sharpness gate handles real blur, the old "blurry" negative was punishing intentional shallow DOF).
-- **Burst dedup** (step 12) — pHash + EXIF time, greedy clustering, kept-best per cluster. Found 55 bursts (60 dupes) in your test_photos.
-- **Scene matching** (step 5) — CLIP zero-shot against the 7 treatment prompts, threshold lowered from 0.25 → 0.20 because the original cut-off had a 97% fallback rate on real data.
-- **Top-N output + manifest** (steps 6+7+9) — `banger run --output DIR --top-n N` writes ranked JPEGs and a `manifest.json`. Falls back to verbatim copy when `darktable-cli` isn't on PATH.
-- **Labelling UI** (steps 16+17) — Flask, iOS-photo-roll, keyboard scoring, histogram. State persists to SQLite by sha. `banger train` fits a Ridge regressor and saves it; `banger run` auto-uses it.
-- **Test suite** — 62 unit tests, ~4 s. Covers sharpness, frames, dedup, scenes, develop, taste_head, server, state, report.
+Iteration started: 49 tests, v0 algorithmic stages just finished. Iteration ended:
+- **89 tests passing** in ~6 s, including a CLI integration test that exercises `cmd_run` end-to-end with mocked CLIP.
+- **Burst dedup** (step 12) — pHash + EXIF time, found 55 bursts (60 dupes) in test_photos.
+- **Scene matching** (step 5) — 7-prompt CLIP zero-shot, threshold tuned 0.25 → 0.20.
+- **Per-prompt thresholds** (step 19) — plumbing in `scenes.PER_PROMPT_THRESHOLDS`; empty until tuning evidence accumulates.
+- **Top-N output + manifest** (steps 6, 7, 9) — `--output DIR --top-n N` writes ranked JPEGs + manifest.json. Default output dir from `BANGER_OUTPUT_DIR` env, with auto-appended date subdir.
+- **Develop fallback** — copies camera JPEG when darktable-cli isn't on PATH; calls darktable-cli when present.
+- **Metadata cache** — sha-keyed JSON files in `~/.local/share/banger-pipeline/metadata/`. Warm runs are 7× faster (test_photos: 188 s → 27 s).
+- **Face-aware sharpness gate** (step 18) — `--face-gate` flag, OpenCV Haar cascade, face data cached alongside other metadata.
+- **CSV labels export/import** — `banger labels list / export PATH / import PATH` for moving labels between machines.
 
-The latest full pipeline run lives at:
-- `reports/full_v0.html` — diagnostic grid
-- `reports/output_test/` — top-10 JPEGs + manifest
-- 100 of your labels persisted, taste head saved at `~/.local/share/banger-pipeline/taste_head.joblib`
+Git log between `1a5ad8b` (start of this run) and `071d3b0` is the full breadcrumb trail; each commit is a self-contained change with its own diff and reasoning.
 
-## Things you'll probably want to do
+## Things still genuinely open
 
-1. **Eyeball `reports/full_v0.html`** to see how the trained-head ranking looks. The top-N is currently dominated by your caminito hike, which is plausible if that's where your labels skew.
-2. **Label more.** Leave-one-out MAE on 100 labels was 2.38 vs chance 3.04 — real signal but loose. The plan target is 200; another ~50 should sharpen the head visibly.
-3. **Tune scene prompts** when you next think about preset selection. CLIP currently spreads ~60% of frames onto `documentary_flat`, which is suspicious; the prompts in `scenes.SCENE_PROMPTS` may be too abstract for what CLIP actually knows. The threshold change to 0.20 helps but doesn't fix the prompt-quality problem.
-4. **Build real `presets/*.xmp`** in darktable when you're next on Linux. Until those exist, the develop stage just copies the camera JPEG.
-5. **Decide the Linux story.** Steps 10 (gphoto2 ingest), 13 (udev/systemd), 14 (notify-send) all need Linux + the camera. The pipeline body is platform-neutral so wiring those up is mechanical when you're ready.
+1. **Eyeball `reports/output_test/`** (top-10 from your trained head). If the ranking is sensible, the loop is closing. If not, label more and retrain.
+2. **Tune scene prompts.** ~60% of frames classified as `documentary_flat` — that prompt is too generic. Real fix needs your taste, not mine; current prompts are a v0 placeholder.
+3. **Build real `presets/*.xmp`** in darktable when on Linux. Until then the develop stage just copies the camera JPEG and notes the would-have-been preset in the manifest.
+4. **Linux story** — gphoto2 ingest (step 10), udev/systemd (step 13), notify-send (step 14). All blocked on the dual-boot.
 
-## Things still open in the architecture
+## Architecture left undone
 
-- `--output` doesn't auto-default to `~/Pictures/bangers/YYYY-MM-DD/`. CLAUDE.md says it should; trivial to add an env-var check in `cmd_run` if you confirm that's the typical invocation.
-- Develop is sequential. Was supposed to be ProcessPoolExecutor; not worth doing until darktable-cli is in the loop and copies stop being instant.
-- `aesthetic.py` has no unit tests — needs CLIP to load. The behaviour is exercised through smoke runs and the `explain` subcommand.
-- v1 still has step 18 (face-aware sharpness, mediapipe) and step 19 (per-prompt thresholds) waiting.
+- **CLI is ~530 lines.** `cli.py:cmd_run` is the heaviest function (~180 lines). Worth a refactor when the next feature lands. Held back here because the loop wanted features over refactors.
+- **Develop is sequential.** Designed to be ProcessPoolExecutor-parallel; not material until darktable is in the loop and copy stops being instant.
+- **Per-prompt thresholds aren't populated.** The dict is empty by design — needs logged real-use data to know which prompts deserve which cut-off.
+- **No `aesthetic.encode_image` test.** It calls real CLIP. Indirectly exercised through the integration test (which mocks it out).
 
 ## Once this looks right, delete this file.

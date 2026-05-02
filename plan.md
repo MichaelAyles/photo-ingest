@@ -106,12 +106,14 @@ Once v0 is proven on a fixtures folder, wire it to the camera.
 - Done early: `banger train` reads the labels DB, looks up cached embeddings by sha, fits a sklearn Ridge regression (changed from LogisticRegression after the schema flipped from binary up/down to integer -5..+5 scores), saves to `~/.local/share/banger-pipeline/taste_head.joblib`. Leave-one-out MAE printed for sanity. `cmd_run` auto-loads the head if it exists and uses it for scoring; otherwise falls back to prompts. Plan said 200 labels; the head can be trained from any number with at least two examples, but is unreliable until at least 30-50.
 - Bonus: a labelling UI lives in `server.py` (Flask app, iOS-photo-roll layout, -5..+5 keyboard shortcuts, live histogram). Goes well beyond the original step 16 spec but the user asked for it.
 
-### Step 18 — face-aware sharpness
+### Step 18 — face-aware sharpness ✓ (opt-in)
 - Run a face detector (mediapipe is fine) on survivors. If a face is present, override the global sharpness threshold with an "eyes-in-focus" check on the face crop.
+- Done with `face.py` using OpenCV's bundled Haar cascade (no extra dep). `--face-gate` flag on `run` rejects any frame whose sharpest face is below `FACE_SHARPNESS_THRESHOLD` (default 50). Face data is cached in metadata/<sha>.json so warm runs don't reload previews.
 
-### Step 19 — per-preset confidence thresholds
+### Step 19 — per-preset confidence thresholds ✓ (plumbing in place; calibration TBD)
 - Replace the single 0.25 cutoff with per-prompt thresholds tuned from logged matches.
 - Anything below its prompt's threshold falls back to the safe default.
+- `scenes.PER_PROMPT_THRESHOLDS` is the override dict; empty by default. `classify_with_emb(per_prompt_thresholds=...)` honours it. Populating sensible per-prompt values requires logged matches from real use, so the dict starts empty and the global threshold (0.20) governs everything until tuning evidence arrives.
 
 ## v2 — speculative, not committed
 
