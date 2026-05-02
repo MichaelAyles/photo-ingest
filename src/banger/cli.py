@@ -109,6 +109,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Train a Ridge taste head on labelled CLIP embeddings.",
     )
 
+    sub.add_parser(
+        "version",
+        help="Print package version + key dep versions + state-dir summary.",
+    )
+
     labels = sub.add_parser("labels", help="Inspect / export / import the label DB.")
     labels_sub = labels.add_subparsers(dest="labels_action", required=True)
     labels_sub.add_parser("list", help="Print all labels as a table.")
@@ -681,6 +686,63 @@ def cmd_cache_clear(kinds: list[str], all_caches: bool) -> int:
     return 0
 
 
+def cmd_version() -> int:
+    import sys
+
+    from banger import __version__
+
+    print(f"banger {__version__}")
+    print(f"python {sys.version.split()[0]} ({sys.executable})")
+
+    deps = []
+    for mod_name, label in (
+        ("torch", "torch"),
+        ("transformers", "transformers"),
+        ("cv2", "opencv-python"),
+        ("rawpy", "rawpy"),
+        ("imagehash", "imagehash"),
+        ("sklearn", "scikit-learn"),
+        ("flask", "flask"),
+    ):
+        try:
+            mod = __import__(mod_name)
+            ver = getattr(mod, "__version__", "?")
+            deps.append(f"  {label}: {ver}")
+        except ImportError:
+            deps.append(f"  {label}: (not installed)")
+    print("dependencies:")
+    print("\n".join(deps))
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            print(f"cuda: {torch.cuda.get_device_name(0)}")
+        else:
+            print("cuda: (not available)")
+    except ImportError:
+        pass
+
+    dt = develop_mod.find_darktable()
+    print(f"darktable-cli: {dt or '(not found)'}")
+
+    head = taste_head.exists()
+    labels = state.labels_dict()
+    pos = sum(1 for s in labels.values() if s > 0)
+    zero = sum(1 for s in labels.values() if s == 0)
+    neg = sum(1 for s in labels.values() if s < 0)
+    stats = state.cache_stats()
+    print(f"taste head: {'present' if head else 'absent'}")
+    print(f"labels: {len(labels)} total ({pos} positive, {zero} zero, {neg} negative)")
+    print(
+        f"caches: embeddings={stats['embeddings']['count']}, "
+        f"thumbs={stats['thumbs']['count']}, "
+        f"previews={stats['previews']['count']}, "
+        f"metadata={stats['metadata']['count']}"
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
@@ -713,6 +775,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_cache_stats()
         if args.cache_action == "clear":
             return cmd_cache_clear(args.kind, args.all)
+    if args.command == "version":
+        return cmd_version()
     return 1
 
 
