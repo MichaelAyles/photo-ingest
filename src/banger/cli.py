@@ -5,7 +5,9 @@ import sys
 import time
 from pathlib import Path
 
-from banger import aesthetic, dedup, scenes, server, state, taste_head
+import os
+
+from banger import aesthetic, dedup, develop as develop_mod, scenes, server, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
 from banger.frames import discover_frames
@@ -13,6 +15,9 @@ from banger.preview import load_preview
 from banger.report import Row, encode_thumbnail, write_report
 from banger.sharpness import CONFIG as SHARPNESS_CONFIG
 from banger.sharpness import sharpness_from_preview
+
+DEFAULT_TOP_N = int(os.environ.get("BANGER_TOP_N", "10"))
+PRESETS_DIR = Path(__file__).resolve().parent.parent.parent / "presets"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -27,6 +32,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Write a self-contained HTML preview report to this path.",
+    )
+    run.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write top-N developed frames (and manifest.json) into this directory.",
+    )
+    run.add_argument(
+        "--top-n",
+        type=int,
+        default=DEFAULT_TOP_N,
+        help=f"Number of frames to write to --output (default {DEFAULT_TOP_N}, env BANGER_TOP_N).",
     )
 
     explain = sub.add_parser(
@@ -65,7 +82,13 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
+def cmd_run(
+    input_dir: Path,
+    recursive: bool,
+    report_path: Path | None,
+    output_dir: Path | None = None,
+    top_n: int = DEFAULT_TOP_N,
+) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
         log.error("not a directory: %s", input_dir)
@@ -228,7 +251,90 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
     if report_path is not None and rows:
         write_report(report_path, rows, threshold)
         log.info("wrote report: %s", report_path)
+
+    if output_dir is not None:
+        keepers = [r for r in rows if r.sharpness >= threshold and r.cluster_best]
+        keepers.sort(
+            key=lambda r: (r.aesthetic if r.aesthetic is not None else r.sharpness),
+            reverse=True,
+        )
+        top = keepers[:top_n]
+        if not top:
+            log.warning("no frames qualified for output: %s", output_dir)
+        else:
+            _write_output(output_dir, top, presets_dir=PRESETS_DIR)
     return 0
+
+
+def _write_output(output_dir: Path, top_rows: list[Row], presets_dir: Path) -> None:
+    log = logging.getLogger("banger")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    dt_cli = develop_mod.find_darktable()
+    if dt_cli is None:
+        log.info(
+            "darktable-cli not found — copy fallback for top %d to %s",
+            len(top_rows),
+            output_dir,
+        )
+    else:
+        log.info(
+            "developing top %d to %s (darktable-cli: %s, presets: %s)",
+            len(top_rows),
+            output_dir,
+            dt_cli,
+            presets_dir if presets_dir.is_dir() else "(none)",
+        )
+
+    used_counts: dict[str, int] = {}
+    manifest_entries: list[dict] = []
+    for rank, r in enumerate(top_rows, start=1):
+        src = r.frame.develop_path
+        # Output filename: NN_subdir_stem.jpg so the directory listing is sorted
+        # by rank and obviously identifies the source.
+        name_parts = []
+        if r.frame.subdir:
+            name_parts.append(r.frame.subdir.replace("/", "_"))
+        name_parts.append(r.frame.stem)
+        out_name = f"{rank:02d}_{'__'.join(name_parts)}.jpg"
+        dst = output_dir / out_name
+
+        result = develop_mod.develop_to_jpeg(
+            src=src,
+            dst=dst,
+            preset_name=r.scene_preset,
+            presets_dir=presets_dir,
+            darktable_cli=dt_cli,
+        )
+        used_counts[result.used] = used_counts.get(result.used, 0) + 1
+        manifest_entries.append(
+            {
+                "rank": rank,
+                "stem": r.frame.stem,
+                "subdir": r.frame.subdir,
+                "src_path": str(src),
+                "output_path": str(dst.relative_to(output_dir)),
+                "kind": r.frame.kind,
+                "sharpness": round(r.sharpness, 1),
+                "aesthetic": round(r.aesthetic, 3) if r.aesthetic is not None else None,
+                "aesthetic_source": r.aesthetic_source,
+                "scene_preset": r.scene_preset,
+                "scene_score": round(r.scene_score, 4) if r.scene_score is not None else None,
+                "scene_fell_back": r.scene_fell_back,
+                "cluster_size": r.cluster_size,
+                "developed_with": result.used,
+                "develop_note": result.note,
+            }
+        )
+
+    manifest_path = output_dir / "manifest.json"
+    develop_mod.write_manifest(manifest_path, manifest_entries)
+    log.info(
+        "wrote %d frames to %s (%s); manifest at %s",
+        len(top_rows),
+        output_dir,
+        ", ".join(f"{k}={v}" for k, v in used_counts.items()),
+        manifest_path,
+    )
 
 
 def cmd_explain(input_dir: Path, recursive: bool, stems: list[str]) -> int:
@@ -347,7 +453,13 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
     if args.command == "run":
-        return cmd_run(args.input_dir, args.recursive, args.report)
+        return cmd_run(
+            args.input_dir,
+            args.recursive,
+            args.report,
+            output_dir=args.output,
+            top_n=args.top_n,
+        )
     if args.command == "explain":
         return cmd_explain(args.input_dir, args.recursive, args.stems)
     if args.command == "label":
