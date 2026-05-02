@@ -19,7 +19,7 @@ Git log between `1a5ad8b` (start of this run) and `071d3b0` is the full breadcru
 
 ## Things still genuinely open
 
-1. **Eyeball `reports/output_test/`** (top-10 from your trained head). If the ranking is sensible, the loop is closing. If not, label more and retrain.
+1. **Open `reports/final.html`** — the latest full diagnostic grid (1033 frames, dedup-aware, scene-classified). Top-10 ranked JPEGs are at `reports/final_top10/` with `manifest.json` next to them. If the rank-1 frames look like keepers, the loop is closing. If they look wrong, label another batch via the UI and retrain.
 2. **Tune scene prompts.** ~60% of frames classified as `documentary_flat` — that prompt is too generic. Real fix needs your taste, not mine; current prompts are a v0 placeholder.
 3. **Build real `presets/*.xmp`** in darktable when on Linux. Until then the develop stage just copies the camera JPEG and notes the would-have-been preset in the manifest.
 4. **Linux story** — gphoto2 ingest (step 10), udev/systemd (step 13), notify-send (step 14). All blocked on the dual-boot.
