@@ -23,7 +23,7 @@ class Row:
     thumb_b64: str
 
 
-def encode_thumbnail(preview: np.ndarray) -> str:
+def encode_thumbnail_bytes(preview: np.ndarray) -> bytes:
     h, w = preview.shape[:2]
     scale = THUMB_LONG_EDGE / max(h, w)
     if scale < 1.0:
@@ -35,7 +35,11 @@ def encode_thumbnail(preview: np.ndarray) -> str:
     ok, buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, THUMB_JPEG_QUALITY])
     if not ok:
         raise RuntimeError("cv2.imencode failed")
-    return base64.b64encode(buf.tobytes()).decode("ascii")
+    return buf.tobytes()
+
+
+def encode_thumbnail(preview: np.ndarray) -> str:
+    return base64.b64encode(encode_thumbnail_bytes(preview)).decode("ascii")
 
 
 def write_report(out_path: Path, rows: list[Row], threshold: float) -> None:
@@ -99,7 +103,7 @@ def _render(rows: list[Row], summary: dict, divider_after: int) -> str:
 def _card(row: Row, is_keep: bool) -> str:
     flag_class = "keep" if is_keep else "reject"
     flag_label = "KEEP" if is_keep else "REJECT"
-    stem = html.escape(row.frame.stem)
+    stem = html.escape(row.frame.display_name)
     kind = html.escape(row.frame.kind)
     if row.aesthetic is not None:
         source_tag = (

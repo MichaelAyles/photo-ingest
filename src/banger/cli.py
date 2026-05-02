@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from banger import aesthetic, state, taste_head
+from banger import aesthetic, server, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.frames import discover_frames
 from banger.preview import load_preview
@@ -20,6 +20,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run the pipeline against a folder of images.")
     run.add_argument("input_dir", type=Path, help="Folder containing JPEGs and/or ARWs.")
+    run.add_argument("-r", "--recursive", action="store_true", help="Walk subdirectories.")
     run.add_argument(
         "--report",
         type=Path,
@@ -32,31 +33,44 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print the per-prompt cosine similarity breakdown for one or more frames.",
     )
     explain.add_argument("input_dir", type=Path)
+    explain.add_argument("-r", "--recursive", action="store_true")
     explain.add_argument("stems", nargs="+", help="Frame stems, e.g. DSC00055 DSC00073.")
 
     label = sub.add_parser(
         "label",
-        help="Record up/down labels for frames; used by `banger train` to fit a taste head.",
+        help="Record an integer score (-5..+5) for one or more frames by stem.",
     )
     label.add_argument("input_dir", type=Path)
-    label.add_argument("verdict", choices=["up", "down"])
-    label.add_argument("stems", nargs="+", help="Frame stems to label with this verdict.")
+    label.add_argument("-r", "--recursive", action="store_true")
+    label.add_argument(
+        "score",
+        type=int,
+        help=f"Integer in [{state.SCORE_MIN}, {state.SCORE_MAX}].",
+    )
+    label.add_argument("stems", nargs="+", help="Frame stems to label with this score.")
 
     sub.add_parser(
         "train",
-        help="Train a logistic-regression taste head on labelled CLIP embeddings.",
+        help="Train a Ridge taste head on labelled CLIP embeddings.",
     )
+
+    ui = sub.add_parser(
+        "ui",
+        help="Start the local labelling UI (http://127.0.0.1:<port>).",
+    )
+    ui.add_argument("input_dir", type=Path)
+    ui.add_argument("--port", type=int, default=8000)
 
     return parser
 
 
-def cmd_run(input_dir: Path, report_path: Path | None) -> int:
+def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
         log.error("not a directory: %s", input_dir)
         return 2
 
-    frames = discover_frames(input_dir)
+    frames = discover_frames(input_dir, recursive=recursive)
     if not frames:
         log.warning("no supported images in %s", input_dir)
         return 0
@@ -64,10 +78,11 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
     threshold = SHARPNESS_CONFIG["threshold"]
     head = taste_head.load()
     log.info(
-        "processing %d frames (sharpness threshold=%.1f, aesthetic=%s, report=%s)",
+        "processing %d frames (sharpness threshold=%.1f, aesthetic=%s, recursive=%s, report=%s)",
         len(frames),
         threshold,
         "trained head" if head is not None else "prompts",
+        recursive,
         report_path or "off",
     )
 
@@ -79,7 +94,7 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
         try:
             preview = load_preview(f.classify_path)
         except Exception as e:
-            log.warning("skip %s: %s", f.stem, e)
+            log.warning("skip %s: %s", f.display_name, e)
             continue
 
         sharp = sharpness_from_preview(preview)
@@ -100,7 +115,7 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
                     source = "prompts"
                 aesthetic_done += 1
             except Exception as e:
-                log.warning("aesthetic skip %s: %s", f.stem, e)
+                log.warning("aesthetic skip %s: %s", f.display_name, e)
                 aesthetic_skipped += 1
 
         thumb = encode_thumbnail(preview) if report_path else ""
@@ -117,7 +132,7 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
 
         a_str = f"aesthetic={a_score:5.2f}" if a_score is not None else "aesthetic= ---"
         flag = "KEEP  " if sharp >= threshold else "REJECT"
-        log.info("%s sharpness=%7.1f %s  %s  [%s]", flag, sharp, a_str, f.stem, f.kind)
+        log.info("%s sharpness=%7.1f %s  %s  [%s]", flag, sharp, a_str, f.display_name, f.kind)
 
     elapsed = time.monotonic() - t0
     sharps = [r.sharpness for r in rows]
@@ -154,21 +169,34 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
     return 0
 
 
-def cmd_explain(input_dir: Path, stems: list[str]) -> int:
+def cmd_explain(input_dir: Path, recursive: bool, stems: list[str]) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
         log.error("not a directory: %s", input_dir)
         return 2
 
-    frames = {f.stem: f for f in discover_frames(input_dir)}
-    missing = [s for s in stems if s not in frames]
-    if missing:
-        log.error("not found in %s: %s", input_dir, ", ".join(missing))
-        return 2
+    frames = discover_frames(input_dir, recursive=recursive)
+    by_stem: dict[str, list] = {}
+    for f in frames:
+        by_stem.setdefault(f.stem, []).append(f)
+
+    selected = []
+    for s in stems:
+        matches = by_stem.get(s, [])
+        if not matches:
+            log.error("not found: %s", s)
+            return 2
+        if len(matches) > 1:
+            log.error(
+                "ambiguous stem %s — appears in: %s",
+                s,
+                ", ".join(m.display_name for m in matches),
+            )
+            return 2
+        selected.append((s, matches[0]))
 
     results: list[tuple[str, float, dict[str, float]]] = []
-    for stem in stems:
-        f = frames[stem]
+    for stem, f in selected:
         preview = load_preview(f.classify_path)
         score, breakdown = aesthetic.score_from_preview(preview)
         results.append((stem, score, breakdown))
@@ -208,26 +236,39 @@ def cmd_explain(input_dir: Path, stems: list[str]) -> int:
     return 0
 
 
-def cmd_label(input_dir: Path, verdict: str, stems: list[str]) -> int:
+def cmd_label(input_dir: Path, recursive: bool, score: int, stems: list[str]) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
         log.error("not a directory: %s", input_dir)
         return 2
-
-    frames = {f.stem: f for f in discover_frames(input_dir)}
-    missing = [s for s in stems if s not in frames]
-    if missing:
-        log.error("not found in %s: %s", input_dir, ", ".join(missing))
+    if not state.SCORE_MIN <= score <= state.SCORE_MAX:
+        log.error(
+            "score must be in [%d, %d], got %d", state.SCORE_MIN, state.SCORE_MAX, score
+        )
         return 2
 
-    for s in stems:
-        f = frames[s]
-        sha = state.sha256_of(f.classify_path)
-        state.add_label(sha, verdict, s, str(f.classify_path))
-        log.info("labelled %s as %s", s, verdict)
+    frames = discover_frames(input_dir, recursive=recursive)
+    by_stem: dict[str, list] = {}
+    for f in frames:
+        by_stem.setdefault(f.stem, []).append(f)
 
-    up, down = state.label_counts()
-    log.info("total labels: %d up + %d down", up, down)
+    for s in stems:
+        matches = by_stem.get(s, [])
+        if not matches:
+            log.error("not found: %s", s)
+            return 2
+        if len(matches) > 1:
+            log.error(
+                "ambiguous stem %s — use the UI for recursive labelling. Found: %s",
+                s,
+                ", ".join(m.display_name for m in matches),
+            )
+            return 2
+        f = matches[0]
+        sha = state.sha256_of(f.classify_path)
+        state.add_label(sha, score, f.stem, str(f.classify_path))
+        log.info("labelled %s as %+d", f.display_name, score)
+
     return 0
 
 
@@ -235,17 +276,24 @@ def cmd_train() -> int:
     return 0 if taste_head.train_from_disk() is not None else 2
 
 
+def cmd_ui(input_dir: Path, port: int) -> int:
+    server.serve(input_dir, port=port)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
     if args.command == "run":
-        return cmd_run(args.input_dir, args.report)
+        return cmd_run(args.input_dir, args.recursive, args.report)
     if args.command == "explain":
-        return cmd_explain(args.input_dir, args.stems)
+        return cmd_explain(args.input_dir, args.recursive, args.stems)
     if args.command == "label":
-        return cmd_label(args.input_dir, args.verdict, args.stems)
+        return cmd_label(args.input_dir, args.recursive, args.score, args.stems)
     if args.command == "train":
         return cmd_train()
+    if args.command == "ui":
+        return cmd_ui(args.input_dir, args.port)
     return 1
 
 

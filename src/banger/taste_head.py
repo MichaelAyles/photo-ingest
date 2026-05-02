@@ -1,7 +1,8 @@
-"""Personal taste head: logistic regression on top of cached CLIP embeddings.
+"""Personal taste head: ridge regression on cached CLIP embeddings.
 
-Trained from `banger label` data. Replaces prompt-based aesthetic scoring
-in cmd_run when the head exists on disk.
+Trained from scores written by `banger label` or `banger ui`. Replaces
+prompt-based aesthetic scoring in cmd_run when the head exists on disk.
+Output is a continuous score, calibrated against your own -5..+5 labels.
 """
 
 import logging
@@ -23,69 +24,68 @@ def load():
 
 
 def predict_score(model, embedding: np.ndarray) -> float:
-    """Map P(up) to a 0-10 score so it stacks with the existing report scale."""
-    prob_up = model.predict_proba(embedding.reshape(1, -1))[0, 1]
-    return float(prob_up * 10.0)
+    """Return predicted score (roughly in the user's labelling range)."""
+    return float(model.predict(embedding.reshape(1, -1))[0])
 
 
 def train_from_disk():
-    from sklearn.linear_model import LogisticRegression
+    from sklearn.linear_model import Ridge
 
     rows = state.all_labels()
     if not rows:
-        log.error("no labels yet — run `banger label <dir> up|down <stem>...` first")
+        log.error("no labels yet — use the UI (`banger ui <dir>`) or CLI to score frames first")
         return None
 
     X: list[np.ndarray] = []
-    y: list[int] = []
+    y: list[float] = []
     missing: list[tuple[str, str]] = []
-    for sha, label, stem, _src, _ts in rows:
+    for sha, score, stem, _src, _ts in rows:
         emb = state.load_embedding(sha)
         if emb is None:
             missing.append((stem, sha))
             continue
         X.append(emb)
-        y.append(1 if label == "up" else 0)
+        y.append(float(score))
 
     if missing:
         log.warning(
             "%d labelled frames have no cached embedding "
-            "(run `banger run` over the source dir first):",
+            "(re-run `banger run` over their source dirs first):",
             len(missing),
         )
         for stem, sha in missing[:5]:
             log.warning("  %s (%s)", stem, sha[:12])
 
-    if len(set(y)) < 2:
-        log.error(
-            "need both up and down labels to train; got %d up, %d down",
-            sum(y),
-            len(y) - sum(y),
-        )
+    if len(y) < 2:
+        log.error("need at least 2 labelled frames to train; got %d", len(y))
         return None
 
     X_arr = np.stack(X)
     y_arr = np.array(y)
 
     log.info(
-        "training on %d up + %d down labels (embedding dim=%d)",
-        int(y_arr.sum()),
-        int(len(y_arr) - y_arr.sum()),
+        "training Ridge on %d labels (range %.1f..%.1f, mean %.2f, embedding dim=%d)",
+        len(y_arr),
+        float(y_arr.min()),
+        float(y_arr.max()),
+        float(y_arr.mean()),
         X_arr.shape[1],
     )
 
-    model = LogisticRegression(max_iter=2000, C=1.0)
+    model = Ridge(alpha=1.0)
     model.fit(X_arr, y_arr)
 
     if 4 <= len(y_arr) <= 200:
         from sklearn.model_selection import LeaveOneOut, cross_val_score
 
-        scores = cross_val_score(model, X_arr, y_arr, cv=LeaveOneOut())
+        # MAE on leave-one-out — interpretable in score units.
+        scores = cross_val_score(
+            model, X_arr, y_arr, cv=LeaveOneOut(), scoring="neg_mean_absolute_error"
+        )
         log.info(
-            "leave-one-out accuracy: %.2f over %d folds (chance = %.2f)",
-            float(scores.mean()),
-            len(scores),
-            float(max(y_arr.mean(), 1 - y_arr.mean())),
+            "leave-one-out MAE: %.2f (in score units; chance ≈ %.2f)",
+            -float(scores.mean()),
+            float(np.abs(y_arr - y_arr.mean()).mean()),
         )
 
     state.STATE_DIR.mkdir(parents=True, exist_ok=True)
