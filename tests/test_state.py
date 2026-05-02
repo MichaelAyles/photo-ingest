@@ -115,6 +115,26 @@ def test_csv_round_trip(isolated_state, tmp_path):
     assert restored == {"sha-a": 5, "sha-b": -3, "sha-c": 0}
 
 
+def test_frame_metadata_round_trip(isolated_state):
+    sha = "deadbeef"
+    assert isolated_state.load_frame_metadata(sha) is None
+    isolated_state.cache_frame_metadata(sha, sharpness=234.5, phash_hex="abc123", timestamp=1700000000.0)
+    loaded = isolated_state.load_frame_metadata(sha)
+    assert loaded is not None
+    assert loaded["sharpness"] == 234.5
+    assert loaded["phash_hex"] == "abc123"
+    assert loaded["timestamp"] == 1700000000.0
+    assert "computed_at" in loaded
+
+
+def test_frame_metadata_corrupt_returns_none(isolated_state, tmp_path):
+    sha = "corrupt"
+    # Write a malformed JSON file directly.
+    isolated_state.METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    (isolated_state.METADATA_DIR / f"{sha}.json").write_text("not json", encoding="utf-8")
+    assert isolated_state.load_frame_metadata(sha) is None
+
+
 def test_csv_import_skips_malformed_rows(isolated_state, tmp_path):
     csv_path = tmp_path / "bad.csv"
     csv_path.write_text(

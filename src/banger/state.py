@@ -15,6 +15,7 @@ STATE_DIR = Path.home() / ".local" / "share" / "banger-pipeline"
 EMBEDDINGS_DIR = STATE_DIR / "embeddings"
 THUMBS_DIR = STATE_DIR / "thumbs"
 PREVIEWS_DIR = STATE_DIR / "previews"
+METADATA_DIR = STATE_DIR / "metadata"
 LABELS_DB = STATE_DIR / "labels.db"
 TASTE_HEAD = STATE_DIR / "taste_head.joblib"
 
@@ -107,6 +108,34 @@ def cache_preview_jpeg(sha: str, jpeg_bytes: bytes) -> None:
 
 def preview_jpeg_path(sha: str) -> Path:
     return PREVIEWS_DIR / f"{sha}.jpg"
+
+
+def cache_frame_metadata(
+    sha: str, sharpness: float, phash_hex: str, timestamp: float
+) -> None:
+    """Cache the per-frame inputs needed by `cmd_run` so re-runs skip preview loads."""
+    import json
+
+    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "sharpness": float(sharpness),
+        "phash_hex": phash_hex,
+        "timestamp": float(timestamp),
+        "computed_at": int(time.time()),
+    }
+    (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def load_frame_metadata(sha: str) -> dict | None:
+    import json
+
+    p = METADATA_DIR / f"{sha}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def add_label(sha: str, score: int, stem: str, src_path: str) -> None:

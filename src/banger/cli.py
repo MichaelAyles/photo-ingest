@@ -7,6 +7,8 @@ from pathlib import Path
 
 import os
 
+import imagehash
+
 from banger import aesthetic, dedup, develop as develop_mod, scenes, server, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
@@ -150,56 +152,125 @@ def cmd_run(
     dedup_inputs: list[tuple[Row, ClusterItem, "np.ndarray"]] = []
     aesthetic_done = 0
     aesthetic_skipped = 0
+    cache_hits = 0
     t0 = time.monotonic()
     for f in frames:
-        try:
-            preview = load_preview(f.classify_path)
-        except Exception as e:
-            log.warning("skip %s: %s", f.display_name, e)
-            continue
+        sha = state.sha256_of(f.classify_path)
+        cached_meta = state.load_frame_metadata(sha)
+        cached_emb = state.load_embedding(sha)
 
-        sharp = sharpness_from_preview(preview)
-        a_score: float | None = None
-        breakdown: dict[str, float] | None = None
-        source: str | None = None
-        phash = None
-        if sharp >= threshold:
+        # Fast path: every per-frame input we need is on disk → don't decode.
+        cache_hit = (
+            cached_meta is not None
+            and "phash_hex" in cached_meta
+            and cached_emb is not None
+            and report_path is None  # thumb requires preview
+        )
+
+        if cache_hit:
+            sharp = float(cached_meta["sharpness"])
+            if sharp < threshold:
+                rows.append(
+                    Row(
+                        frame=f,
+                        sharpness=sharp,
+                        aesthetic=None,
+                        aesthetic_breakdown=None,
+                        aesthetic_source=None,
+                        thumb_b64="",
+                    )
+                )
+                cache_hits += 1
+                log.info(
+                    "REJECT sharpness=%7.1f aesthetic= ---  %s  [%s] (cached)",
+                    sharp, f.display_name, f.kind,
+                )
+                continue
+            phash = imagehash.hex_to_hash(cached_meta["phash_hex"])
+            ts = float(cached_meta["timestamp"])
+            emb = cached_emb
             try:
-                emb = aesthetic.encode_image(preview)
-                sha = state.sha256_of(f.classify_path)
-                state.cache_embedding(sha, emb)
                 _, breakdown = aesthetic.score_from_embedding(emb)
-                if head is not None:
-                    a_score = taste_head.predict_score(head, emb)
-                    source = "head"
-                else:
-                    a_score, _ = aesthetic.score_from_embedding(emb)
-                    source = "prompts"
-                phash = dedup.phash_from_preview(preview)
+                a_score = (
+                    taste_head.predict_score(head, emb) if head is not None
+                    else aesthetic.score_from_embedding(emb)[0]
+                )
+                source = "head" if head is not None else "prompts"
                 aesthetic_done += 1
+                cache_hits += 1
             except Exception as e:
                 log.warning("aesthetic skip %s: %s", f.display_name, e)
                 aesthetic_skipped += 1
+                a_score = None
+                breakdown = None
+                source = None
+        else:
+            try:
+                preview = load_preview(f.classify_path)
+            except Exception as e:
+                log.warning("skip %s: %s", f.display_name, e)
+                continue
 
-        thumb = encode_thumbnail(preview) if report_path else ""
-        row = Row(
-            frame=f,
-            sharpness=sharp,
-            aesthetic=a_score,
-            aesthetic_breakdown=breakdown,
-            aesthetic_source=source,
-            thumb_b64=thumb,
-        )
-        rows.append(row)
-        if phash is not None and a_score is not None:
-            ts = dedup.best_timestamp(f.classify_path)
+            sharp = sharpness_from_preview(preview)
+            a_score = None
+            breakdown = None
+            source = None
+            phash = None
+            ts = 0.0
+            emb = None
+            if sharp >= threshold:
+                try:
+                    emb = aesthetic.encode_image(preview)
+                    state.cache_embedding(sha, emb)
+                    _, breakdown = aesthetic.score_from_embedding(emb)
+                    if head is not None:
+                        a_score = taste_head.predict_score(head, emb)
+                        source = "head"
+                    else:
+                        a_score, _ = aesthetic.score_from_embedding(emb)
+                        source = "prompts"
+                    phash = dedup.phash_from_preview(preview)
+                    ts = dedup.best_timestamp(f.classify_path)
+                    state.cache_frame_metadata(sha, sharp, str(phash), ts)
+                    aesthetic_done += 1
+                except Exception as e:
+                    log.warning("aesthetic skip %s: %s", f.display_name, e)
+                    aesthetic_skipped += 1
+            thumb = encode_thumbnail(preview) if report_path else ""
+
+        if not cache_hit:
+            row = Row(
+                frame=f,
+                sharpness=sharp,
+                aesthetic=a_score,
+                aesthetic_breakdown=breakdown,
+                aesthetic_source=source,
+                thumb_b64=thumb,
+            )
+            rows.append(row)
+        else:
+            row = Row(
+                frame=f,
+                sharpness=sharp,
+                aesthetic=a_score,
+                aesthetic_breakdown=breakdown,
+                aesthetic_source=source,
+                thumb_b64="",
+            )
+            rows.append(row)
+
+        if phash is not None and a_score is not None and emb is not None:
             dedup_inputs.append(
                 (row, ClusterItem(key=f.display_name, phash=phash, timestamp=ts, score=a_score), emb)
             )
 
         a_str = f"aesthetic={a_score:5.2f}" if a_score is not None else "aesthetic= ---"
         flag = "KEEP  " if sharp >= threshold else "REJECT"
-        log.info("%s sharpness=%7.1f %s  %s  [%s]", flag, sharp, a_str, f.display_name, f.kind)
+        suffix = " (cached)" if cache_hit else ""
+        log.info(
+            "%s sharpness=%7.1f %s  %s  [%s]%s",
+            flag, sharp, a_str, f.display_name, f.kind, suffix,
+        )
 
     # Burst dedup: cluster by pHash + timestamp, mark non-best siblings.
     rows_by_key = {ci.key: row for row, ci, _ in dedup_inputs}
@@ -240,7 +311,7 @@ def cmd_run(
 
     log.info(
         "summary: %d final kept (= %d sharpness-pass − %d burst dupes), %d rejected of "
-        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found, %d scenes classified)",
+        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found, %d scenes classified, %d cache hits)",
         final_kept,
         sharp_kept,
         suppressed_count,
@@ -251,6 +322,7 @@ def cmd_run(
         aesthetic_skipped,
         len(bursts),
         scene_done,
+        cache_hits,
     )
 
     if scene_done:

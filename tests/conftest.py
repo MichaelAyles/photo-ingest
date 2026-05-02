@@ -68,6 +68,7 @@ def isolated_state(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(st, "EMBEDDINGS_DIR", state_dir / "embeddings")
     monkeypatch.setattr(st, "THUMBS_DIR", state_dir / "thumbs")
     monkeypatch.setattr(st, "PREVIEWS_DIR", state_dir / "previews")
+    monkeypatch.setattr(st, "METADATA_DIR", state_dir / "metadata")
     monkeypatch.setattr(st, "LABELS_DB", state_dir / "labels.db")
     monkeypatch.setattr(st, "TASTE_HEAD", state_dir / "taste_head.joblib")
     return st
