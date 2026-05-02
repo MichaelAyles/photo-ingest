@@ -5,8 +5,9 @@ import sys
 import time
 from pathlib import Path
 
-from banger import aesthetic, server, state, taste_head
+from banger import aesthetic, dedup, server, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
+from banger.dedup import ClusterItem
 from banger.frames import discover_frames
 from banger.preview import load_preview
 from banger.report import Row, encode_thumbnail, write_report
@@ -87,6 +88,7 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
     )
 
     rows: list[Row] = []
+    dedup_inputs: list[tuple[Row, ClusterItem]] = []
     aesthetic_done = 0
     aesthetic_skipped = 0
     t0 = time.monotonic()
@@ -101,6 +103,7 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
         a_score: float | None = None
         breakdown: dict[str, float] | None = None
         source: str | None = None
+        phash = None
         if sharp >= threshold:
             try:
                 emb = aesthetic.encode_image(preview)
@@ -113,40 +116,65 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
                 else:
                     a_score, _ = aesthetic.score_from_embedding(emb)
                     source = "prompts"
+                phash = dedup.phash_from_preview(preview)
                 aesthetic_done += 1
             except Exception as e:
                 log.warning("aesthetic skip %s: %s", f.display_name, e)
                 aesthetic_skipped += 1
 
         thumb = encode_thumbnail(preview) if report_path else ""
-        rows.append(
-            Row(
-                frame=f,
-                sharpness=sharp,
-                aesthetic=a_score,
-                aesthetic_breakdown=breakdown,
-                aesthetic_source=source,
-                thumb_b64=thumb,
-            )
+        row = Row(
+            frame=f,
+            sharpness=sharp,
+            aesthetic=a_score,
+            aesthetic_breakdown=breakdown,
+            aesthetic_source=source,
+            thumb_b64=thumb,
         )
+        rows.append(row)
+        if phash is not None and a_score is not None:
+            ts = dedup.best_timestamp(f.classify_path)
+            dedup_inputs.append(
+                (row, ClusterItem(key=f.display_name, phash=phash, timestamp=ts, score=a_score))
+            )
 
         a_str = f"aesthetic={a_score:5.2f}" if a_score is not None else "aesthetic= ---"
         flag = "KEEP  " if sharp >= threshold else "REJECT"
         log.info("%s sharpness=%7.1f %s  %s  [%s]", flag, sharp, a_str, f.display_name, f.kind)
 
+    # Burst dedup: cluster by pHash + timestamp, mark non-best siblings.
+    rows_by_key = {ci.key: row for row, ci in dedup_inputs}
+    clusters = dedup.cluster_bursts([ci for _, ci in dedup_inputs])
+    bursts = [c for c in clusters if len(c) > 1]
+    suppressed_count = 0
+    for cid, cluster in enumerate(bursts, start=1):
+        best = cluster.best
+        for it in cluster.items:
+            row = rows_by_key[it.key]
+            row.cluster_id = cid
+            row.cluster_size = len(cluster)
+            row.cluster_best = it.key == best.key
+            if not row.cluster_best:
+                suppressed_count += 1
+
     elapsed = time.monotonic() - t0
     sharps = [r.sharpness for r in rows]
     aesthetic_vals = [r.aesthetic for r in rows if r.aesthetic is not None]
-    kept = sum(1 for r in rows if r.sharpness >= threshold)
+    sharp_kept = sum(1 for r in rows if r.sharpness >= threshold)
+    final_kept = sum(1 for r in rows if r.sharpness >= threshold and r.cluster_best)
 
     log.info(
-        "summary: %d kept, %d rejected of %d frames in %.1fs (aesthetic done=%d skipped=%d)",
-        kept,
-        len(rows) - kept,
+        "summary: %d final kept (= %d sharpness-pass − %d burst dupes), %d rejected of "
+        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found)",
+        final_kept,
+        sharp_kept,
+        suppressed_count,
+        len(rows) - sharp_kept,
         len(rows),
         elapsed,
         aesthetic_done,
         aesthetic_skipped,
+        len(bursts),
     )
     if sharps:
         log.info(

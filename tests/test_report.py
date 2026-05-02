@@ -62,3 +62,68 @@ def test_write_report_creates_valid_html(tmp_path, make_jpeg):
     assert keep_pos < reject_pos
     # No unbalanced template braces
     assert not re.search(r"\{[a-zA-Z_]+\}", html)
+
+
+def test_write_report_with_burst_cluster(tmp_path, make_jpeg):
+    p = make_jpeg()
+    preview = load_preview(p)
+    thumb = encode_thumbnail(preview)
+    rows = [
+        Row(
+            frame=Frame(stem="best", subdir="", jpeg=p, raw=None),
+            sharpness=500.0,
+            aesthetic=4.0,
+            aesthetic_breakdown=None,
+            aesthetic_source="head",
+            thumb_b64=thumb,
+            cluster_id=1,
+            cluster_size=3,
+            cluster_best=True,
+        ),
+        Row(
+            frame=Frame(stem="dupe1", subdir="", jpeg=p, raw=None),
+            sharpness=500.0,
+            aesthetic=3.5,
+            aesthetic_breakdown=None,
+            aesthetic_source="head",
+            thumb_b64=thumb,
+            cluster_id=1,
+            cluster_size=3,
+            cluster_best=False,
+        ),
+        Row(
+            frame=Frame(stem="dupe2", subdir="", jpeg=p, raw=None),
+            sharpness=500.0,
+            aesthetic=2.0,
+            aesthetic_breakdown=None,
+            aesthetic_source="head",
+            thumb_b64=thumb,
+            cluster_id=1,
+            cluster_size=3,
+            cluster_best=False,
+        ),
+        Row(
+            frame=Frame(stem="solo", subdir="", jpeg=p, raw=None),
+            sharpness=500.0,
+            aesthetic=1.0,
+            aesthetic_breakdown=None,
+            aesthetic_source="head",
+            thumb_b64=thumb,
+        ),
+    ]
+    out = tmp_path / "out.html"
+    write_report(out, rows, threshold=100.0)
+    html = out.read_text(encoding="utf-8")
+
+    assert "best of 3 burst" in html
+    assert "dupe of cluster 1" in html
+    assert "DUPE" in html
+    assert "suppressed by burst dedup" in html
+    # Best + solo come before any DUPE in the rendered order.
+    best_idx = html.index(">best<")
+    solo_idx = html.index(">solo<")
+    dupe_divider_idx = html.index("suppressed by burst dedup")
+    dupe_idx = html.index(">dupe1<")
+    assert best_idx < dupe_divider_idx
+    assert solo_idx < dupe_divider_idx
+    assert dupe_divider_idx < dupe_idx

@@ -21,6 +21,9 @@ class Row:
     aesthetic_breakdown: dict[str, float] | None
     aesthetic_source: str | None  # "prompts" | "head"
     thumb_b64: str
+    cluster_id: int | None = None  # None if not in a multi-frame cluster
+    cluster_size: int = 1
+    cluster_best: bool = True  # False = suppressed sibling of a burst best
 
 
 def encode_thumbnail_bytes(preview: np.ndarray) -> bytes:
@@ -43,20 +46,25 @@ def encode_thumbnail(preview: np.ndarray) -> str:
 
 
 def write_report(out_path: Path, rows: list[Row], threshold: float) -> None:
-    kept = [r for r in rows if r.sharpness >= threshold]
+    kept = [r for r in rows if r.sharpness >= threshold and r.cluster_best]
+    suppressed = [r for r in rows if r.sharpness >= threshold and not r.cluster_best]
     rejected = [r for r in rows if r.sharpness < threshold]
     kept.sort(
         key=lambda r: (r.aesthetic if r.aesthetic is not None else r.sharpness),
         reverse=True,
     )
+    suppressed.sort(
+        key=lambda r: (r.cluster_id or 0, -(r.aesthetic if r.aesthetic is not None else 0))
+    )
     rejected.sort(key=lambda r: r.sharpness, reverse=True)
-    ordered = kept + rejected
+    ordered = kept + suppressed + rejected
 
     sharp_scores = [r.sharpness for r in rows]
     aesthetic_scores = [r.aesthetic for r in rows if r.aesthetic is not None]
     summary = {
         "total": len(rows),
         "kept": len(kept),
+        "suppressed": len(suppressed),
         "rejected": len(rejected),
         "threshold": threshold,
         "sharp_min": min(sharp_scores) if sharp_scores else 0.0,
@@ -67,18 +75,32 @@ def write_report(out_path: Path, rows: list[Row], threshold: float) -> None:
         "aesthetic_max": max(aesthetic_scores) if aesthetic_scores else None,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(_render(ordered, summary, len(kept)), encoding="utf-8")
+    out_path.write_text(
+        _render(ordered, summary, len(kept), len(kept) + len(suppressed)),
+        encoding="utf-8",
+    )
 
 
-def _render(rows: list[Row], summary: dict, divider_after: int) -> str:
+def _render(rows: list[Row], summary: dict, kept_after: int, suppress_after: int) -> str:
     cards = []
     for i, r in enumerate(rows):
-        if i == divider_after and summary["rejected"]:
+        if i == kept_after and summary["suppressed"]:
+            cards.append(
+                f'<div class="divider">↓ suppressed by burst dedup '
+                f'({summary["suppressed"]}) ↓</div>'
+            )
+        if i == suppress_after and summary["rejected"]:
             cards.append(
                 f'<div class="divider">↓ below sharpness threshold '
                 f'({summary["threshold"]:.0f}) ↓</div>'
             )
-        cards.append(_card(r, is_keep=(i < divider_after)))
+        if i < kept_after:
+            section = "keep"
+        elif i < suppress_after:
+            section = "suppressed"
+        else:
+            section = "reject"
+        cards.append(_card(r, section=section))
     if summary["aesthetic_min"] is not None:
         aesthetic_line = (
             f'aesthetic min {summary["aesthetic_min"]:.2f} / '
@@ -90,6 +112,7 @@ def _render(rows: list[Row], summary: dict, divider_after: int) -> str:
     return _TEMPLATE.format(
         total=summary["total"],
         kept=summary["kept"],
+        suppressed=summary["suppressed"],
         rejected=summary["rejected"],
         threshold=summary["threshold"],
         sharp_min=summary["sharp_min"],
@@ -100,9 +123,13 @@ def _render(rows: list[Row], summary: dict, divider_after: int) -> str:
     )
 
 
-def _card(row: Row, is_keep: bool) -> str:
-    flag_class = "keep" if is_keep else "reject"
-    flag_label = "KEEP" if is_keep else "REJECT"
+def _card(row: Row, section: str = "keep") -> str:
+    if section == "keep":
+        flag_class, flag_label = "keep", "KEEP"
+    elif section == "suppressed":
+        flag_class, flag_label = "suppressed", "DUPE"
+    else:
+        flag_class, flag_label = "reject", "REJECT"
     stem = html.escape(row.frame.display_name)
     kind = html.escape(row.frame.kind)
     if row.aesthetic is not None:
@@ -115,13 +142,24 @@ def _card(row: Row, is_keep: bool) -> str:
     else:
         primary = '<span class="primary muted">—</span>'
     breakdown_html = _breakdown(row.aesthetic_breakdown) if row.aesthetic_breakdown else ""
+    cluster_html = ""
+    if row.cluster_size > 1:
+        if row.cluster_best:
+            cluster_html = (
+                f'<span class="cluster">best of {row.cluster_size} burst</span>'
+            )
+        else:
+            cluster_html = (
+                f'<span class="cluster">dupe of cluster {row.cluster_id} '
+                f'(n={row.cluster_size})</span>'
+            )
     return (
         f'<figure class="card {flag_class}">'
         f'<img loading="lazy" src="data:image/jpeg;base64,{row.thumb_b64}" alt="{stem}">'
         f'<figcaption>'
         f'<div class="head"><span class="stem">{stem}</span>{primary}</div>'
         f'<div class="meta">'
-        f'<span class="kind">{kind}</span>'
+        f'<span class="kind">{kind}{cluster_html}</span>'
         f'<span class="extras">sharp {row.sharpness:.0f} '
         f'<span class="badge {flag_class}">{flag_label}</span></span>'
         f'</div>'
@@ -159,6 +197,9 @@ _TEMPLATE = """<!doctype html>
   .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .75rem; }}
   .card {{ margin: 0; background: #1a1a1a; border-radius: 6px; overflow: hidden; border: 1px solid #2a2a2a; }}
   .card.reject {{ opacity: .55; }}
+  .card.suppressed {{ opacity: .65; border-color: #3a3a4a; }}
+  .badge.suppressed {{ background: #2e2e3a; color: #c0c0e0; }}
+  .cluster {{ font-size: .65rem; color: #aaa; margin-left: .35rem; padding: 0 .35rem; background: #222; border-radius: 2px; }}
   .card img {{ width: 100%; display: block; aspect-ratio: 3/2; object-fit: cover; }}
   figcaption {{ padding: .4rem .55rem; font-size: .8rem; }}
   figcaption .head, figcaption .meta {{ display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }}
@@ -183,7 +224,7 @@ _TEMPLATE = """<!doctype html>
 <header>
   <h1>banger report</h1>
   <div class="summary">
-    {total} frames &middot; {kept} kept &middot; {rejected} rejected (threshold {threshold:.0f})<br>
+    {total} frames &middot; {kept} kept &middot; {suppressed} suppressed (dupes) &middot; {rejected} rejected (threshold {threshold:.0f})<br>
     sharpness min {sharp_min:.0f} / median {sharp_median:.0f} / max {sharp_max:.0f}<br>
     {aesthetic_line}
   </div>
