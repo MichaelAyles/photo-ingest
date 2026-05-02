@@ -1,6 +1,6 @@
-# TODO — pick up here after reboot
+# TODO — pick up here
 
-Last good commit: `e80fe97`. The whole stack (sharpness + CLIP aesthetic + label DB + trained head) is wired up but the final smoke tests were blocked by Windows commit-charge pressure (`ServiceShell` was at 13 GB RAM; OpenCV couldn't allocate 72 MB to read a JPEG).
+Memory pressure eased before reboot, so steps 1 and 2 are done. Last good commit at the time of writing this update: caching + new prompts validated end-to-end, 110 embeddings cached at `~/.local/share/banger-pipeline/embeddings/`.
 
 ## Run these in order
 
@@ -9,28 +9,13 @@ cd /c/Users/mikea/OneDrive/Desktop/Projects/photo-ingest
 PY=.venv/Scripts/python.exe
 ```
 
-### 1. Verify the rewritten prompts moved the needle on their own
+### ~~1. Verify the rewritten prompts moved the needle on their own~~ DONE
 
-Earlier we found CLIP was punishing DSC00055 (your favourite, shallow DOF) for "blurry, poorly framed photograph" — high similarity because the bokeh background reads as blur to CLIP. Rewrote the prompts to drop blur/focus negatives (sharpness gate already filters real blur) and add shallow-DOF positives. Expected impact: 55 should rise relative to 73, even before any labels.
+Result: DSC00055 went from 0.57 to 1.47, DSC00073 dropped from 2.37 to 1.11. The user's favourite is now ranked above the swimming-away dog with the new prompts alone.
 
-```sh
-$PY -m banger explain test_photos DSC00055 DSC00073
-```
+### ~~2. End-to-end run with the new caching + head fallback path~~ DONE
 
-Compare to the pre-rewrite breakdown (in commit `349bebc`): mean(positives) was 0.2355 vs 0.2347 (tied), mean(negatives) was 0.2240 vs 0.1874 (75 winning here). If the rewrite worked, expect 55's mean(negatives) to drop because we removed the blur term that was firing on its bokeh.
-
-### 2. End-to-end run with the new caching + head fallback path
-
-Coded blind — not yet executed. Should:
-- Score every frame's sharpness as before
-- For survivors: encode CLIP, save embedding to `~/.local/share/banger-pipeline/embeddings/{sha}.npy`
-- Fall back to prompt scoring (no head trained yet)
-- Write HTML report with `prompts` source tag on each card
-
-```sh
-$PY -m banger run test_photos --report reports/full.html
-ls ~/.local/share/banger-pipeline/embeddings/ | wc -l   # should be 110-ish
-```
+110 embeddings cached. Full run took 35 s. Aesthetic range -1.83 to 2.04, median 0.70 (shifted positive because the rewritten negatives are softer than the old "blurry/cluttered/amateur" set).
 
 ### 3. Build a label set and train
 
