@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from banger.preview import SUPPORTED_SUFFIXES
+from banger.frames import Frame, discover_frames
 from banger.sharpness import CONFIG as SHARPNESS_CONFIG
 from banger.sharpness import sharpness
 
@@ -26,38 +26,39 @@ def cmd_run(input_dir: Path) -> int:
         log.error("not a directory: %s", input_dir)
         return 2
 
-    paths = sorted(
-        p for p in input_dir.iterdir() if p.is_file() and p.suffix in SUPPORTED_SUFFIXES
-    )
-    if not paths:
+    frames = discover_frames(input_dir)
+    if not frames:
         log.warning("no supported images in %s", input_dir)
         return 0
 
     threshold = SHARPNESS_CONFIG["threshold"]
-    log.info("scoring %d files for sharpness (threshold=%.1f)", len(paths), threshold)
+    log.info("scoring %d frames for sharpness (threshold=%.1f)", len(frames), threshold)
 
     t0 = time.monotonic()
-    scored: list[tuple[Path, float]] = []
-    for p in paths:
+    scored: list[tuple[Frame, float]] = []
+    for f in frames:
         try:
-            scored.append((p, sharpness(p)))
+            scored.append((f, sharpness(f.classify_path)))
         except Exception as e:
-            log.warning("skip %s: %s", p.name, e)
+            log.warning("skip %s: %s", f.stem, e)
     elapsed = time.monotonic() - t0
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    for p, s in scored:
+    for f, s in scored:
         flag = "KEEP  " if s >= threshold else "REJECT"
-        log.info("%s sharpness=%8.1f  %s", flag, s, p.name)
+        log.info("%s sharpness=%8.1f  %s  [%s]", flag, s, f.stem, f.kind)
 
     if scored:
         scores = [s for _, s in scored]
         kept = sum(1 for s in scores if s >= threshold)
         log.info(
-            "stats: min=%.1f median=%.1f max=%.1f", min(scores), statistics.median(scores), max(scores)
+            "stats: min=%.1f median=%.1f max=%.1f",
+            min(scores),
+            statistics.median(scores),
+            max(scores),
         )
         log.info(
-            "summary: %d kept, %d rejected of %d in %.1fs",
+            "summary: %d kept, %d rejected of %d frames in %.1fs",
             kept,
             len(scored) - kept,
             len(scored),

@@ -19,6 +19,7 @@ Goal: a script that takes a folder of JPEGs, picks the top 10, applies a CLIP-ma
 - Function `sharpness(path) -> float` using cv2 Laplacian variance on a 1024px-long-edge resize.
 - Threshold lives in a config dict at the top of the module, default 100.
 - Return all paths with their score so the caller decides what to bin.
+- The unit of work for the rest of the pipeline is a `Frame` (stem, jpeg, raw — one or both present), not a raw path. Classification stages always read `frame.classify_path` (prefer JPEG, fall back to RAW preview); develop reads `frame.develop_path` (prefer RAW, fall back to JPEG). This kills duplicate scoring of RAW+JPEG pairs and folds most of step 15 into the loader.
 
 ### Step 3 — aesthetic scoring
 - Wrap aesthetic-predictor-v2.5 in a single `score(path) -> float` that loads the model once (module-level cache) and runs it on the resized preview.
@@ -79,8 +80,7 @@ Once v0 is proven on a fixtures folder, wire it to the camera.
 - Click action opens the dated output folder. `gio open` is the simplest cross-DE way.
 
 ### Step 15 — RAW preview extraction
-- For ARW-only shoots, use `rawpy` to extract the embedded preview before the scoring stages.
-- Keep the JPEG path for actual develop input — darktable-cli wants the RAW.
+- Already done as part of step 2: `Frame.classify_path` falls back to the RAW for RAW-only frames, and `preview.load_preview` extracts the embedded JPEG via rawpy. Nothing extra to do unless a real shoot turns up an ARW with no embedded thumb (libraw raises `LibRawNoThumbnailError`, currently logged-and-skipped).
 
 ## v1 — make the cull actually mine
 
