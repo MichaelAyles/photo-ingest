@@ -89,3 +89,43 @@ def test_thumbnail_and_preview_paths_use_state_dir(isolated_state):
     isolated_state.cache_preview_jpeg(sha, b"biggerbytes")
     assert isolated_state.thumbnail_path(sha).read_bytes() == b"jpegbytes"
     assert isolated_state.preview_jpeg_path(sha).read_bytes() == b"biggerbytes"
+
+
+def test_csv_round_trip(isolated_state, tmp_path):
+    isolated_state.add_label("sha-a", 5, "DSC1", "/path/a.JPG")
+    isolated_state.add_label("sha-b", -3, "DSC2", "/path/b.JPG")
+    isolated_state.add_label("sha-c", 0, "DSC3", "/path/c.JPG")
+
+    csv_path = tmp_path / "labels.csv"
+    n_exp = isolated_state.export_labels_csv(csv_path)
+    assert n_exp == 3
+    assert csv_path.exists()
+
+    # Wipe DB and re-import to confirm round-trip.
+    import sqlite3
+
+    with sqlite3.connect(isolated_state.LABELS_DB) as conn:
+        conn.execute("DELETE FROM labels")
+    assert isolated_state.all_labels() == []
+
+    n_imp, n_skip = isolated_state.import_labels_csv(csv_path)
+    assert n_imp == 3
+    assert n_skip == 0
+    restored = isolated_state.labels_dict()
+    assert restored == {"sha-a": 5, "sha-b": -3, "sha-c": 0}
+
+
+def test_csv_import_skips_malformed_rows(isolated_state, tmp_path):
+    csv_path = tmp_path / "bad.csv"
+    csv_path.write_text(
+        "sha256,score,stem,src_path,ts\n"
+        "good-sha,3,DSC1,/p,1000\n"
+        "no-score-sha,not-a-number,DSC2,/p,1001\n"
+        "out-of-range,99,DSC3,/p,1002\n"
+        "missing-col,2,DSC4\n",
+        encoding="utf-8",
+    )
+    imported, skipped = isolated_state.import_labels_csv(csv_path)
+    assert imported == 1
+    assert skipped == 3
+    assert isolated_state.labels_dict() == {"good-sha": 3}

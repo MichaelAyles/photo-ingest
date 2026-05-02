@@ -71,3 +71,26 @@ def test_default_threshold_in_calibrated_range():
     # CLAUDE.md guessed 0.25; empirically tuned downward against the user's
     # 1000+ frame sample. Anything outside this band should look suspicious.
     assert 0.15 <= CONFIDENCE_THRESHOLD <= 0.30
+
+
+def test_per_prompt_threshold_can_override_global():
+    """A prompt-specific threshold should fire when the global threshold wouldn't."""
+    target = "a vibrant warm landscape at golden hour"
+    text_emb = _build_text_emb(special_prompt=target)
+    # Image embedding partially aligned with the boosted axis; cos sim ≈ 0.7.
+    image_emb = np.array([0.7, 0.7, 0.0, 0.0], dtype=np.float32)
+    image_emb /= np.linalg.norm(image_emb)
+
+    # Global threshold = 0.0 → the prompt fires.
+    out_loose = classify_with_emb(image_emb, text_emb, confidence_threshold=0.0)
+    assert out_loose.prompt == target
+    assert not out_loose.fell_back
+
+    # Per-prompt threshold above the actual sim → that prompt is rejected,
+    # and the call falls back to the default.
+    overrides = {target: 0.95}
+    out_strict = classify_with_emb(
+        image_emb, text_emb, confidence_threshold=0.0, per_prompt_thresholds=overrides
+    )
+    assert out_strict.fell_back
+    assert out_strict.prompt == DEFAULT_PROMPT

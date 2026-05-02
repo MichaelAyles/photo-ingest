@@ -138,3 +138,45 @@ def all_labels() -> list[tuple[str, int, str, str, int]]:
 
 def labels_dict() -> dict[str, int]:
     return {sha: score for sha, score, _, _, _ in all_labels()}
+
+
+def export_labels_csv(path: Path) -> int:
+    """Write labels.db to a CSV at path. Returns count written."""
+    import csv
+
+    rows = all_labels()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["sha256", "score", "stem", "src_path", "ts"])
+        for sha, score, stem, src, ts in rows:
+            writer.writerow([sha, score, stem, src, ts])
+    return len(rows)
+
+
+def import_labels_csv(path: Path) -> tuple[int, int]:
+    """Read CSV at path and INSERT-OR-REPLACE into labels. Returns (count_imported, count_skipped)."""
+    import csv
+
+    imported = 0
+    skipped = 0
+    with open(path, encoding="utf-8") as fp:
+        reader = csv.DictReader(fp)
+        for row in reader:
+            try:
+                sha = (row.get("sha256") or "").strip()
+                score = int(row.get("score") or "")
+                if not (SCORE_MIN <= score <= SCORE_MAX) or not sha:
+                    skipped += 1
+                    continue
+                stem = (row.get("stem") or "").strip()
+                src = (row.get("src_path") or "").strip()
+                if not stem or not src:
+                    skipped += 1
+                    continue
+            except (KeyError, ValueError, TypeError):
+                skipped += 1
+                continue
+            add_label(sha, score, stem, src)
+            imported += 1
+    return imported, skipped

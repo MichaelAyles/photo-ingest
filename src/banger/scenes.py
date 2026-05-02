@@ -22,6 +22,16 @@ from banger.aesthetic import _load as _load_clip_internals
 
 CONFIDENCE_THRESHOLD = 0.20  # CLAUDE.md guessed 0.25; empirically 97% fell back at that level on real data
 
+# Per-prompt thresholds (step 19): start uniform at the global default, override
+# specific prompts when empirical tuning suggests they need to be tighter or
+# looser. Looking up via .get(prompt, CONFIDENCE_THRESHOLD) so a missing entry
+# falls back to the global value rather than crashing.
+PER_PROMPT_THRESHOLDS: dict[str, float] = {
+    # No overrides yet — populate as evidence accumulates that, e.g.,
+    # "a moody high-contrast black and white photograph" needs +0.02 to avoid
+    # firing on dim daytime shots, etc.
+}
+
 SCENE_PROMPTS = [
     "a moody high-contrast black and white photograph",
     "a vibrant warm landscape at golden hour",
@@ -72,14 +82,23 @@ def classify_with_emb(
     image_emb: np.ndarray,
     text_emb: torch.Tensor,
     confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    per_prompt_thresholds: dict[str, float] | None = None,
 ) -> SceneMatch:
-    """Pure logic over a precomputed text-embedding tensor; no model load."""
+    """Pure logic over a precomputed text-embedding tensor; no model load.
+
+    The threshold check is per-prompt — `per_prompt_thresholds` overrides
+    `confidence_threshold` for any prompt with an entry. A prompt fails only
+    when its similarity is below ITS specific threshold, so different
+    treatments can have different stringency.
+    """
+    overrides = per_prompt_thresholds or PER_PROMPT_THRESHOLDS
     img_t = torch.from_numpy(image_emb).to(text_emb.device).to(text_emb.dtype)
     sims = (img_t @ text_emb.T).cpu().tolist()
     breakdown = dict(zip(SCENE_PROMPTS, sims))
     top_prompt = max(breakdown, key=breakdown.get)
     top_score = breakdown[top_prompt]
-    if top_score < confidence_threshold:
+    threshold_for_top = overrides.get(top_prompt, confidence_threshold)
+    if top_score < threshold_for_top:
         return SceneMatch(
             prompt=DEFAULT_PROMPT,
             preset=DEFAULT_PRESET,

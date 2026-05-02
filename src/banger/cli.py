@@ -20,6 +20,28 @@ DEFAULT_TOP_N = int(os.environ.get("BANGER_TOP_N", "10"))
 PRESETS_DIR = Path(__file__).resolve().parent.parent.parent / "presets"
 
 
+def _default_output_dir() -> Path | None:
+    """Resolve the default --output dir from BANGER_OUTPUT_DIR.
+
+    The env var, when set, can be a fully-qualified path or a parent directory
+    that gets a YYYY-MM-DD subdir appended. Examples:
+      BANGER_OUTPUT_DIR=~/Pictures/bangers          -> ~/Pictures/bangers/2026-05-02
+      BANGER_OUTPUT_DIR=~/Pictures/bangers/today    -> ~/Pictures/bangers/today (verbatim)
+
+    The "auto-append today" behaviour fires when the env var ends in "bangers"
+    or "/", matching CLAUDE.md's expectation; otherwise we use it verbatim.
+    """
+    raw = os.environ.get("BANGER_OUTPUT_DIR")
+    if not raw:
+        return None
+    import datetime
+
+    p = Path(raw).expanduser()
+    if raw.endswith(("/", "\\")) or p.name == "bangers":
+        p = p / datetime.date.today().isoformat()
+    return p
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="banger")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -36,8 +58,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--output",
         type=Path,
-        default=None,
-        help="Write top-N developed frames (and manifest.json) into this directory.",
+        default=_default_output_dir(),
+        help=(
+            "Write top-N developed frames (and manifest.json) into this directory. "
+            "Defaults to $BANGER_OUTPUT_DIR (with a YYYY-MM-DD subdir appended when "
+            "the env value ends in /, \\ or 'bangers')."
+        ),
     )
     run.add_argument(
         "--top-n",
@@ -71,6 +97,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "train",
         help="Train a Ridge taste head on labelled CLIP embeddings.",
     )
+
+    labels = sub.add_parser("labels", help="Inspect / export / import the label DB.")
+    labels_sub = labels.add_subparsers(dest="labels_action", required=True)
+    labels_sub.add_parser("list", help="Print all labels as a table.")
+    exp = labels_sub.add_parser("export", help="Export labels to CSV.")
+    exp.add_argument("path", type=Path)
+    imp = labels_sub.add_parser("import", help="Import labels from CSV.")
+    imp.add_argument("path", type=Path)
 
     ui = sub.add_parser(
         "ui",
@@ -449,6 +483,37 @@ def cmd_ui(input_dir: Path, port: int) -> int:
     return 0
 
 
+def cmd_labels_list() -> int:
+    rows = state.all_labels()
+    if not rows:
+        print("(no labels)")
+        return 0
+    print(f"{'score':>6}  {'stem':<32}  {'sha':<16}  {'src_path'}")
+    print("-" * 80)
+    for sha, score, stem, src, _ts in rows:
+        sign = "+" if score >= 0 else ""
+        print(f"{sign}{score:>5}  {stem[:32]:<32}  {sha[:16]:<16}  {src}")
+    print(f"\n{len(rows)} labels.")
+    return 0
+
+
+def cmd_labels_export(path: Path) -> int:
+    n = state.export_labels_csv(path)
+    log = logging.getLogger("banger")
+    log.info("exported %d labels to %s", n, path)
+    return 0
+
+
+def cmd_labels_import(path: Path) -> int:
+    log = logging.getLogger("banger")
+    if not path.is_file():
+        log.error("not a file: %s", path)
+        return 2
+    imported, skipped = state.import_labels_csv(path)
+    log.info("imported %d labels from %s (skipped %d malformed)", imported, path, skipped)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
@@ -468,6 +533,13 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_train()
     if args.command == "ui":
         return cmd_ui(args.input_dir, args.port)
+    if args.command == "labels":
+        if args.labels_action == "list":
+            return cmd_labels_list()
+        if args.labels_action == "export":
+            return cmd_labels_export(args.path)
+        if args.labels_action == "import":
+            return cmd_labels_import(args.path)
     return 1
 
 
