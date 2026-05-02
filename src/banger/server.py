@@ -1,12 +1,21 @@
 """Local labelling UI: Flask app at localhost:<port>.
 
-Walks the input directory recursively on startup and parallel-hashes every
-frame's classify-path so labels can be keyed by sha256 (content-addressed,
-survives moves and renames). Thumbnails and CLIP embeddings are encoded
-LAZILY — thumbs on the first /api/thumb/<sha> request, embeddings on the
-first /api/label POST for a frame. That keeps startup fast (~10 s for
-~1000 frames; only sha hashing) and skips CLIP work entirely for frames
-you never label.
+iOS photo-roll layout: one big hero image plus a horizontal filmstrip of
+thumbnails along the bottom. Eye stays in the same place; left/right
+arrows or number keys advance, the filmstrip auto-centres on the current
+frame.
+
+Walks the input directory recursively on startup and parallel-hashes
+every frame's classify-path so labels can be keyed by sha256
+(content-addressed, survives moves and renames). Thumbnails, hero
+previews, and CLIP embeddings are encoded LAZILY:
+
+  - 480 px thumbs on first /api/thumb/<sha>
+  - 1024 px hero JPEGs on first /api/preview/<sha>
+  - CLIP embeddings on first /api/label POST
+
+That keeps startup fast (~1 s/1k frames; only sha hashing) and skips
+encoder work entirely for frames that never enter view.
 
 Differs from CLAUDE.md ("No web server. No frontend.") — the user
 explicitly asked for a labelling frontend.
@@ -18,6 +27,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cv2
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from banger import aesthetic, state
@@ -26,6 +36,8 @@ from banger.preview import load_preview
 from banger.report import encode_thumbnail_bytes
 
 log = logging.getLogger("banger")
+
+PREVIEW_JPEG_QUALITY = 88
 
 
 def _hash_frames(frames):
@@ -36,6 +48,13 @@ def _hash_frames(frames):
 
     with ThreadPoolExecutor(max_workers=8) as exe:
         return list(exe.map(hash_one, frames))
+
+
+def _encode_preview_jpeg(preview_bgr) -> bytes:
+    ok, buf = cv2.imencode(".jpg", preview_bgr, [cv2.IMWRITE_JPEG_QUALITY, PREVIEW_JPEG_QUALITY])
+    if not ok:
+        raise RuntimeError("cv2.imencode failed")
+    return buf.tobytes()
 
 
 def serve(input_dir: Path, port: int = 8000) -> None:
@@ -61,30 +80,24 @@ def serve(input_dir: Path, port: int = 8000) -> None:
         }
         for f, sha in pairs
     ]
-    # Shuffle so labelling samples the dataset evenly and the user doesn't get
-    # a long run of near-duplicate consecutive frames. Stable across one
-    # server session.
     random.shuffle(frames_view)
     log.info("ready: %d frames (shuffled)", len(frames_view))
 
-    # Encoders can race when multiple cards' thumbnails load concurrently —
-    # serialise so we don't double-encode the same sha.
-    thumb_locks: dict[str, threading.Lock] = {}
-    thumb_locks_guard = threading.Lock()
+    locks_guard = threading.Lock()
+    locks: dict[tuple[str, str], threading.Lock] = {}
 
-    def _thumb_lock(sha: str) -> threading.Lock:
-        with thumb_locks_guard:
-            if sha not in thumb_locks:
-                thumb_locks[sha] = threading.Lock()
-            return thumb_locks[sha]
+    def _lock(kind: str, sha: str) -> threading.Lock:
+        key = (kind, sha)
+        with locks_guard:
+            if key not in locks:
+                locks[key] = threading.Lock()
+            return locks[key]
 
     app = Flask(__name__)
 
     @app.route("/")
     def index():
         labels = state.labels_dict()
-        # Put unlabelled frames first so the action surface is at the top of
-        # the grid; labelled frames stay visible below for review.
         unlabelled = [f for f in frames_view if f["sha"] not in labels]
         labelled = [f for f in frames_view if f["sha"] in labels]
         return render_template_string(
@@ -101,7 +114,7 @@ def serve(input_dir: Path, port: int = 8000) -> None:
             return ("not found", 404)
         path = state.thumbnail_path(sha)
         if not path.exists():
-            with _thumb_lock(sha):
+            with _lock("thumb", sha):
                 if not path.exists():
                     try:
                         preview = load_preview(f.classify_path)
@@ -109,6 +122,23 @@ def serve(input_dir: Path, port: int = 8000) -> None:
                         log.warning("thumb fail %s: %s", f.display_name, e)
                         return ("preview failed", 500)
                     state.cache_thumbnail(sha, encode_thumbnail_bytes(preview))
+        return send_file(path, mimetype="image/jpeg")
+
+    @app.route("/api/preview/<sha>")
+    def preview(sha):
+        f = sha_to_frame.get(sha)
+        if f is None:
+            return ("not found", 404)
+        path = state.preview_jpeg_path(sha)
+        if not path.exists():
+            with _lock("preview", sha):
+                if not path.exists():
+                    try:
+                        preview_arr = load_preview(f.classify_path)
+                    except Exception as e:
+                        log.warning("preview fail %s: %s", f.display_name, e)
+                        return ("preview failed", 500)
+                    state.cache_preview_jpeg(sha, _encode_preview_jpeg(preview_arr))
         return send_file(path, mimetype="image/jpeg")
 
     @app.route("/api/label", methods=["POST"])
@@ -128,14 +158,12 @@ def serve(input_dir: Path, port: int = 8000) -> None:
         if not state.SCORE_MIN <= score <= state.SCORE_MAX:
             return (f"score out of [{state.SCORE_MIN}, {state.SCORE_MAX}]", 400)
 
-        # Encode CLIP embedding lazily on first label so train can use it later.
         if state.load_embedding(sha) is None:
             try:
-                preview = load_preview(f.classify_path)
-                state.cache_embedding(sha, aesthetic.encode_image(preview))
+                preview_arr = load_preview(f.classify_path)
+                state.cache_embedding(sha, aesthetic.encode_image(preview_arr))
             except Exception as e:
                 log.warning("embedding fail %s: %s", f.display_name, e)
-                # Label anyway; train will warn about missing embeddings.
 
         state.add_label(sha, score, f.stem, str(f.classify_path))
         return jsonify({"sha": sha, "score": score})
@@ -173,25 +201,25 @@ _TEMPLATE = r"""<!doctype html>
 <title>banger label — {{ input_dir }}</title>
 <style>
   :root { color-scheme: dark; }
-  body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 1rem; background: #111; color: #eee; }
-  header { position: sticky; top: 0; background: #111; padding: .25rem 0 .75rem; border-bottom: 1px solid #2a2a2a; margin-bottom: .75rem; z-index: 10; }
-  h1 { margin: 0 0 .25rem; font-size: 1rem; }
-  .summary { font-size: .8rem; color: #aaa; }
+  html, body { height: 100%; }
+  body { margin: 0; background: #0c0c0c; color: #eee; font-family: ui-sans-serif, system-ui, sans-serif; display: flex; flex-direction: column; overflow: hidden; }
+  header { flex: 0 0 auto; padding: .5rem .75rem; border-bottom: 1px solid #2a2a2a; background: #111; display: flex; gap: .75rem; align-items: baseline; flex-wrap: wrap; }
+  h1 { margin: 0; font-size: .9rem; }
+  .summary { font-size: .75rem; color: #aaa; }
   .summary code { background: #222; padding: 1px 5px; border-radius: 3px; color: #ccc; }
-  .help { font-size: .7rem; color: #888; margin-top: .25rem; }
+  .help { font-size: .7rem; color: #888; margin-left: auto; }
   .help kbd { background: #222; border: 1px solid #333; border-radius: 3px; padding: 0 4px; font-family: ui-monospace, monospace; color: #bbb; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: .75rem; }
-  .card { margin: 0; background: #1a1a1a; border-radius: 6px; overflow: hidden; border: 1px solid #2a2a2a; scroll-margin-top: 6rem; }
-  .card.labelled { border-color: #3a4a3a; }
-  .card.focused { outline: 3px solid #ffaa55; outline-offset: -3px; }
-  .card img { width: 100%; display: block; aspect-ratio: 3/2; object-fit: cover; cursor: pointer; }
-  figcaption { padding: .4rem .55rem; font-size: .75rem; }
-  .head { display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }
-  .stem { font-family: ui-monospace, monospace; }
-  .kind { font-size: .65rem; color: #888; }
-  .subdir { font-size: .65rem; color: #888; }
-  .scores { display: flex; gap: 2px; margin-top: .35rem; flex-wrap: wrap; }
-  .scores button { flex: 1 1 0; min-width: 24px; padding: .25rem 0; background: #222; color: #888; border: 1px solid transparent; border-radius: 3px; cursor: pointer; font: inherit; font-size: .7rem; font-variant-numeric: tabular-nums; }
+
+  #hero { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem; min-height: 0; gap: .75rem; }
+  #hero-img-wrap { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; width: 100%; }
+  #hero-img { max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 4px 32px rgba(0,0,0,.5); border-radius: 4px; background: #000; }
+  #hero-info { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: .35rem; }
+  #hero-meta { font-size: .8rem; color: #ccc; font-family: ui-monospace, monospace; }
+  #hero-meta .sub { color: #888; }
+  #hero-meta .kind { color: #888; font-size: .7rem; margin-left: .35rem; }
+
+  .scores { display: flex; gap: 3px; }
+  .scores button { min-width: 38px; padding: .35rem 0; background: #1f1f1f; color: #888; border: 1px solid transparent; border-radius: 4px; cursor: pointer; font: inherit; font-size: .85rem; font-variant-numeric: tabular-nums; }
   .scores button:hover { background: #2c2c2c; color: #ddd; }
   .scores button.up { color: #5fa05f; }
   .scores button.down { color: #a05f5f; }
@@ -199,23 +227,45 @@ _TEMPLATE = r"""<!doctype html>
   .scores button.active { background: #2e3a2e; color: #d8eed8; border-color: #4a6a4a; }
   .scores button.down.active { background: #3a2e2e; color: #eed8d8; border-color: #6a4a4a; }
   .scores button.zero.active { background: #333; color: #eee; border-color: #666; }
-  .clear { margin-top: .25rem; font-size: .65rem; color: #555; background: none; border: none; cursor: pointer; padding: 0; }
+  .clear { font-size: .65rem; color: #555; background: none; border: none; cursor: pointer; padding: 0; }
   .clear:hover { color: #888; }
+
+  #filmstrip { flex: 0 0 96px; display: flex; gap: 4px; overflow-x: auto; padding: 8px 12px; background: #0a0a0a; border-top: 1px solid #2a2a2a; scrollbar-width: thin; }
+  #filmstrip::-webkit-scrollbar { height: 6px; }
+  #filmstrip::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  .thumb { flex: 0 0 auto; height: 80px; aspect-ratio: 3/2; cursor: pointer; opacity: .55; transition: opacity .12s, transform .12s; border-radius: 3px; object-fit: cover; background: #000; border: 2px solid transparent; box-sizing: border-box; }
+  .thumb:hover { opacity: .85; }
+  .thumb.current { opacity: 1; outline: 2px solid #ffaa55; outline-offset: -2px; transform: scale(1.06); }
+  .thumb.labelled { border-bottom-color: #5fa05f; }
+  .thumb.labelled.down { border-bottom-color: #a05f5f; }
+  .thumb.labelled.zero { border-bottom-color: #888; }
 </style>
 </head>
 <body>
 <header>
   <h1>banger label</h1>
   <div class="summary">
-    <code>{{ input_dir }}</code> &middot;
-    <span id="stats"></span>
+    <code>{{ input_dir }}</code> &middot; <span id="stats"></span>
   </div>
   <div class="help">
-    <kbd>1</kbd>-<kbd>5</kbd> = -5 to -1 &nbsp; <kbd>6</kbd>-<kbd>9</kbd> + <kbd>0</kbd> = +1 to +5 &nbsp;·&nbsp;
-    <kbd>←</kbd> <kbd>→</kbd> move &nbsp;·&nbsp; <kbd>Space</kbd> skip &nbsp;·&nbsp; <kbd>Backspace</kbd> clear
+    <kbd>1</kbd>-<kbd>5</kbd> = -5..-1 &nbsp; <kbd>6</kbd>-<kbd>9</kbd>+<kbd>0</kbd> = +1..+5 &nbsp;·&nbsp;
+    <kbd>←</kbd><kbd>→</kbd> move &nbsp;·&nbsp; <kbd>Space</kbd> skip &nbsp;·&nbsp; <kbd>Bksp</kbd> clear
   </div>
 </header>
-<main class="grid" id="grid"></main>
+
+<section id="hero">
+  <div id="hero-img-wrap">
+    <img id="hero-img" alt="">
+  </div>
+  <div id="hero-info">
+    <div id="hero-meta"></div>
+    <div class="scores" id="hero-scores"></div>
+    <button class="clear" id="hero-clear">clear label</button>
+  </div>
+</section>
+
+<div id="filmstrip"></div>
+
 <script>
 const FRAMES = {{ frames | tojson }};
 const LABELS = {{ labels | tojson }};
@@ -224,6 +274,7 @@ const KEY_TO_SCORE = {
   '1': -5, '2': -4, '3': -3, '4': -2, '5': -1,
   '6': 1, '7': 2, '8': 3, '9': 4, '0': 5,
 };
+const PRELOAD_RANGE = 3;
 
 let focusIdx = 0;
 
@@ -231,49 +282,90 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-function cardHtml(f, idx) {
-  const score = LABELS[f.sha];
-  const labelled = score !== undefined ? "labelled" : "";
-  const buttons = SCORES.map(s => {
-    const cls = (s > 0 ? "up" : s < 0 ? "down" : "zero") + (s === score ? " active" : "");
+function buildFilmstrip() {
+  const strip = document.getElementById("filmstrip");
+  strip.innerHTML = FRAMES.map((f, i) => {
+    const score = LABELS[f.sha];
+    const labelClass = score === undefined ? "" :
+      "labelled " + (score > 0 ? "up" : score < 0 ? "down" : "zero");
+    return `<img class="thumb ${labelClass}" loading="lazy"
+                 data-idx="${i}" data-sha="${f.sha}"
+                 src="/api/thumb/${f.sha}"
+                 alt="${escapeHtml(f.display)}"
+                 title="${escapeHtml(f.display)}${score !== undefined ? ' (' + (score>0?'+':'') + score + ')' : ''}">`;
+  }).join("");
+}
+
+function buildScoreButtons() {
+  const wrap = document.getElementById("hero-scores");
+  wrap.innerHTML = SCORES.map(s => {
+    const cls = s > 0 ? "up" : s < 0 ? "down" : "zero";
     const label = s > 0 ? "+" + s : s;
     return `<button data-score="${s}" class="${cls}" tabindex="-1">${label}</button>`;
   }).join("");
-  const sub = f.subdir ? `<span class="subdir">${escapeHtml(f.subdir)}</span>` : "";
-  return `
-    <figure class="card ${labelled}" data-sha="${f.sha}" data-idx="${idx}">
-      <img loading="lazy" src="/api/thumb/${f.sha}" alt="${escapeHtml(f.display)}">
-      <figcaption>
-        <div class="head">
-          <span class="stem">${escapeHtml(f.stem)}</span>
-          <span class="kind">${escapeHtml(f.kind)}</span>
-        </div>
-        ${sub}
-        <div class="scores">${buttons}</div>
-        <button class="clear" tabindex="-1">clear label</button>
-      </figcaption>
-    </figure>
-  `;
 }
 
-function render() {
-  document.getElementById("grid").innerHTML = FRAMES.map(cardHtml).join("");
-  setFocus(0);
+function refreshFilmstripThumb(sha) {
+  const node = document.querySelector(`#filmstrip .thumb[data-sha="${sha}"]`);
+  if (!node) return;
+  const score = LABELS[sha];
+  node.classList.remove("labelled", "up", "down", "zero");
+  if (score !== undefined) {
+    node.classList.add("labelled", score > 0 ? "up" : score < 0 ? "down" : "zero");
+  }
+  let title = node.dataset.display || node.alt;
+  if (score !== undefined) title += " (" + (score > 0 ? "+" : "") + score + ")";
+  node.title = title;
+}
+
+function refreshHero() {
+  const f = FRAMES[focusIdx];
+  if (!f) return;
+  const img = document.getElementById("hero-img");
+  img.src = "/api/preview/" + f.sha;
+  img.alt = f.display;
+
+  const meta = document.getElementById("hero-meta");
+  const sub = f.subdir ? `<span class="sub">${escapeHtml(f.subdir)}/</span>` : "";
+  meta.innerHTML = `${sub}${escapeHtml(f.stem)}<span class="kind">${escapeHtml(f.kind)}</span>`;
+
+  const score = LABELS[f.sha];
+  document.querySelectorAll("#hero-scores button").forEach(b => {
+    b.classList.toggle("active", parseInt(b.dataset.score) === score);
+  });
+
+  document.querySelectorAll("#filmstrip .thumb.current").forEach(n => n.classList.remove("current"));
+  const cur = document.querySelector(`#filmstrip .thumb[data-idx="${focusIdx}"]`);
+  if (cur) {
+    cur.classList.add("current");
+    centreThumb(cur);
+  }
+
+  preloadAhead();
   updateStats();
 }
 
-function cards() {
-  return document.querySelectorAll(".card");
+function centreThumb(node) {
+  const strip = document.getElementById("filmstrip");
+  const target = node.offsetLeft - strip.clientWidth / 2 + node.offsetWidth / 2;
+  strip.scrollTo({left: target, behavior: "smooth"});
+}
+
+function preloadAhead() {
+  for (let off = -PRELOAD_RANGE; off <= PRELOAD_RANGE; off++) {
+    if (off === 0) continue;
+    const i = focusIdx + off;
+    if (i < 0 || i >= FRAMES.length) continue;
+    const img = new Image();
+    img.src = "/api/preview/" + FRAMES[i].sha;
+  }
 }
 
 function setFocus(idx) {
-  const all = cards();
-  if (all.length === 0) return;
-  idx = Math.max(0, Math.min(idx, all.length - 1));
-  document.querySelectorAll(".card.focused").forEach(c => c.classList.remove("focused"));
+  if (idx < 0) idx = 0;
+  if (idx >= FRAMES.length) idx = FRAMES.length - 1;
   focusIdx = idx;
-  all[idx].classList.add("focused");
-  all[idx].scrollIntoView({block: "nearest", behavior: "smooth"});
+  refreshHero();
 }
 
 async function setScore(sha, score) {
@@ -287,52 +379,53 @@ async function setScore(sha, score) {
     return;
   }
   LABELS[sha] = score;
-  refreshCard(sha);
+  refreshFilmstripThumb(sha);
+  if (FRAMES[focusIdx].sha === sha) {
+    document.querySelectorAll("#hero-scores button").forEach(b => {
+      b.classList.toggle("active", parseInt(b.dataset.score) === score);
+    });
+  }
+  updateStats();
 }
 
 async function clearScore(sha) {
   const res = await fetch("/api/label/" + sha, {method: "DELETE"});
   if (!res.ok) return;
   delete LABELS[sha];
-  refreshCard(sha);
-}
-
-function refreshCard(sha) {
-  const card = document.querySelector(`.card[data-sha="${sha}"]`);
-  if (!card) return;
-  const score = LABELS[sha];
-  card.classList.toggle("labelled", score !== undefined);
-  card.querySelectorAll(".scores button").forEach(b => {
-    b.classList.toggle("active", parseInt(b.dataset.score) === score);
-  });
+  refreshFilmstripThumb(sha);
+  if (FRAMES[focusIdx].sha === sha) {
+    document.querySelectorAll("#hero-scores button.active").forEach(b => b.classList.remove("active"));
+  }
   updateStats();
 }
 
 function updateStats() {
   const labelled = FRAMES.filter(f => LABELS[f.sha] !== undefined).length;
-  document.getElementById("stats").textContent = `${FRAMES.length} frames · ${labelled} labelled`;
+  document.getElementById("stats").textContent =
+    `${focusIdx + 1} / ${FRAMES.length} · ${labelled} labelled`;
 }
 
-document.addEventListener("click", e => {
-  const card = e.target.closest(".card");
-  if (!card) return;
-  const idx = parseInt(card.dataset.idx);
-  if (!Number.isNaN(idx)) setFocus(idx);
-  const sha = card.dataset.sha;
-  if (e.target.matches(".scores button")) {
-    setScore(sha, parseInt(e.target.dataset.score));
-  } else if (e.target.matches(".clear")) {
-    clearScore(sha);
-  }
+document.getElementById("filmstrip").addEventListener("click", e => {
+  const t = e.target.closest(".thumb");
+  if (!t) return;
+  setFocus(parseInt(t.dataset.idx));
+});
+
+document.getElementById("hero-scores").addEventListener("click", e => {
+  if (!e.target.matches("button")) return;
+  const sha = FRAMES[focusIdx]?.sha;
+  if (sha) setScore(sha, parseInt(e.target.dataset.score));
+});
+
+document.getElementById("hero-clear").addEventListener("click", () => {
+  const sha = FRAMES[focusIdx]?.sha;
+  if (sha) clearScore(sha);
 });
 
 document.addEventListener("keydown", e => {
   if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
-
-  const all = cards();
-  if (all.length === 0) return;
-  const sha = all[focusIdx]?.dataset.sha;
+  const sha = FRAMES[focusIdx]?.sha;
 
   if (e.key in KEY_TO_SCORE) {
     e.preventDefault();
@@ -344,24 +437,6 @@ document.addEventListener("keydown", e => {
   } else if (e.key === "ArrowLeft" || e.key === "h") {
     e.preventDefault();
     setFocus(focusIdx - 1);
-  } else if (e.key === "ArrowDown" || e.key === "j") {
-    e.preventDefault();
-    // Approximate column count by comparing card top offsets.
-    const cur = all[focusIdx];
-    const nextRow = Array.from(all).findIndex((c, i) => i > focusIdx && c.offsetTop > cur.offsetTop);
-    if (nextRow >= 0) {
-      const cols = nextRow - all.findIndex((c, i) => c.offsetTop === cur.offsetTop);
-      setFocus(focusIdx + cols);
-    }
-  } else if (e.key === "ArrowUp" || e.key === "k") {
-    e.preventDefault();
-    const cur = all[focusIdx];
-    const colsAbove = Array.from(all).slice(0, focusIdx).reverse().findIndex(c => c.offsetTop < cur.offsetTop);
-    if (colsAbove >= 0) {
-      setFocus(focusIdx - colsAbove - 1);
-    } else {
-      setFocus(0);
-    }
   } else if (e.key === "Backspace") {
     e.preventDefault();
     if (sha) clearScore(sha);
@@ -371,7 +446,9 @@ document.addEventListener("keydown", e => {
   }
 });
 
-render();
+buildFilmstrip();
+buildScoreButtons();
+setFocus(0);
 </script>
 </body>
 </html>

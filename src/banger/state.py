@@ -14,6 +14,7 @@ import numpy as np
 STATE_DIR = Path.home() / ".local" / "share" / "banger-pipeline"
 EMBEDDINGS_DIR = STATE_DIR / "embeddings"
 THUMBS_DIR = STATE_DIR / "thumbs"
+PREVIEWS_DIR = STATE_DIR / "previews"
 LABELS_DB = STATE_DIR / "labels.db"
 TASTE_HEAD = STATE_DIR / "taste_head.joblib"
 
@@ -97,6 +98,15 @@ def cache_thumbnail(sha: str, jpeg_bytes: bytes) -> None:
 
 def thumbnail_path(sha: str) -> Path:
     return THUMBS_DIR / f"{sha}.jpg"
+
+
+def cache_preview_jpeg(sha: str, jpeg_bytes: bytes) -> None:
+    PREVIEWS_DIR.mkdir(parents=True, exist_ok=True)
+    (PREVIEWS_DIR / f"{sha}.jpg").write_bytes(jpeg_bytes)
+
+
+def preview_jpeg_path(sha: str) -> Path:
+    return PREVIEWS_DIR / f"{sha}.jpg"
 
 
 def add_label(sha: str, score: int, stem: str, src_path: str) -> None:
