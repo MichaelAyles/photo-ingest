@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from banger import aesthetic
+from banger import aesthetic, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.frames import discover_frames
 from banger.preview import load_preview
@@ -34,6 +34,19 @@ def _build_parser() -> argparse.ArgumentParser:
     explain.add_argument("input_dir", type=Path)
     explain.add_argument("stems", nargs="+", help="Frame stems, e.g. DSC00055 DSC00073.")
 
+    label = sub.add_parser(
+        "label",
+        help="Record up/down labels for frames; used by `banger train` to fit a taste head.",
+    )
+    label.add_argument("input_dir", type=Path)
+    label.add_argument("verdict", choices=["up", "down"])
+    label.add_argument("stems", nargs="+", help="Frame stems to label with this verdict.")
+
+    sub.add_parser(
+        "train",
+        help="Train a logistic-regression taste head on labelled CLIP embeddings.",
+    )
+
     return parser
 
 
@@ -49,10 +62,12 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
         return 0
 
     threshold = SHARPNESS_CONFIG["threshold"]
+    head = taste_head.load()
     log.info(
-        "processing %d frames (sharpness threshold=%.1f, report=%s)",
+        "processing %d frames (sharpness threshold=%.1f, aesthetic=%s, report=%s)",
         len(frames),
         threshold,
+        "trained head" if head is not None else "prompts",
         report_path or "off",
     )
 
@@ -70,9 +85,19 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
         sharp = sharpness_from_preview(preview)
         a_score: float | None = None
         breakdown: dict[str, float] | None = None
+        source: str | None = None
         if sharp >= threshold:
             try:
-                a_score, breakdown = aesthetic.score_from_preview(preview)
+                emb = aesthetic.encode_image(preview)
+                sha = state.sha256_of(f.classify_path)
+                state.cache_embedding(sha, emb)
+                _, breakdown = aesthetic.score_from_embedding(emb)
+                if head is not None:
+                    a_score = taste_head.predict_score(head, emb)
+                    source = "head"
+                else:
+                    a_score, _ = aesthetic.score_from_embedding(emb)
+                    source = "prompts"
                 aesthetic_done += 1
             except Exception as e:
                 log.warning("aesthetic skip %s: %s", f.stem, e)
@@ -85,6 +110,7 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
                 sharpness=sharp,
                 aesthetic=a_score,
                 aesthetic_breakdown=breakdown,
+                aesthetic_source=source,
                 thumb_b64=thumb,
             )
         )
@@ -166,8 +192,8 @@ def cmd_explain(input_dir: Path, stems: list[str]) -> int:
             print(f"{breakdown[prompt]:>{col_w}.4f}", end="")
         print()
     print("-" * (label_w + col_w * len(results)))
-    print(f"{'mean(positives)':<{label_w}}", end="")
     n_pos = len(POSITIVE_PROMPTS)
+    print(f"{'mean(positives)':<{label_w}}", end="")
     for _, _, b in results:
         print(f"{sum(list(b.values())[:n_pos]) / n_pos:>{col_w}.4f}", end="")
     print()
@@ -182,6 +208,33 @@ def cmd_explain(input_dir: Path, stems: list[str]) -> int:
     return 0
 
 
+def cmd_label(input_dir: Path, verdict: str, stems: list[str]) -> int:
+    log = logging.getLogger("banger")
+    if not input_dir.is_dir():
+        log.error("not a directory: %s", input_dir)
+        return 2
+
+    frames = {f.stem: f for f in discover_frames(input_dir)}
+    missing = [s for s in stems if s not in frames]
+    if missing:
+        log.error("not found in %s: %s", input_dir, ", ".join(missing))
+        return 2
+
+    for s in stems:
+        f = frames[s]
+        sha = state.sha256_of(f.classify_path)
+        state.add_label(sha, verdict, s, str(f.classify_path))
+        log.info("labelled %s as %s", s, verdict)
+
+    up, down = state.label_counts()
+    log.info("total labels: %d up + %d down", up, down)
+    return 0
+
+
+def cmd_train() -> int:
+    return 0 if taste_head.train_from_disk() is not None else 2
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
@@ -189,6 +242,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(args.input_dir, args.report)
     if args.command == "explain":
         return cmd_explain(args.input_dir, args.stems)
+    if args.command == "label":
+        return cmd_label(args.input_dir, args.verdict, args.stems)
+    if args.command == "train":
+        return cmd_train()
     return 1
 
 

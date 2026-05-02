@@ -19,6 +19,7 @@ class Row:
     sharpness: float
     aesthetic: float | None
     aesthetic_breakdown: dict[str, float] | None
+    aesthetic_source: str | None  # "prompts" | "head"
     thumb_b64: str
 
 
@@ -101,7 +102,12 @@ def _card(row: Row, is_keep: bool) -> str:
     stem = html.escape(row.frame.stem)
     kind = html.escape(row.frame.kind)
     if row.aesthetic is not None:
-        primary = f'<span class="primary">{row.aesthetic:.2f}</span>'
+        source_tag = (
+            f'<span class="src-{row.aesthetic_source}">{row.aesthetic_source}</span>'
+            if row.aesthetic_source
+            else ""
+        )
+        primary = f'<span class="primary">{row.aesthetic:.2f}</span>{source_tag}'
     else:
         primary = '<span class="primary muted">—</span>'
     breakdown_html = _breakdown(row.aesthetic_breakdown) if row.aesthetic_breakdown else ""
@@ -165,6 +171,8 @@ _TEMPLATE = """<!doctype html>
   .breakdown table {{ width: 100%; border-collapse: collapse; margin-top: .2rem; }}
   .breakdown td {{ padding: .1rem 0; }}
   .breakdown td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .src-prompts {{ font-size: .55rem; color: #888; margin-left: .35rem; text-transform: uppercase; letter-spacing: .04em; }}
+  .src-head {{ font-size: .55rem; color: #c9d; margin-left: .35rem; text-transform: uppercase; letter-spacing: .04em; }}
 </style>
 </head>
 <body>

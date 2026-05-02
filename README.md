@@ -26,10 +26,22 @@ pip install "transformers<5"  # transformers 5.x has a Windows-segfaulting paral
 ## Usage
 
 ```sh
-python -m banger run ./tests/fixtures/
+# Score a folder (sharpness + aesthetic) and write an HTML report:
+python -m banger run ./test_photos --report reports/today.html
+
+# See why CLIP ranked two specific frames the way it did:
+python -m banger explain ./test_photos DSC00055 DSC00073
+
+# Build a personal taste head from your own thumbs-up/down:
+python -m banger run ./test_photos --report reports/today.html  # caches CLIP embeddings
+python -m banger label ./test_photos up   DSC00055 DSC00088 DSC00091
+python -m banger label ./test_photos down DSC00073 DSC00077
+python -m banger train                                          # fits logistic regression
+python -m banger run ./test_photos --report reports/today.html  # auto-uses the head
 ```
 
-Currently a stub — logs the input path and exits.
+State (cached CLIP embeddings, label DB, taste head) lives at
+`~/.local/share/banger-pipeline/`. Delete that dir to start fresh.
 
 ## Why this exists
 

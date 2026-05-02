@@ -87,14 +87,12 @@ Once v0 is proven on a fixtures folder, wire it to the camera.
 
 ## v1 — make the cull actually mine
 
-### Step 16 — thumbs-up/down log
-- Add a tiny CLI: `banger label <path> up|down`. Appends to a JSONL file with the CLIP embedding (cached) and the label.
-- Optional: a one-shot script that walks the output folder and prompts y/n per image, for batch labelling after a trip.
+### Step 16 — thumbs-up/down log (PULLED FORWARD)
+- Done early: generic CLIP-prompt scoring failed empirically on real photos (it ranked a clean shot of a dog swimming away above the user's actual favourite, because CLIP's negatives punished the favourite's intentional shallow depth-of-field as if it were accidental blur). The plan called for the trained head only at v1, but with the prompt scoring this misranked, we needed the labelling tool now.
+- Implemented: `banger label <input_dir> up|down <stem>...` writes a SQLite row keyed by sha256 of the source file. CLIP embeddings cached during `banger run` at `~/.local/share/banger-pipeline/embeddings/{sha}.npy`.
 
-### Step 17 — trained taste head
-- Once 200 labels exist, train a logistic regression (or 2-layer MLP) on the cached CLIP embeddings.
-- Replace `score()` in stage 5 with the trained head. Keep the generic predictor as a fallback when the model doesn't exist yet.
-- Retrain on every label update; it's seconds.
+### Step 17 — trained taste head (PULLED FORWARD)
+- Done early: `banger train` reads the labels DB, looks up cached embeddings by sha, fits a sklearn LogisticRegression, saves to `~/.local/share/banger-pipeline/taste_head.joblib`. Leave-one-out CV accuracy printed for sanity. `cmd_run` auto-loads the head if it exists and uses it for scoring; otherwise falls back to prompts. Plan said 200 labels; the head can be trained from any number with both classes present, but is unreliable until at least 30-50.
 
 ### Step 18 — face-aware sharpness
 - Run a face detector (mediapipe is fine) on survivors. If a face is present, override the global sharpness threshold with an "eyes-in-focus" check on the face crop.
