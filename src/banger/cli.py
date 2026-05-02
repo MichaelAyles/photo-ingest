@@ -117,6 +117,20 @@ def _build_parser() -> argparse.ArgumentParser:
     imp = labels_sub.add_parser("import", help="Import labels from CSV.")
     imp.add_argument("path", type=Path)
 
+    cache = sub.add_parser("cache", help="Inspect / clear on-disk caches (not labels).")
+    cache_sub = cache.add_subparsers(dest="cache_action", required=True)
+    cache_sub.add_parser("stats", help="Print counts + sizes for each cache.")
+    clear = cache_sub.add_parser(
+        "clear", help="Delete cached files. Use --kind repeatedly or --all."
+    )
+    clear.add_argument(
+        "--kind",
+        action="append",
+        choices=["embeddings", "thumbs", "previews", "metadata"],
+        default=[],
+    )
+    clear.add_argument("--all", action="store_true", help="Clear every cache.")
+
     ui = sub.add_parser(
         "ui",
         help="Start the local labelling UI (http://127.0.0.1:<port>).",
@@ -637,6 +651,36 @@ def cmd_labels_import(path: Path) -> int:
     return 0
 
 
+def cmd_cache_stats() -> int:
+    stats = state.cache_stats()
+    print(f"{'cache':<12} {'count':>8} {'size':>10}  path")
+    print("-" * 80)
+    total_bytes = 0
+    total_count = 0
+    for name, info in stats.items():
+        size_mb = info["bytes"] / (1024 * 1024)
+        size_str = f"{size_mb:>9.1f}M" if size_mb >= 1 else f"{info['bytes']:>9}B"
+        print(f"{name:<12} {info['count']:>8} {size_str}  {info['path']}")
+        total_bytes += info["bytes"]
+        total_count += info["count"]
+    print("-" * 80)
+    print(f"{'TOTAL':<12} {total_count:>8} {total_bytes / (1024 * 1024):>9.1f}M")
+    return 0
+
+
+def cmd_cache_clear(kinds: list[str], all_caches: bool) -> int:
+    log = logging.getLogger("banger")
+    if all_caches:
+        kinds = ["embeddings", "thumbs", "previews", "metadata"]
+    if not kinds:
+        log.error("specify at least one --kind, or --all")
+        return 2
+    removed = state.clear_cache(kinds)
+    for k, n in removed.items():
+        log.info("cleared %s: %d files removed", k, n)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
@@ -664,6 +708,11 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_labels_export(args.path)
         if args.labels_action == "import":
             return cmd_labels_import(args.path)
+    if args.command == "cache":
+        if args.cache_action == "stats":
+            return cmd_cache_stats()
+        if args.cache_action == "clear":
+            return cmd_cache_clear(args.kind, args.all)
     return 1
 
 

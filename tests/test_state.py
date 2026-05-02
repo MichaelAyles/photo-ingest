@@ -135,6 +135,43 @@ def test_frame_metadata_corrupt_returns_none(isolated_state, tmp_path):
     assert isolated_state.load_frame_metadata(sha) is None
 
 
+def test_cache_stats_starts_empty(isolated_state):
+    stats = isolated_state.cache_stats()
+    assert set(stats) == {"embeddings", "thumbs", "previews", "metadata"}
+    for name, info in stats.items():
+        assert info["count"] == 0
+        assert info["bytes"] == 0
+
+
+def test_cache_stats_reflects_writes(isolated_state):
+    sha = "deadbeef"
+    isolated_state.cache_thumbnail(sha, b"jpegbytes")
+    isolated_state.cache_preview_jpeg(sha, b"biggerbytes")
+    isolated_state.cache_frame_metadata(sha, 1.0, "abc", 0.0)
+    stats = isolated_state.cache_stats()
+    assert stats["thumbs"]["count"] == 1
+    assert stats["previews"]["count"] == 1
+    assert stats["metadata"]["count"] == 1
+
+
+def test_cache_clear_removes_only_named_kinds(isolated_state):
+    sha = "deadbeef"
+    isolated_state.cache_thumbnail(sha, b"j")
+    isolated_state.cache_preview_jpeg(sha, b"j")
+    isolated_state.cache_frame_metadata(sha, 1.0, "abc", 0.0)
+    removed = isolated_state.clear_cache(["thumbs"])
+    assert removed == {"thumbs": 1}
+    stats = isolated_state.cache_stats()
+    assert stats["thumbs"]["count"] == 0
+    assert stats["previews"]["count"] == 1
+    assert stats["metadata"]["count"] == 1
+
+
+def test_cache_clear_unknown_kind_raises(isolated_state):
+    with pytest.raises(ValueError):
+        isolated_state.clear_cache(["bogus"])
+
+
 def test_csv_import_skips_malformed_rows(isolated_state, tmp_path):
     csv_path = tmp_path / "bad.csv"
     csv_path.write_text(

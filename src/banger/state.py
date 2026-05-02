@@ -178,6 +178,58 @@ def labels_dict() -> dict[str, int]:
     return {sha: score for sha, score, _, _, _ in all_labels()}
 
 
+def cache_stats() -> dict[str, dict]:
+    """Return per-cache (count, total_bytes) for the on-disk caches we own."""
+    out: dict[str, dict] = {}
+    for name, dir_path, suffix in (
+        ("embeddings", EMBEDDINGS_DIR, ".npy"),
+        ("thumbs", THUMBS_DIR, ".jpg"),
+        ("previews", PREVIEWS_DIR, ".jpg"),
+        ("metadata", METADATA_DIR, ".json"),
+    ):
+        if dir_path.exists():
+            files = list(dir_path.glob(f"*{suffix}"))
+            out[name] = {
+                "count": len(files),
+                "bytes": sum(p.stat().st_size for p in files),
+                "path": str(dir_path),
+            }
+        else:
+            out[name] = {"count": 0, "bytes": 0, "path": str(dir_path)}
+    return out
+
+
+def clear_cache(kinds: list[str]) -> dict[str, int]:
+    """Delete files in the named caches. Returns count removed per kind.
+
+    Valid kinds: 'embeddings', 'thumbs', 'previews', 'metadata'. Labels are
+    NOT touched — they're not a cache, they're authored input.
+    """
+    targets = {
+        "embeddings": (EMBEDDINGS_DIR, "*.npy"),
+        "thumbs": (THUMBS_DIR, "*.jpg"),
+        "previews": (PREVIEWS_DIR, "*.jpg"),
+        "metadata": (METADATA_DIR, "*.json"),
+    }
+    removed: dict[str, int] = {}
+    for k in kinds:
+        if k not in targets:
+            raise ValueError(f"unknown cache kind: {k}")
+        dir_path, glob = targets[k]
+        if not dir_path.exists():
+            removed[k] = 0
+            continue
+        n = 0
+        for p in dir_path.glob(glob):
+            try:
+                p.unlink()
+                n += 1
+            except OSError:
+                pass
+        removed[k] = n
+    return removed
+
+
 def export_labels_csv(path: Path) -> int:
     """Write labels.db to a CSV at path. Returns count written."""
     import csv
