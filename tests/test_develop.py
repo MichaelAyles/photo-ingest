@@ -5,11 +5,7 @@ import shutil
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from banger.develop import (
-    DARKTABLE_BINARY_NAMES,
-    DARKTABLE_WINDOWS_FALLBACK_PATHS,
     DevelopResult,
     copy_fallback,
     develop_to_jpeg,

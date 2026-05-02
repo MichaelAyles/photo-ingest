@@ -82,7 +82,7 @@ def score_from_embedding(emb: np.ndarray) -> tuple[float, dict[str, float]]:
     img_t = torch.from_numpy(emb).to(text_emb.device).to(text_emb.dtype)
     sims = (img_t @ text_emb.T).cpu().tolist()
     all_prompts = POSITIVE_PROMPTS + NEGATIVE_PROMPTS
-    breakdown = dict(zip(all_prompts, sims))
+    breakdown = dict(zip(all_prompts, sims, strict=True))
     pos = sum(sims[:n_pos]) / n_pos
     neg = sum(sims[n_pos:]) / (len(sims) - n_pos)
     # Cosine sims sit in [0.15, 0.35]; pos-neg gap typically [-0.05, 0.10].

@@ -1,8 +1,6 @@
 """Face detection: Haar cascade smoke tests with synthetic + real images."""
 
-from pathlib import Path
 
-import cv2
 import numpy as np
 import pytest
 

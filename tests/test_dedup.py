@@ -1,11 +1,9 @@
 """Burst dedup: clustering rules + best-per-cluster selection."""
 
-from datetime import datetime
 
 import imagehash
 import numpy as np
 import pytest
-from PIL import Image
 
 from banger.dedup import (
     Cluster,

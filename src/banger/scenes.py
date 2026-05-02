@@ -94,7 +94,7 @@ def classify_with_emb(
     overrides = per_prompt_thresholds or PER_PROMPT_THRESHOLDS
     img_t = torch.from_numpy(image_emb).to(text_emb.device).to(text_emb.dtype)
     sims = (img_t @ text_emb.T).cpu().tolist()
-    breakdown = dict(zip(SCENE_PROMPTS, sims))
+    breakdown = dict(zip(SCENE_PROMPTS, sims, strict=True))
     top_prompt = max(breakdown, key=breakdown.get)
     top_score = breakdown[top_prompt]
     threshold_for_top = overrides.get(top_prompt, confidence_threshold)

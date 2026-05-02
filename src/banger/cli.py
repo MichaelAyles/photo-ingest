@@ -1,15 +1,16 @@
 import argparse
 import logging
+import os
 import statistics
 import sys
 import time
 from pathlib import Path
 
-import os
-
 import imagehash
+import numpy as np
 
-from banger import aesthetic, dedup, develop as develop_mod, face, scenes, server, state, taste_head
+from banger import aesthetic, dedup, face, scenes, server, state, taste_head
+from banger import develop as develop_mod
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
 from banger.frames import discover_frames
@@ -178,7 +179,7 @@ def cmd_run(
     rows: list[Row] = []
     # Carry the in-memory embedding alongside dedup metadata so the scene
     # classifier doesn't have to re-read it from disk per cluster best.
-    dedup_inputs: list[tuple[Row, ClusterItem, "np.ndarray"]] = []
+    dedup_inputs: list[tuple[Row, ClusterItem, np.ndarray]] = []
     aesthetic_done = 0
     aesthetic_skipped = 0
     cache_hits = 0
@@ -342,7 +343,6 @@ def cmd_run(
 
     # Burst dedup: cluster by pHash + timestamp, mark non-best siblings.
     rows_by_key = {ci.key: row for row, ci, _ in dedup_inputs}
-    embs_by_key = {ci.key: emb for _, ci, emb in dedup_inputs}
     clusters = dedup.cluster_bursts([ci for _, ci, _ in dedup_inputs])
     bursts = [c for c in clusters if len(c) > 1]
     suppressed_count = 0
@@ -358,7 +358,7 @@ def cmd_run(
 
     # Scene classification: only for frames that survive both gates.
     scene_done = 0
-    for row, ci, emb in dedup_inputs:
+    for row, _ci, emb in dedup_inputs:
         if not row.cluster_best:
             continue
         try:

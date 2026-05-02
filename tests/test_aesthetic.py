@@ -7,7 +7,6 @@ matmul against the prompt embeddings + a positive/negative average.
 """
 
 import numpy as np
-import pytest
 import torch
 
 from banger import aesthetic

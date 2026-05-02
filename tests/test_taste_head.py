@@ -6,7 +6,6 @@ exercising — same logic at any dimensionality.
 """
 
 import numpy as np
-import pytest
 
 from banger import taste_head
 

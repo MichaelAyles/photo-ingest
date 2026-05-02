@@ -138,7 +138,7 @@ def test_frame_metadata_corrupt_returns_none(isolated_state, tmp_path):
 def test_cache_stats_starts_empty(isolated_state):
     stats = isolated_state.cache_stats()
     assert set(stats) == {"embeddings", "thumbs", "previews", "metadata"}
-    for name, info in stats.items():
+    for _name, info in stats.items():
         assert info["count"] == 0
         assert info["bytes"] == 0
 
