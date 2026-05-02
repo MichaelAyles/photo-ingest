@@ -231,10 +231,10 @@ def cmd_run(
             ts = float(cached_meta["timestamp"])
             emb = cached_emb
             try:
-                _, breakdown = aesthetic.score_from_embedding(emb)
+                prompt_score, breakdown = aesthetic.score_from_embedding(emb)
                 a_score = (
                     taste_head.predict_score(head, emb) if head is not None
-                    else aesthetic.score_from_embedding(emb)[0]
+                    else prompt_score
                 )
                 source = "head" if head is not None else "prompts"
                 aesthetic_done += 1
@@ -263,12 +263,12 @@ def cmd_run(
                 try:
                     emb = aesthetic.encode_image(preview)
                     state.cache_embedding(sha, emb)
-                    _, breakdown = aesthetic.score_from_embedding(emb)
+                    prompt_score, breakdown = aesthetic.score_from_embedding(emb)
                     if head is not None:
                         a_score = taste_head.predict_score(head, emb)
                         source = "head"
                     else:
-                        a_score, _ = aesthetic.score_from_embedding(emb)
+                        a_score = prompt_score
                         source = "prompts"
                     phash = dedup.phash_from_preview(preview)
                     ts = dedup.best_timestamp(f.classify_path)
