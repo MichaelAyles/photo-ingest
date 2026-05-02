@@ -56,7 +56,8 @@ def _load():
     return model, processor, device, text_emb, len(POSITIVE_PROMPTS)
 
 
-def score_from_preview(preview: np.ndarray) -> float:
+def score_from_preview(preview: np.ndarray) -> tuple[float, dict[str, float]]:
+    """Return (score, per-prompt cosine similarity dict)."""
     rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
     pil = Image.fromarray(rgb)
     model, processor, device, text_emb, n_pos = _load()
@@ -67,15 +68,17 @@ def score_from_preview(preview: np.ndarray) -> float:
     with torch.inference_mode():
         img_emb = model.get_image_features(**image_inputs)
         img_emb = img_emb / img_emb.norm(dim=-1, keepdim=True)
-        sims = (img_emb @ text_emb.T).squeeze(0)
+        sims = (img_emb @ text_emb.T).squeeze(0).cpu().tolist()
 
-    pos = sims[:n_pos].mean().item()
-    neg = sims[n_pos:].mean().item()
+    all_prompts = POSITIVE_PROMPTS + NEGATIVE_PROMPTS
+    breakdown = dict(zip(all_prompts, sims))
+    pos = sum(sims[:n_pos]) / n_pos
+    neg = sum(sims[n_pos:]) / (len(sims) - n_pos)
     # Cosine sims for typical image-text pairs sit in [0.15, 0.35]. The pos-neg
     # gap typically lands in [-0.05, 0.10]. Scale by 50 so the printable score
-    # has the rough magnitude of an aesthetic rating, but only the ranking matters.
-    return (pos - neg) * 50.0
+    # has the rough magnitude of an aesthetic rating; only ranking matters.
+    return (pos - neg) * 50.0, breakdown
 
 
-def score(path: Path) -> float:
+def score(path: Path) -> tuple[float, dict[str, float]]:
     return score_from_preview(load_preview(path))

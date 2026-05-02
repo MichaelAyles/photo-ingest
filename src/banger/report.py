@@ -18,6 +18,7 @@ class Row:
     frame: Frame
     sharpness: float
     aesthetic: float | None
+    aesthetic_breakdown: dict[str, float] | None
     thumb_b64: str
 
 
@@ -103,6 +104,7 @@ def _card(row: Row, is_keep: bool) -> str:
         primary = f'<span class="primary">{row.aesthetic:.2f}</span>'
     else:
         primary = '<span class="primary muted">—</span>'
+    breakdown_html = _breakdown(row.aesthetic_breakdown) if row.aesthetic_breakdown else ""
     return (
         f'<figure class="card {flag_class}">'
         f'<img loading="lazy" src="data:image/jpeg;base64,{row.thumb_b64}" alt="{stem}">'
@@ -113,8 +115,23 @@ def _card(row: Row, is_keep: bool) -> str:
         f'<span class="extras">sharp {row.sharpness:.0f} '
         f'<span class="badge {flag_class}">{flag_label}</span></span>'
         f'</div>'
+        f'{breakdown_html}'
         f'</figcaption>'
         f'</figure>'
+    )
+
+
+def _breakdown(b: dict[str, float]) -> str:
+    rows = []
+    for prompt, sim in b.items():
+        rows.append(
+            f'<tr><td>{html.escape(prompt)}</td>'
+            f'<td class="num">{sim:.4f}</td></tr>'
+        )
+    return (
+        '<details class="breakdown"><summary>prompt sims</summary>'
+        f'<table>{"".join(rows)}</table>'
+        '</details>'
     )
 
 
@@ -143,6 +160,11 @@ _TEMPLATE = """<!doctype html>
   .badge.keep {{ background: #1e3a1e; color: #8fdc8f; }}
   .badge.reject {{ background: #3a1e1e; color: #dc8f8f; }}
   .divider {{ grid-column: 1 / -1; padding: .6rem; text-align: center; color: #c97; border-top: 1px dashed #555; border-bottom: 1px dashed #555; margin: .25rem 0; font-size: .85rem; letter-spacing: .05em; }}
+  .breakdown {{ margin-top: .35rem; font-size: .65rem; color: #aaa; }}
+  .breakdown summary {{ cursor: pointer; color: #888; }}
+  .breakdown table {{ width: 100%; border-collapse: collapse; margin-top: .2rem; }}
+  .breakdown td {{ padding: .1rem 0; }}
+  .breakdown td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
 </style>
 </head>
 <body>
