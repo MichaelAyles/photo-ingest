@@ -111,7 +111,12 @@ def preview_jpeg_path(sha: str) -> Path:
 
 
 def cache_frame_metadata(
-    sha: str, sharpness: float, phash_hex: str, timestamp: float
+    sha: str,
+    sharpness: float,
+    phash_hex: str,
+    timestamp: float,
+    face_count: int | None = None,
+    face_sharpness: float | None = None,
 ) -> None:
     """Cache the per-frame inputs needed by `cmd_run` so re-runs skip preview loads."""
     import json
@@ -123,6 +128,10 @@ def cache_frame_metadata(
         "timestamp": float(timestamp),
         "computed_at": int(time.time()),
     }
+    if face_count is not None:
+        payload["face_count"] = int(face_count)
+    if face_sharpness is not None:
+        payload["face_sharpness"] = float(face_sharpness)
     (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 

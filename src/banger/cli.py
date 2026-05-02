@@ -9,7 +9,7 @@ import os
 
 import imagehash
 
-from banger import aesthetic, dedup, develop as develop_mod, scenes, server, state, taste_head
+from banger import aesthetic, dedup, develop as develop_mod, face, scenes, server, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
 from banger.frames import discover_frames
@@ -73,6 +73,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOP_N,
         help=f"Number of frames to write to --output (default {DEFAULT_TOP_N}, env BANGER_TOP_N).",
     )
+    run.add_argument(
+        "--face-gate",
+        action="store_true",
+        help=(
+            "Also reject frames whose detected faces are softer than "
+            f"face.FACE_SHARPNESS_THRESHOLD (={face.FACE_SHARPNESS_THRESHOLD}). "
+            "Frames without a detected face still go through the global gate only."
+        ),
+    )
 
     explain = sub.add_parser(
         "explain",
@@ -124,6 +133,7 @@ def cmd_run(
     report_path: Path | None,
     output_dir: Path | None = None,
     top_n: int = DEFAULT_TOP_N,
+    face_gate: bool = False,
 ) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
@@ -153,19 +163,31 @@ def cmd_run(
     aesthetic_done = 0
     aesthetic_skipped = 0
     cache_hits = 0
+    face_gated = 0  # rejected by face-aware gate (in addition to global gate)
     t0 = time.monotonic()
     for f in frames:
         sha = state.sha256_of(f.classify_path)
         cached_meta = state.load_frame_metadata(sha)
         cached_emb = state.load_embedding(sha)
 
+        # If the face-gate is on, the cache also needs face_count + face_sharpness.
+        face_data_ok = (not face_gate) or (
+            cached_meta is not None
+            and "face_count" in cached_meta
+            and "face_sharpness" in cached_meta
+        )
+
         # Fast path: every per-frame input we need is on disk → don't decode.
         cache_hit = (
             cached_meta is not None
             and "phash_hex" in cached_meta
             and cached_emb is not None
+            and face_data_ok
             and report_path is None  # thumb requires preview
         )
+
+        face_count = (cached_meta or {}).get("face_count", 0)
+        face_sharp = (cached_meta or {}).get("face_sharpness", 0.0)
 
         if cache_hit:
             sharp = float(cached_meta["sharpness"])
@@ -231,12 +253,39 @@ def cmd_run(
                         source = "prompts"
                     phash = dedup.phash_from_preview(preview)
                     ts = dedup.best_timestamp(f.classify_path)
-                    state.cache_frame_metadata(sha, sharp, str(phash), ts)
+                    # Always populate face data on cold path so future warm runs
+                    # don't need a preview reload even if face-gate is later asked for.
+                    face_count, face_sharp = face.best_face_sharpness(preview)
+                    state.cache_frame_metadata(
+                        sha, sharp, str(phash), ts,
+                        face_count=face_count, face_sharpness=face_sharp,
+                    )
                     aesthetic_done += 1
                 except Exception as e:
                     log.warning("aesthetic skip %s: %s", f.display_name, e)
                     aesthetic_skipped += 1
             thumb = encode_thumbnail(preview) if report_path else ""
+
+        # Face-aware gate: only kicks in when --face-gate is set AND the frame
+        # contains a face AND the sharpest face is below the per-face threshold.
+        if (
+            face_gate
+            and a_score is not None
+            and face_count > 0
+            and face_sharp < face.FACE_SHARPNESS_THRESHOLD
+        ):
+            face_gated += 1
+            # Pretend the frame failed the global gate so it lands in REJECT.
+            sharp = min(sharp, threshold - 0.01)
+            a_score = None
+            breakdown = None
+            source = None
+            emb = None
+            phash = None
+            log.info(
+                "REJECT (face soft, %.1f < %.1f) %s",
+                face_sharp, face.FACE_SHARPNESS_THRESHOLD, f.display_name,
+            )
 
         if not cache_hit:
             row = Row(
@@ -311,7 +360,8 @@ def cmd_run(
 
     log.info(
         "summary: %d final kept (= %d sharpness-pass − %d burst dupes), %d rejected of "
-        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found, %d scenes classified, %d cache hits)",
+        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found, "
+        "%d scenes classified, %d cache hits, %d face-gated)",
         final_kept,
         sharp_kept,
         suppressed_count,
@@ -323,6 +373,7 @@ def cmd_run(
         len(bursts),
         scene_done,
         cache_hits,
+        face_gated,
     )
 
     if scene_done:
@@ -596,6 +647,7 @@ def main(argv: list[str] | None = None) -> int:
             args.report,
             output_dir=args.output,
             top_n=args.top_n,
+            face_gate=args.face_gate,
         )
     if args.command == "explain":
         return cmd_explain(args.input_dir, args.recursive, args.stems)
