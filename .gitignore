@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Pipeline runtime artefacts
+staging/
+output/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+
+# Test fixtures (real photos, sometimes large; commit deliberately)
+tests/fixtures/*.JPG
+tests/fixtures/*.jpg
+tests/fixtures/*.ARW
+tests/fixtures/*.arw
+!tests/fixtures/.gitkeep
+
+# Model weights — pull at install time, do not vendor
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
