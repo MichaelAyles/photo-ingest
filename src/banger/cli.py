@@ -5,7 +5,7 @@ import sys
 import time
 from pathlib import Path
 
-from banger import aesthetic, dedup, server, state, taste_head
+from banger import aesthetic, dedup, scenes, server, state, taste_head
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
 from banger.frames import discover_frames
@@ -88,7 +88,9 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
     )
 
     rows: list[Row] = []
-    dedup_inputs: list[tuple[Row, ClusterItem]] = []
+    # Carry the in-memory embedding alongside dedup metadata so the scene
+    # classifier doesn't have to re-read it from disk per cluster best.
+    dedup_inputs: list[tuple[Row, ClusterItem, "np.ndarray"]] = []
     aesthetic_done = 0
     aesthetic_skipped = 0
     t0 = time.monotonic()
@@ -135,7 +137,7 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
         if phash is not None and a_score is not None:
             ts = dedup.best_timestamp(f.classify_path)
             dedup_inputs.append(
-                (row, ClusterItem(key=f.display_name, phash=phash, timestamp=ts, score=a_score))
+                (row, ClusterItem(key=f.display_name, phash=phash, timestamp=ts, score=a_score), emb)
             )
 
         a_str = f"aesthetic={a_score:5.2f}" if a_score is not None else "aesthetic= ---"
@@ -143,8 +145,9 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
         log.info("%s sharpness=%7.1f %s  %s  [%s]", flag, sharp, a_str, f.display_name, f.kind)
 
     # Burst dedup: cluster by pHash + timestamp, mark non-best siblings.
-    rows_by_key = {ci.key: row for row, ci in dedup_inputs}
-    clusters = dedup.cluster_bursts([ci for _, ci in dedup_inputs])
+    rows_by_key = {ci.key: row for row, ci, _ in dedup_inputs}
+    embs_by_key = {ci.key: emb for _, ci, emb in dedup_inputs}
+    clusters = dedup.cluster_bursts([ci for _, ci, _ in dedup_inputs])
     bursts = [c for c in clusters if len(c) > 1]
     suppressed_count = 0
     for cid, cluster in enumerate(bursts, start=1):
@@ -157,6 +160,21 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
             if not row.cluster_best:
                 suppressed_count += 1
 
+    # Scene classification: only for frames that survive both gates.
+    scene_done = 0
+    for row, ci, emb in dedup_inputs:
+        if not row.cluster_best:
+            continue
+        try:
+            match = scenes.classify(emb)
+        except Exception as e:
+            log.warning("scene classify skip %s: %s", row.frame.display_name, e)
+            continue
+        row.scene_preset = match.preset
+        row.scene_score = match.score
+        row.scene_fell_back = match.fell_back
+        scene_done += 1
+
     elapsed = time.monotonic() - t0
     sharps = [r.sharpness for r in rows]
     aesthetic_vals = [r.aesthetic for r in rows if r.aesthetic is not None]
@@ -165,7 +183,7 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
 
     log.info(
         "summary: %d final kept (= %d sharpness-pass − %d burst dupes), %d rejected of "
-        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found)",
+        "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found, %d scenes classified)",
         final_kept,
         sharp_kept,
         suppressed_count,
@@ -175,7 +193,23 @@ def cmd_run(input_dir: Path, recursive: bool, report_path: Path | None) -> int:
         aesthetic_done,
         aesthetic_skipped,
         len(bursts),
+        scene_done,
     )
+
+    if scene_done:
+        preset_counts: dict[str, int] = {}
+        fell_back = 0
+        for r in rows:
+            if r.scene_preset:
+                preset_counts[r.scene_preset] = preset_counts.get(r.scene_preset, 0) + 1
+            if r.scene_fell_back:
+                fell_back += 1
+        ordered = sorted(preset_counts.items(), key=lambda kv: -kv[1])
+        log.info(
+            "preset assignments: %s (%d fell back to default)",
+            ", ".join(f"{name}={n}" for name, n in ordered),
+            fell_back,
+        )
     if sharps:
         log.info(
             "sharpness stats: min=%.1f median=%.1f max=%.1f",

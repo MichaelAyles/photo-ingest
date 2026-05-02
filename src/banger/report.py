@@ -24,6 +24,9 @@ class Row:
     cluster_id: int | None = None  # None if not in a multi-frame cluster
     cluster_size: int = 1
     cluster_best: bool = True  # False = suppressed sibling of a burst best
+    scene_preset: str | None = None  # picked darktable preset name
+    scene_score: float | None = None
+    scene_fell_back: bool = False
 
 
 def encode_thumbnail_bytes(preview: np.ndarray) -> bytes:
@@ -153,13 +156,19 @@ def _card(row: Row, section: str = "keep") -> str:
                 f'<span class="cluster">dupe of cluster {row.cluster_id} '
                 f'(n={row.cluster_size})</span>'
             )
+    scene_html = ""
+    if row.scene_preset:
+        suffix = " (default)" if row.scene_fell_back else ""
+        scene_html = (
+            f'<span class="scene">{html.escape(row.scene_preset)}{suffix}</span>'
+        )
     return (
         f'<figure class="card {flag_class}">'
         f'<img loading="lazy" src="data:image/jpeg;base64,{row.thumb_b64}" alt="{stem}">'
         f'<figcaption>'
         f'<div class="head"><span class="stem">{stem}</span>{primary}</div>'
         f'<div class="meta">'
-        f'<span class="kind">{kind}{cluster_html}</span>'
+        f'<span class="kind">{kind}{cluster_html}{scene_html}</span>'
         f'<span class="extras">sharp {row.sharpness:.0f} '
         f'<span class="badge {flag_class}">{flag_label}</span></span>'
         f'</div>'
@@ -200,6 +209,7 @@ _TEMPLATE = """<!doctype html>
   .card.suppressed {{ opacity: .65; border-color: #3a3a4a; }}
   .badge.suppressed {{ background: #2e2e3a; color: #c0c0e0; }}
   .cluster {{ font-size: .65rem; color: #aaa; margin-left: .35rem; padding: 0 .35rem; background: #222; border-radius: 2px; }}
+  .scene {{ font-size: .65rem; color: #c9c; margin-left: .35rem; padding: 0 .35rem; background: #2a1f2a; border-radius: 2px; font-family: ui-monospace, monospace; }}
   .card img {{ width: 100%; display: block; aspect-ratio: 3/2; object-fit: cover; }}
   figcaption {{ padding: .4rem .55rem; font-size: .8rem; }}
   figcaption .head, figcaption .meta {{ display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }}
