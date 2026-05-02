@@ -210,6 +210,16 @@ _TEMPLATE = r"""<!doctype html>
   .help { font-size: .7rem; color: #888; margin-left: auto; }
   .help kbd { background: #222; border: 1px solid #333; border-radius: 3px; padding: 0 4px; font-family: ui-monospace, monospace; color: #bbb; }
 
+  .hist-wrap { display: inline-flex; align-items: center; gap: .5rem; font-size: .7rem; color: #888; }
+  .hist { display: inline-flex; align-items: flex-end; height: 32px; gap: 2px; padding: 0 4px; background: #161616; border: 1px solid #232323; border-radius: 3px; }
+  .hist .bar { width: 9px; min-height: 2px; border-radius: 1px 1px 0 0; background: #444; transition: height .15s ease; }
+  .hist .bar.up { background: #5fa05f; }
+  .hist .bar.down { background: #a05f5f; }
+  .hist .bar.zero { background: #888; }
+  .hist .bar.empty { background: #2a2a2a; }
+  .hist-axis { display: flex; gap: 2px; padding: 0 4px; font-size: .55rem; color: #666; font-variant-numeric: tabular-nums; }
+  .hist-axis span { width: 9px; text-align: center; }
+
   #hero { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 1rem; min-height: 0; gap: .75rem; }
   #hero-img-wrap { flex: 1 1 auto; min-height: 0; display: flex; align-items: center; justify-content: center; width: 100%; }
   #hero-img { max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 4px 32px rgba(0,0,0,.5); border-radius: 4px; background: #000; }
@@ -246,6 +256,17 @@ _TEMPLATE = r"""<!doctype html>
   <h1>banger label</h1>
   <div class="summary">
     <code>{{ input_dir }}</code> &middot; <span id="stats"></span>
+  </div>
+  <div class="hist-wrap" title="distribution of your scores">
+    <div>
+      <div id="hist" class="hist"></div>
+      <div class="hist-axis">
+        <span>-5</span><span></span><span></span><span></span><span></span>
+        <span>0</span>
+        <span></span><span></span><span></span><span></span><span>+5</span>
+      </div>
+    </div>
+    <span id="hist-summary"></span>
   </div>
   <div class="help">
     <kbd>1</kbd>-<kbd>5</kbd> = -5..-1 &nbsp; <kbd>6</kbd>-<kbd>9</kbd>+<kbd>0</kbd> = +1..+5 &nbsp;·&nbsp;
@@ -403,6 +424,34 @@ function updateStats() {
   const labelled = FRAMES.filter(f => LABELS[f.sha] !== undefined).length;
   document.getElementById("stats").textContent =
     `${focusIdx + 1} / ${FRAMES.length} · ${labelled} labelled`;
+  updateHistogram();
+}
+
+function updateHistogram() {
+  const counts = {};
+  SCORES.forEach(s => counts[s] = 0);
+  Object.values(LABELS).forEach(s => { if (s in counts) counts[s]++; });
+  const max = Math.max(1, ...Object.values(counts));
+
+  const hist = document.getElementById("hist");
+  hist.innerHTML = SCORES.map(s => {
+    const c = counts[s];
+    const cls = c === 0 ? "empty" : (s > 0 ? "up" : s < 0 ? "down" : "zero");
+    const h = c === 0 ? 2 : Math.max(3, Math.round(c / max * 28));
+    const label = `${s > 0 ? "+" : ""}${s}: ${c}`;
+    return `<div class="bar ${cls}" style="height:${h}px" title="${label}"></div>`;
+  }).join("");
+
+  const summary = document.getElementById("hist-summary");
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  if (total === 0) {
+    summary.textContent = "no labels yet";
+  } else {
+    let sum = 0;
+    SCORES.forEach(s => sum += s * counts[s]);
+    const mean = sum / total;
+    summary.textContent = `mean ${mean >= 0 ? "+" : ""}${mean.toFixed(1)}`;
+  }
 }
 
 document.getElementById("filmstrip").addEventListener("click", e => {
