@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "banger"
+version = "0.0.1"
+description = "Local image triage and develop pipeline for the Sony a6600"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Michael Ayles" }]
+license = { text = "Unlicensed" }
+dependencies = [
+    "torch>=2.2",
+    "open_clip_torch>=2.24",
+    "rawpy>=0.21",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+]
+
+# aesthetic-predictor-v2.5 is a GitHub project, not on PyPI.
+# Install it separately, see README install section.
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+banger = "banger.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/banger"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
