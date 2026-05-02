@@ -13,13 +13,14 @@ Skeleton only. CLI entry point exists and parses args; no pipeline stages wired 
 ```sh
 python -m venv .venv
 . .venv/bin/activate          # on Windows: .venv\Scripts\activate
+
+# torch needs the CUDA wheel index; install it FIRST so pip doesn't pull
+# the CPU wheel as a transitive dep. Pick the index matching your CUDA:
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+
+# Then everything else:
 pip install -e ".[dev]"
-
-# torch needs the CUDA wheel index; pick the one matching your CUDA:
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# aesthetic-predictor-v2.5 is GitHub-only:
-pip install git+https://github.com/discus0434/aesthetic-predictor-v2-5
+pip install "transformers<5"  # transformers 5.x has a Windows-segfaulting parallel weight loader
 ```
 
 ## Usage

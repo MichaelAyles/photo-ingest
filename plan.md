@@ -22,8 +22,11 @@ Goal: a script that takes a folder of JPEGs, picks the top 10, applies a CLIP-ma
 - The unit of work for the rest of the pipeline is a `Frame` (stem, jpeg, raw — one or both present), not a raw path. Classification stages always read `frame.classify_path` (prefer JPEG, fall back to RAW preview); develop reads `frame.develop_path` (prefer RAW, fall back to JPEG). This kills duplicate scoring of RAW+JPEG pairs and folds most of step 15 into the loader.
 
 ### Step 3 — aesthetic scoring
-- Wrap aesthetic-predictor-v2.5 in a single `score(path) -> float` that loads the model once (module-level cache) and runs it on the resized preview.
-- Stage independently testable on a fixtures folder: assert score is in [1, 10].
+- Original plan: wrap aesthetic-predictor-v2.5 (SigLIP-so400m) in a `score(path) -> float`.
+- Pivoted: use CLIP ViT-B/32 with prompt-based scoring (mean sim to "good photo" prompts minus mean sim to "bad photo" prompts). Reason: SigLIP's 3.3 GB safetensors triggers a torch+Windows mmap-slice bug (`torch.UntypedStorage.__getitem__` access violation on files above ~2 GB). The plan explicitly permits the CLIP-prompt fallback.
+- Output range is roughly [-2, 3] rather than [1, 10]; only the ranking matters for top-N selection.
+- Module-level `lru_cache` loads CLIP once and pre-encodes prompts; per-frame scoring is one image forward + one matmul.
+- Replace with a trained taste head in v1 (step 17). The trained head can run on Linux where the SigLIP path also works if we want it later.
 
 ### Step 4 — top-N selection
 - Filter by sharpness threshold, sort surviving frames by aesthetic score, take top N (default 10, env var `BANGER_TOP_N`).

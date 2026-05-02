@@ -16,7 +16,8 @@ THUMB_JPEG_QUALITY = 78
 @dataclass
 class Row:
     frame: Frame
-    score: float
+    sharpness: float
+    aesthetic: float | None
     thumb_b64: str
 
 
@@ -36,43 +37,60 @@ def encode_thumbnail(preview: np.ndarray) -> str:
 
 
 def write_report(out_path: Path, rows: list[Row], threshold: float) -> None:
-    rows = sorted(rows, key=lambda r: r.score, reverse=True)
-    scores = [r.score for r in rows]
-    kept = sum(1 for s in scores if s >= threshold)
+    kept = [r for r in rows if r.sharpness >= threshold]
+    rejected = [r for r in rows if r.sharpness < threshold]
+    kept.sort(
+        key=lambda r: (r.aesthetic if r.aesthetic is not None else r.sharpness),
+        reverse=True,
+    )
+    rejected.sort(key=lambda r: r.sharpness, reverse=True)
+    ordered = kept + rejected
+
+    sharp_scores = [r.sharpness for r in rows]
+    aesthetic_scores = [r.aesthetic for r in rows if r.aesthetic is not None]
     summary = {
         "total": len(rows),
-        "kept": kept,
-        "rejected": len(rows) - kept,
+        "kept": len(kept),
+        "rejected": len(rejected),
         "threshold": threshold,
-        "min": min(scores) if scores else 0.0,
-        "median": statistics.median(scores) if scores else 0.0,
-        "max": max(scores) if scores else 0.0,
+        "sharp_min": min(sharp_scores) if sharp_scores else 0.0,
+        "sharp_median": statistics.median(sharp_scores) if sharp_scores else 0.0,
+        "sharp_max": max(sharp_scores) if sharp_scores else 0.0,
+        "aesthetic_min": min(aesthetic_scores) if aesthetic_scores else None,
+        "aesthetic_median": statistics.median(aesthetic_scores) if aesthetic_scores else None,
+        "aesthetic_max": max(aesthetic_scores) if aesthetic_scores else None,
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(_render(rows, summary), encoding="utf-8")
+    out_path.write_text(_render(ordered, summary, len(kept)), encoding="utf-8")
 
 
-def _render(rows: list[Row], summary: dict) -> str:
+def _render(rows: list[Row], summary: dict, divider_after: int) -> str:
     cards = []
-    divider_emitted = False
-    for r in rows:
-        is_keep = r.score >= summary["threshold"]
-        if not is_keep and not divider_emitted:
+    for i, r in enumerate(rows):
+        if i == divider_after and summary["rejected"]:
             cards.append(
-                f'<div class="divider">↓ below threshold ({summary["threshold"]:.0f}) ↓</div>'
+                f'<div class="divider">↓ below sharpness threshold '
+                f'({summary["threshold"]:.0f}) ↓</div>'
             )
-            divider_emitted = True
-        cards.append(_card(r, is_keep))
-    cards_html = "\n".join(cards)
+        cards.append(_card(r, is_keep=(i < divider_after)))
+    if summary["aesthetic_min"] is not None:
+        aesthetic_line = (
+            f'aesthetic min {summary["aesthetic_min"]:.2f} / '
+            f'median {summary["aesthetic_median"]:.2f} / '
+            f'max {summary["aesthetic_max"]:.2f}'
+        )
+    else:
+        aesthetic_line = "aesthetic: —"
     return _TEMPLATE.format(
         total=summary["total"],
         kept=summary["kept"],
         rejected=summary["rejected"],
         threshold=summary["threshold"],
-        min_=summary["min"],
-        median=summary["median"],
-        max_=summary["max"],
-        cards=cards_html,
+        sharp_min=summary["sharp_min"],
+        sharp_median=summary["sharp_median"],
+        sharp_max=summary["sharp_max"],
+        aesthetic_line=aesthetic_line,
+        cards="\n".join(cards),
     )
 
 
@@ -81,14 +99,20 @@ def _card(row: Row, is_keep: bool) -> str:
     flag_label = "KEEP" if is_keep else "REJECT"
     stem = html.escape(row.frame.stem)
     kind = html.escape(row.frame.kind)
+    if row.aesthetic is not None:
+        primary = f'<span class="primary">{row.aesthetic:.2f}</span>'
+    else:
+        primary = '<span class="primary muted">—</span>'
     return (
         f'<figure class="card {flag_class}">'
         f'<img loading="lazy" src="data:image/jpeg;base64,{row.thumb_b64}" alt="{stem}">'
         f'<figcaption>'
-        f'<span class="stem">{stem}</span>'
-        f'<span class="score">{row.score:.1f}</span>'
-        f'<span class="badge {flag_class}">{flag_label}</span>'
+        f'<div class="head"><span class="stem">{stem}</span>{primary}</div>'
+        f'<div class="meta">'
         f'<span class="kind">{kind}</span>'
+        f'<span class="extras">sharp {row.sharpness:.0f} '
+        f'<span class="badge {flag_class}">{flag_label}</span></span>'
+        f'</div>'
         f'</figcaption>'
         f'</figure>'
     )
@@ -98,34 +122,36 @@ _TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>banger sharpness report</title>
+<title>banger report</title>
 <style>
   :root {{ color-scheme: light dark; }}
   body {{ font-family: ui-sans-serif, system-ui, sans-serif; margin: 1rem; background: #111; color: #eee; }}
   header {{ margin-bottom: 1rem; }}
   h1 {{ margin: 0 0 .25rem; font-size: 1.1rem; }}
-  .summary {{ font-size: .85rem; color: #aaa; }}
+  .summary {{ font-size: .8rem; color: #aaa; line-height: 1.5; }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: .75rem; }}
   .card {{ margin: 0; background: #1a1a1a; border-radius: 6px; overflow: hidden; border: 1px solid #2a2a2a; }}
   .card.reject {{ opacity: .55; }}
   .card img {{ width: 100%; display: block; aspect-ratio: 3/2; object-fit: cover; }}
-  figcaption {{ padding: .4rem .55rem; display: grid; grid-template-columns: 1fr auto; gap: .15rem .5rem; font-size: .8rem; align-items: baseline; }}
+  figcaption {{ padding: .4rem .55rem; font-size: .8rem; }}
+  figcaption .head, figcaption .meta {{ display: flex; justify-content: space-between; align-items: baseline; gap: .5rem; }}
+  figcaption .meta {{ font-size: .7rem; color: #888; margin-top: .2rem; }}
   .stem {{ font-family: ui-monospace, monospace; }}
-  .score {{ font-variant-numeric: tabular-nums; color: #ddd; text-align: right; }}
-  .badge {{ font-size: .65rem; padding: .05rem .35rem; border-radius: 3px; letter-spacing: .03em; }}
+  .primary {{ font-variant-numeric: tabular-nums; font-weight: 600; color: #ddd; }}
+  .primary.muted {{ color: #555; font-weight: normal; }}
+  .badge {{ font-size: .65rem; padding: .05rem .35rem; border-radius: 3px; letter-spacing: .03em; margin-left: .35rem; }}
   .badge.keep {{ background: #1e3a1e; color: #8fdc8f; }}
   .badge.reject {{ background: #3a1e1e; color: #dc8f8f; }}
-  .kind {{ font-size: .7rem; color: #888; text-align: right; }}
   .divider {{ grid-column: 1 / -1; padding: .6rem; text-align: center; color: #c97; border-top: 1px dashed #555; border-bottom: 1px dashed #555; margin: .25rem 0; font-size: .85rem; letter-spacing: .05em; }}
 </style>
 </head>
 <body>
 <header>
-  <h1>banger sharpness report</h1>
+  <h1>banger report</h1>
   <div class="summary">
-    {total} frames &middot; {kept} kept &middot; {rejected} rejected &middot;
-    threshold = {threshold:.1f} &middot;
-    min {min_:.1f} / median {median:.1f} / max {max_:.1f}
+    {total} frames &middot; {kept} kept &middot; {rejected} rejected (threshold {threshold:.0f})<br>
+    sharpness min {sharp_min:.0f} / median {sharp_median:.0f} / max {sharp_max:.0f}<br>
+    {aesthetic_line}
   </div>
 </header>
 <main class="grid">

@@ -5,7 +5,8 @@ import sys
 import time
 from pathlib import Path
 
-from banger.frames import Frame, discover_frames
+from banger import aesthetic
+from banger.frames import discover_frames
 from banger.preview import load_preview
 from banger.report import Row, encode_thumbnail, write_report
 from banger.sharpness import CONFIG as SHARPNESS_CONFIG
@@ -41,47 +42,67 @@ def cmd_run(input_dir: Path, report_path: Path | None) -> int:
 
     threshold = SHARPNESS_CONFIG["threshold"]
     log.info(
-        "scoring %d frames for sharpness (threshold=%.1f, report=%s)",
+        "processing %d frames (sharpness threshold=%.1f, report=%s)",
         len(frames),
         threshold,
         report_path or "off",
     )
 
-    t0 = time.monotonic()
-    scored: list[tuple[Frame, float]] = []
     rows: list[Row] = []
+    aesthetic_done = 0
+    aesthetic_skipped = 0
+    t0 = time.monotonic()
     for f in frames:
         try:
             preview = load_preview(f.classify_path)
         except Exception as e:
             log.warning("skip %s: %s", f.stem, e)
             continue
-        score = sharpness_from_preview(preview)
-        scored.append((f, score))
-        if report_path is not None:
-            rows.append(Row(frame=f, score=score, thumb_b64=encode_thumbnail(preview)))
+
+        sharp = sharpness_from_preview(preview)
+        a_score: float | None = None
+        if sharp >= threshold:
+            try:
+                a_score = aesthetic.score_from_preview(preview)
+                aesthetic_done += 1
+            except Exception as e:
+                log.warning("aesthetic skip %s: %s", f.stem, e)
+                aesthetic_skipped += 1
+
+        thumb = encode_thumbnail(preview) if report_path else ""
+        rows.append(Row(frame=f, sharpness=sharp, aesthetic=a_score, thumb_b64=thumb))
+
+        a_str = f"aesthetic={a_score:5.2f}" if a_score is not None else "aesthetic= ---"
+        flag = "KEEP  " if sharp >= threshold else "REJECT"
+        log.info("%s sharpness=%7.1f %s  %s  [%s]", flag, sharp, a_str, f.stem, f.kind)
+
     elapsed = time.monotonic() - t0
+    sharps = [r.sharpness for r in rows]
+    aesthetic_vals = [r.aesthetic for r in rows if r.aesthetic is not None]
+    kept = sum(1 for r in rows if r.sharpness >= threshold)
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    for f, s in scored:
-        flag = "KEEP  " if s >= threshold else "REJECT"
-        log.info("%s sharpness=%8.1f  %s  [%s]", flag, s, f.stem, f.kind)
-
-    if scored:
-        scores = [s for _, s in scored]
-        kept = sum(1 for s in scores if s >= threshold)
+    log.info(
+        "summary: %d kept, %d rejected of %d frames in %.1fs (aesthetic done=%d skipped=%d)",
+        kept,
+        len(rows) - kept,
+        len(rows),
+        elapsed,
+        aesthetic_done,
+        aesthetic_skipped,
+    )
+    if sharps:
         log.info(
-            "stats: min=%.1f median=%.1f max=%.1f",
-            min(scores),
-            statistics.median(scores),
-            max(scores),
+            "sharpness stats: min=%.1f median=%.1f max=%.1f",
+            min(sharps),
+            statistics.median(sharps),
+            max(sharps),
         )
+    if aesthetic_vals:
         log.info(
-            "summary: %d kept, %d rejected of %d frames in %.1fs",
-            kept,
-            len(scored) - kept,
-            len(scored),
-            elapsed,
+            "aesthetic stats: min=%.2f median=%.2f max=%.2f",
+            min(aesthetic_vals),
+            statistics.median(aesthetic_vals),
+            max(aesthetic_vals),
         )
 
     if report_path is not None and rows:

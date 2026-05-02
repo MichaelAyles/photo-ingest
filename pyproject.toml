@@ -16,7 +16,7 @@ dependencies = [
     "rawpy>=0.21",
     "imagehash>=4.3",
     "Pillow>=10.0",
-    "numpy>=1.26",
+    "numpy>=1.26,<2",  # transformers/siglip C extensions still expect NumPy 1.x ABI
     "opencv-python>=4.9",
 ]
 
