@@ -6,8 +6,10 @@ import time
 from pathlib import Path
 
 from banger.frames import Frame, discover_frames
+from banger.preview import load_preview
+from banger.report import Row, encode_thumbnail, write_report
 from banger.sharpness import CONFIG as SHARPNESS_CONFIG
-from banger.sharpness import sharpness
+from banger.sharpness import sharpness_from_preview
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -16,11 +18,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run the pipeline against a folder of images.")
     run.add_argument("input_dir", type=Path, help="Folder containing JPEGs and/or ARWs.")
+    run.add_argument(
+        "--report",
+        type=Path,
+        default=None,
+        help="Write a self-contained HTML preview report to this path.",
+    )
 
     return parser
 
 
-def cmd_run(input_dir: Path) -> int:
+def cmd_run(input_dir: Path, report_path: Path | None) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
         log.error("not a directory: %s", input_dir)
@@ -32,15 +40,26 @@ def cmd_run(input_dir: Path) -> int:
         return 0
 
     threshold = SHARPNESS_CONFIG["threshold"]
-    log.info("scoring %d frames for sharpness (threshold=%.1f)", len(frames), threshold)
+    log.info(
+        "scoring %d frames for sharpness (threshold=%.1f, report=%s)",
+        len(frames),
+        threshold,
+        report_path or "off",
+    )
 
     t0 = time.monotonic()
     scored: list[tuple[Frame, float]] = []
+    rows: list[Row] = []
     for f in frames:
         try:
-            scored.append((f, sharpness(f.classify_path)))
+            preview = load_preview(f.classify_path)
         except Exception as e:
             log.warning("skip %s: %s", f.stem, e)
+            continue
+        score = sharpness_from_preview(preview)
+        scored.append((f, score))
+        if report_path is not None:
+            rows.append(Row(frame=f, score=score, thumb_b64=encode_thumbnail(preview)))
     elapsed = time.monotonic() - t0
 
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -64,6 +83,10 @@ def cmd_run(input_dir: Path) -> int:
             len(scored),
             elapsed,
         )
+
+    if report_path is not None and rows:
+        write_report(report_path, rows, threshold)
+        log.info("wrote report: %s", report_path)
     return 0
 
 
@@ -71,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = _build_parser().parse_args(argv)
     if args.command == "run":
-        return cmd_run(args.input_dir)
+        return cmd_run(args.input_dir, args.report)
     return 1
 
 

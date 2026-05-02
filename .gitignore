@@ -24,6 +24,7 @@ Thumbs.db
 # Pipeline runtime artefacts
 staging/
 output/
+reports/
 test_photos/
 *.db
 *.db-journal
