@@ -7,9 +7,9 @@ import pytest
 
 
 def test_sha256_is_content_addressed(make_jpeg, isolated_state):
-    p1 = make_jpeg(name="a.JPG", sharpness="medium")
-    p2 = make_jpeg(name="b.JPG", sharpness="medium")  # same seed, same content
-    p3 = make_jpeg(name="c.JPG", sharpness="high")
+    p1 = make_jpeg(name="a.JPG", sharpness="medium", seed=42)
+    p2 = make_jpeg(name="b.JPG", sharpness="medium", seed=42)  # explicit same seed
+    p3 = make_jpeg(name="c.JPG", sharpness="high", seed=42)
     assert isolated_state.sha256_of(p1) == isolated_state.sha256_of(p2)
     assert isolated_state.sha256_of(p1) != isolated_state.sha256_of(p3)
 

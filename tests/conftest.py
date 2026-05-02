@@ -15,13 +15,20 @@ import numpy as np
 import pytest
 
 
-def _make_image(width: int = 64, height: int = 48, sharpness: str = "medium") -> np.ndarray:
+def _make_image(
+    width: int = 64,
+    height: int = 48,
+    sharpness: str = "medium",
+    seed: int = 42,
+) -> np.ndarray:
     """Return a BGR uint8 image with a controllable amount of high-frequency content.
 
     The Laplacian variance — which the pipeline uses for sharpness — depends
     on per-pixel detail. A flat image scores ~0; a checkerboard scores high.
+    Pass distinct ``seed`` values to get distinct random content (and so
+    distinct pHashes for dedup tests).
     """
-    rng = np.random.default_rng(seed=42)
+    rng = np.random.default_rng(seed=seed)
     if sharpness == "blank":
         # Solid grey: zero gradient, zero variance.
         return np.full((height, width, 3), 128, dtype=np.uint8)
@@ -45,11 +52,20 @@ def _make_image(width: int = 64, height: int = 48, sharpness: str = "medium") ->
 def make_jpeg(tmp_path: Path):
     """Returns a callable that writes a synthetic JPEG into tmp_path and returns the path."""
 
-    def _factory(name: str = "test.JPG", sharpness: str = "medium", subdir: str = "") -> Path:
+    def _factory(
+        name: str = "test.JPG",
+        sharpness: str = "medium",
+        subdir: str = "",
+        seed: int | None = None,
+    ) -> Path:
         target_dir = tmp_path / subdir if subdir else tmp_path
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / name
-        img = _make_image(sharpness=sharpness)
+        # Seed defaults to a hash of the filename so two factories called with
+        # different names produce different content (important for tests that
+        # rely on dedup distinguishing frames).
+        s = seed if seed is not None else (hash((name, subdir)) & 0xFFFF)
+        img = _make_image(sharpness=sharpness, seed=s)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
         assert ok, "cv2.imencode failed"
         path.write_bytes(buf.tobytes())
