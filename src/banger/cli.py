@@ -9,7 +9,7 @@ from pathlib import Path
 import imagehash
 import numpy as np
 
-from banger import aesthetic, dedup, face, scenes, server, state, taste_head
+from banger import aesthetic, dedup, face, scenes, select, server, state, taste_head
 from banger import develop as develop_mod
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
@@ -83,6 +83,16 @@ def _build_parser() -> argparse.ArgumentParser:
             "Frames without a detected face still go through the global gate only."
         ),
     )
+    run.add_argument(
+        "--diversity",
+        type=float,
+        default=0.5,
+        help=(
+            "Diversity lambda for top-N selection in [0, 1]. 1.0 = plain top-K "
+            "by aesthetic; 0.5 = balanced MMR; 0.0 = pure visual-diversity. "
+            "Lower values spread picks across visually distinct frames."
+        ),
+    )
 
     explain = sub.add_parser(
         "explain",
@@ -154,6 +164,7 @@ def cmd_run(
     output_dir: Path | None = None,
     top_n: int = DEFAULT_TOP_N,
     face_gate: bool = False,
+    diversity: float = 0.5,
 ) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
@@ -429,16 +440,30 @@ def cmd_run(
         log.info("wrote report: %s", report_path)
 
     if output_dir is not None:
-        keepers = [r for r in rows if r.sharpness >= threshold and r.cluster_best]
-        keepers.sort(
-            key=lambda r: (r.aesthetic if r.aesthetic is not None else r.sharpness),
-            reverse=True,
-        )
-        top = keepers[:top_n]
-        if not top:
+        # Build pool of (Row, score, embedding) for cluster-best survivors.
+        embs_by_row_id = {id(row): emb for row, _ci, emb in dedup_inputs}
+        candidates: list[tuple[Row, float, "np.ndarray"]] = []
+        for r in rows:
+            if r.sharpness < threshold or not r.cluster_best:
+                continue
+            score = r.aesthetic if r.aesthetic is not None else r.sharpness
+            emb = embs_by_row_id.get(id(r))
+            if emb is None:
+                continue
+            candidates.append((r, score, emb))
+
+        if not candidates:
             log.warning("no frames qualified for output: %s", output_dir)
         else:
-            _write_output(output_dir, top, presets_dir=PRESETS_DIR)
+            log.info(
+                "selecting top %d from %d candidates (diversity lambda=%.2f)",
+                top_n, len(candidates), diversity,
+            )
+            chosen = select.select_diverse_top_n(
+                candidates, n=top_n, diversity_lambda=diversity
+            )
+            top_rows = [row for row, _s, _e in chosen]
+            _write_output(output_dir, top_rows, presets_dir=PRESETS_DIR)
     return 0
 
 
@@ -754,6 +779,7 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output,
             top_n=args.top_n,
             face_gate=args.face_gate,
+            diversity=args.diversity,
         )
     if args.command == "explain":
         return cmd_explain(args.input_dir, args.recursive, args.stems)
