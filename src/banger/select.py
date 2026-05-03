@@ -76,3 +76,43 @@ def select_diverse_top_n(
         selected.append(pool.pop(best_idx))
 
     return [(payload, score, emb) for payload, score, emb, _ in selected]
+
+
+def select_top_k(
+    items: list[tuple[T, float, np.ndarray]], n: int
+) -> list[tuple[T, float, np.ndarray]]:
+    """Plain sort-by-score-desc, take first N. No diversity awareness."""
+    return sorted(items, key=lambda it: -it[1])[:n]
+
+
+def select_kmeans_top_n(
+    items: list[tuple[T, float, np.ndarray]],
+    n: int,
+    random_state: int = 0,
+) -> list[tuple[T, float, np.ndarray]]:
+    """Strong-diversity selection: cluster candidates into N visual groups via
+    k-means on their embeddings, take the highest-scoring frame from each.
+
+    Guarantees N visually distinct picks (one per cluster) when len(items) > n.
+    Useful when the goal is portfolio variety — the wedding-shoot case where
+    "100 excellent shots of the bride and groom" should yield ONE picked
+    portrait alongside picks from every other category.
+    """
+    if not items or n <= 0:
+        return []
+    if len(items) <= n:
+        return select_top_k(items, n)
+
+    from sklearn.cluster import KMeans
+
+    embs = np.stack([e for _, _, e in items])
+    n_clusters = min(n, len(items))
+    km = KMeans(n_clusters=n_clusters, n_init=10, random_state=random_state)
+    labels = km.fit_predict(embs)
+
+    by_cluster: dict[int, tuple[T, float, np.ndarray]] = {}
+    for label, item in zip(labels.tolist(), items, strict=True):
+        if label not in by_cluster or item[1] > by_cluster[label][1]:
+            by_cluster[label] = item
+
+    return sorted(by_cluster.values(), key=lambda it: -it[1])

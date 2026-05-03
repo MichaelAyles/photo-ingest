@@ -25,9 +25,16 @@ def cli_env(tmp_path: Path, monkeypatch, isolated_state, make_jpeg):
     make_jpeg(name="D.JPG", sharpness="blank")
     make_jpeg(name="E.JPG", subdir="sub", sharpness="high")
 
-    monkeypatch.setattr(
-        aesthetic, "encode_image", lambda preview: np.ones(8, dtype=np.float32)
-    )
+    # Use the first pixel of the preview to seed a unique embedding per frame —
+    # k-means selection in cmd_run needs distinct embeddings to cluster.
+    def _stub_encode(preview):
+        seed = int(preview[0, 0, 0]) * 17 + int(preview[0, 0, 1]) * 31
+        rng = np.random.default_rng(seed)
+        v = rng.standard_normal(8).astype(np.float32)
+        v /= np.linalg.norm(v)
+        return v
+
+    monkeypatch.setattr(aesthetic, "encode_image", _stub_encode)
     monkeypatch.setattr(
         aesthetic,
         "score_from_embedding",

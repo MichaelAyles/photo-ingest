@@ -84,13 +84,26 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     run.add_argument(
+        "--strategy",
+        choices=["topk", "mmr", "kmeans"],
+        default="kmeans",
+        help=(
+            "Top-N selection strategy. 'topk' = pure aesthetic ranking, "
+            "no diversity. 'mmr' = continuous knob via --diversity. "
+            "'kmeans' (default) = cluster the candidates by CLIP embedding "
+            "into N visual groups and pick the highest-scoring frame from "
+            "each — best for portfolio-style output where you want "
+            "scenery + portrait + group + detail rather than 10 portraits."
+        ),
+    )
+    run.add_argument(
         "--diversity",
         type=float,
         default=0.5,
         help=(
-            "Diversity lambda for top-N selection in [0, 1]. 1.0 = plain top-K "
-            "by aesthetic; 0.5 = balanced MMR; 0.0 = pure visual-diversity. "
-            "Lower values spread picks across visually distinct frames."
+            "Diversity lambda for the MMR strategy in [0, 1]. 1.0 = plain "
+            "top-K by aesthetic; 0.5 = balanced; 0.0 = pure visual-diversity. "
+            "Only used when --strategy mmr."
         ),
     )
 
@@ -165,6 +178,7 @@ def cmd_run(
     top_n: int = DEFAULT_TOP_N,
     face_gate: bool = False,
     diversity: float = 0.5,
+    strategy: str = "kmeans",
 ) -> int:
     log = logging.getLogger("banger")
     if not input_dir.is_dir():
@@ -455,13 +469,23 @@ def cmd_run(
         if not candidates:
             log.warning("no frames qualified for output: %s", output_dir)
         else:
-            log.info(
-                "selecting top %d from %d candidates (diversity lambda=%.2f)",
-                top_n, len(candidates), diversity,
-            )
-            chosen = select.select_diverse_top_n(
-                candidates, n=top_n, diversity_lambda=diversity
-            )
+            if strategy == "topk":
+                log.info("selecting top %d (plain top-K by aesthetic)", top_n)
+                chosen = select.select_top_k(candidates, n=top_n)
+            elif strategy == "mmr":
+                log.info(
+                    "selecting top %d (MMR, lambda=%.2f) from %d candidates",
+                    top_n, diversity, len(candidates),
+                )
+                chosen = select.select_diverse_top_n(
+                    candidates, n=top_n, diversity_lambda=diversity
+                )
+            else:  # kmeans
+                log.info(
+                    "selecting top %d (k-means, one per cluster) from %d candidates",
+                    top_n, len(candidates),
+                )
+                chosen = select.select_kmeans_top_n(candidates, n=top_n)
             top_rows = [row for row, _s, _e in chosen]
             _write_output(output_dir, top_rows, presets_dir=PRESETS_DIR)
     return 0
@@ -780,6 +804,7 @@ def main(argv: list[str] | None = None) -> int:
             top_n=args.top_n,
             face_gate=args.face_gate,
             diversity=args.diversity,
+            strategy=args.strategy,
         )
     if args.command == "explain":
         return cmd_explain(args.input_dir, args.recursive, args.stems)

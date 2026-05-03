@@ -89,6 +89,72 @@ def test_first_pick_is_always_top_score():
         assert out[0][0] == "high", f"first pick should be top-score at lambda={lam}"
 
 
+def test_kmeans_returns_n_visually_distinct_clusters():
+    from banger.select import select_kmeans_top_n
+
+    # Three clusters of three items each; embeddings tightly grouped within
+    # cluster, well-separated between clusters. n=3 should pick one per cluster.
+    items = []
+    for i, axis in enumerate([(1, 0, 0), (0, 1, 0), (0, 0, 1)]):
+        for j in range(3):
+            score = 1.0 + i + 0.1 * j  # ranges 1-3.2 across all
+            jitter = np.array([0.01 * j, 0.01 * j, 0.01 * j], dtype=np.float32)
+            emb = np.array(axis, dtype=np.float32) + jitter
+            emb /= np.linalg.norm(emb)
+            items.append((f"c{i}_{j}", score, emb))
+
+    chosen = select_kmeans_top_n(items, n=3)
+    assert len(chosen) == 3
+    # Each chosen frame should come from a different cluster (different first char).
+    keys = [c[0] for c in chosen]
+    cluster_ids = {k.split("_")[0] for k in keys}
+    assert len(cluster_ids) == 3, f"expected one pick per cluster, got {keys}"
+
+
+def test_kmeans_picks_highest_score_per_cluster():
+    from banger.select import select_kmeans_top_n
+
+    # Two cluster axes, three items each — verify the highest-score-in-cluster
+    # gets picked rather than just any.
+    items = [
+        ("a_low", 1.0, _emb(1, 0)),
+        ("a_high", 5.0, _emb(0.99, 0.14)),
+        ("a_mid", 3.0, _emb(0.95, 0.31)),
+        ("b_low", 0.5, _emb(0, 1)),
+        ("b_high", 4.5, _emb(-0.14, 0.99)),
+        ("b_mid", 2.5, _emb(-0.31, 0.95)),
+    ]
+    chosen = select_kmeans_top_n(items, n=2)
+    keys = sorted(c[0] for c in chosen)
+    assert keys == ["a_high", "b_high"]
+
+
+def test_kmeans_returns_all_when_n_exceeds_pool():
+    from banger.select import select_kmeans_top_n
+
+    items = [("x", 1.0, _emb(1, 0)), ("y", 2.0, _emb(0, 1))]
+    chosen = select_kmeans_top_n(items, n=5)
+    assert len(chosen) == 2
+
+
+def test_kmeans_empty():
+    from banger.select import select_kmeans_top_n
+
+    assert select_kmeans_top_n([], n=5) == []
+
+
+def test_select_top_k_is_pure_sort():
+    from banger.select import select_top_k
+
+    items = [
+        ("a", 3.0, _emb(1, 0)),
+        ("b", 5.0, _emb(0.99, 0.14)),  # similar to a but higher score
+        ("c", 1.0, _emb(0, 1)),
+    ]
+    chosen = select_top_k(items, n=2)
+    assert [c[0] for c in chosen] == ["b", "a"]
+
+
 def test_preserves_original_score_value():
     """Normalisation is internal — output payloads carry the unchanged score."""
     items = [
