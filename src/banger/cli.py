@@ -192,6 +192,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument("input_dir", type=Path)
     ui.add_argument("--port", type=int, default=8000)
 
+    gui = sub.add_parser(
+        "gui",
+        help="Open the native desktop GUI (pywebview). The user-friendly entrypoint.",
+    )
+    gui.add_argument("--port", type=int, default=8765)
+    gui.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run the Flask backend only, no webview. Useful for debugging / remote.",
+    )
+
     bench = sub.add_parser(
         "benchmark",
         help="Run banger (and optionally facet) on the same input, write a markdown report.",
@@ -936,6 +947,10 @@ def main(argv: list[str] | None = None) -> int:
             return scene_kmeans.print_summary()
     if args.command == "ui":
         return cmd_ui(args.input_dir, args.port)
+    if args.command == "gui":
+        from banger import gui as gui_mod
+        gui_mod.serve(port=args.port, open_window=not args.headless)
+        return 0
     if args.command == "labels":
         if args.labels_action == "list":
             return cmd_labels_list()
