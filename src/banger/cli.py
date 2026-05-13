@@ -515,6 +515,12 @@ def cmd_run(
         write_report(report_path, rows, threshold)
         log.info("wrote report: %s", report_path)
 
+    if write_xmp and rows:
+        from banger import xmp as xmp_mod
+
+        n = xmp_mod.write_for_rows(rows)
+        log.info("wrote %d XMP sidecars (rating from rank, label from scene)", n)
+
     if output_dir is not None:
         # Build pool of (Row, score, embedding) for cluster-best survivors.
         embs_by_row_id = {id(row): emb for row, _ci, emb in dedup_inputs}
