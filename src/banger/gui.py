@@ -717,21 +717,34 @@ def _auto_setup() -> None:
         log.warning("auto-setup: scene fit failed: %s", e)
 
     if not eyes_mod.mediapipe_available():
-        log.info("auto-setup: installing mediapipe in the background…")
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--quiet", "mediapipe"],
-                capture_output=True, text=True, timeout=180,
-            )
-            if proc.returncode == 0:
-                log.info("auto-setup: mediapipe installed (restart GUI to enable --eye-gate)")
-            else:
-                log.warning(
-                    "auto-setup: mediapipe install failed (rc=%d): %s",
-                    proc.returncode, proc.stderr.strip()[-200:],
+        marker = state.STATE_DIR / "mediapipe_install_attempted"
+        if marker.exists():
+            log.info("auto-setup: mediapipe install previously failed, skipping retry")
+        else:
+            log.info("auto-setup: spawning detached mediapipe install (~30-60s)…")
+            try:
+                state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+                marker.touch()  # set first so we don't retry on every crash-during-install
+                log_path = state.STATE_DIR / "mediapipe_install.log"
+                creationflags = 0
+                if os.name == "nt":
+                    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so the pip
+                    # process survives the GUI window closing.
+                    creationflags = 0x00000008 | 0x00000200
+                with open(log_path, "w", encoding="utf-8") as fp:
+                    subprocess.Popen(
+                        [sys.executable, "-m", "pip", "install", "mediapipe"],
+                        stdout=fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                        creationflags=creationflags,
+                        close_fds=True,
+                    )
+                log.info(
+                    "auto-setup: mediapipe install detached (log: %s). "
+                    "Restart GUI when it finishes to enable --eye-gate.",
+                    log_path,
                 )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            log.warning("auto-setup: mediapipe install errored: %s", e)
+            except OSError as e:
+                log.warning("auto-setup: mediapipe install spawn failed: %s", e)
 
     # Wait briefly for the Flask socket so the webview's first nav doesn't
     # race-fail. 200 ms is plenty on a modern machine; on a slow one we
