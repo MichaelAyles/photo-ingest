@@ -85,6 +85,63 @@ def select_top_k(
     return sorted(items, key=lambda it: -it[1])[:n]
 
 
+def select_faces_top_n(
+    items: list[tuple[T, float, np.ndarray]],
+    face_embs_per_item: list[list[np.ndarray]],
+    n: int,
+    random_state: int = 0,
+) -> list[tuple[T, float, np.ndarray]]:
+    """Identity-diverse selection: one good shot per detected person, the
+    Aftershoot trick. Frames without faces fall back to kmeans-on-CLIP for
+    the remaining slots so a folder of landscapes still gets visual variety.
+
+    The argument shape mirrors select_kmeans_top_n with an extra parallel
+    list of per-item face embeddings (already extracted upstream via
+    banger.face_id). Returns at most `n` items in chosen order.
+    """
+    if not items or n <= 0:
+        return []
+    if len(face_embs_per_item) != len(items):
+        raise ValueError("face_embs_per_item must be the same length as items")
+
+    from banger.face_id import cluster_faces
+
+    per_frame = cluster_faces(face_embs_per_item)
+    # Find each person cluster's best-scoring frame (the "rep" for that person).
+    best_for_person: dict[int, int] = {}  # person_id -> index into items
+    for idx, persons in enumerate(per_frame):
+        score = items[idx][1]
+        for pid in persons:
+            cur = best_for_person.get(pid)
+            if cur is None or items[cur][1] < score:
+                best_for_person[pid] = idx
+
+    # Dedupe: one frame might be the best for multiple people (group photo).
+    # That frame still gets picked once; we lose no information because the
+    # reps below it for those other people will be lower-scoring.
+    chosen_idx: list[int] = []
+    seen: set[int] = set()
+    # Sort person reps by frame score descending so the strongest face cluster
+    # leads.
+    for pid in sorted(best_for_person, key=lambda p: -items[best_for_person[p]][1]):
+        idx = best_for_person[pid]
+        if idx in seen:
+            continue
+        chosen_idx.append(idx)
+        seen.add(idx)
+        if len(chosen_idx) >= n:
+            break
+
+    if len(chosen_idx) >= n:
+        return [items[i] for i in chosen_idx]
+
+    # Fill remaining slots with kmeans-on-CLIP picks from the leftover pool.
+    remaining = [items[i] for i in range(len(items)) if i not in seen]
+    needed = n - len(chosen_idx)
+    fillers = select_kmeans_top_n(remaining, n=needed, random_state=random_state)
+    return [items[i] for i in chosen_idx] + fillers
+
+
 def select_kmeans_top_n(
     items: list[tuple[T, float, np.ndarray]],
     n: int,

@@ -119,6 +119,7 @@ def cache_frame_metadata(
     face_sharpness: float | None = None,
     metrics: dict | None = None,
     eyes: dict | None = None,
+    face_embeddings: list | None = None,
 ) -> None:
     """Cache the per-frame inputs needed by `cmd_run` so re-runs skip preview loads.
 
@@ -144,6 +145,8 @@ def cache_frame_metadata(
         payload["metrics"] = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
     if eyes:
         payload["eyes"] = eyes
+    if face_embeddings:
+        payload["face_embeddings"] = face_embeddings
     (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 

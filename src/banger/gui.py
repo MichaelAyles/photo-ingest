@@ -39,7 +39,8 @@ import imagehash
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from banger import aesthetic, dedup, eyes as eyes_mod, face, metrics as metrics_mod
+from banger import aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod
+from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
 from banger import xmp as xmp_mod
 from banger.frames import discover_frames
@@ -153,7 +154,10 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
             cached_meta = state.load_frame_metadata(sha)
             cached_emb = state.load_embedding(sha)
 
-            if cached_meta and "phash_hex" in cached_meta and cached_emb is not None:
+            face_id_ok = (strategy != "faces") or (
+                cached_meta is not None and "face_embeddings" in cached_meta
+            )
+            if cached_meta and "phash_hex" in cached_meta and cached_emb is not None and face_id_ok:
                 sharp = float(cached_meta["sharpness"])
                 if sharp < threshold:
                     cache_hits += 1
@@ -193,10 +197,18 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
                             frame_eyes = eyes_mod.analyse_eyes(preview)
                         except Exception as e:
                             log_line(f"eyes skip {f.display_name}: {e}")
+                    face_embs_payload = None
+                    if strategy == "faces":
+                        try:
+                            embs = face_id_mod.extract_face_embeddings(preview)
+                            face_embs_payload = face_id_mod.encode_for_cache(embs)
+                        except Exception as e:
+                            log_line(f"face_id skip {f.display_name}: {e}")
                     state.cache_frame_metadata(
                         sha, sharp, str(phash), ts,
                         face_count=face_count, face_sharpness=face_sharp,
                         metrics=frame_metrics, eyes=frame_eyes,
+                        face_embeddings=face_embs_payload,
                     )
                 except Exception as e:
                     log_line(f"score fail {f.display_name}: {e}")
@@ -257,6 +269,19 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
             chosen = select.select_top_k(candidates, n=top_n)
         elif strategy == "mmr":
             chosen = select.select_diverse_top_n(candidates, n=top_n, diversity_lambda=diversity)
+        elif strategy == "faces":
+            face_embs_per_item: list[list[np.ndarray]] = []
+            for r, _s, _e in candidates:
+                sha2 = state.sha256_of(r.frame.classify_path)
+                meta2 = state.load_frame_metadata(sha2) or {}
+                face_embs_per_item.append(
+                    face_id_mod.decode_from_cache(meta2.get("face_embeddings"))
+                )
+            n_people_frames = sum(1 for embs in face_embs_per_item if embs)
+            log_line(f"face-id: {n_people_frames}/{len(candidates)} candidates carry embeddings")
+            chosen = select.select_faces_top_n(
+                candidates, face_embs_per_item=face_embs_per_item, n=top_n,
+            )
         else:
             chosen = select.select_kmeans_top_n(candidates, n=top_n)
 
@@ -630,6 +655,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
             "head_loaded": taste_head.exists(),
             "scene_model": scene_kmeans.exists(),
             "mediapipe": eyes_mod.mediapipe_available(),
+            "insightface": face_id_mod.insightface_available(),
             "labels_total": len(labels),
             "cache_counts": {k: v["count"] for k, v in stats.items()},
         })
@@ -835,6 +861,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
       <label class="opt">strategy
         <select id="opt-strategy">
           <option value="kmeans" selected>kmeans (portfolio)</option>
+          <option value="faces">faces (one per person)</option>
           <option value="mmr">mmr (diverse)</option>
           <option value="topk">topk (pure score)</option>
         </select>
@@ -883,6 +910,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
       <label><span class="k">Taste head</span><span id="st-head" class="badge">…</span></label>
       <label><span class="k">Scene clusters</span><span id="st-scene" class="badge">…</span></label>
       <label><span class="k">Mediapipe (eyes)</span><span id="st-eyes" class="badge">…</span></label>
+      <label><span class="k">InsightFace (faces)</span><span id="st-faces" class="badge">…</span></label>
       <label><span class="k">Labels collected</span><span id="st-labels"></span></label>
       <label><span class="k">Embeddings cached</span><span id="st-embs"></span></label>
     </div>
@@ -1253,10 +1281,15 @@ async function loadState() {
   setBadge("#st-head", s.head_loaded, "Taste head trained via `banger train`");
   setBadge("#st-scene", s.scene_model, "Scene clusters fit via `banger scenes fit`");
   setBadge("#st-eyes", s.mediapipe, "mediapipe installed = --eye-gate works");
+  setBadge("#st-faces", s.insightface, "insightface installed = 'faces' strategy works");
   $("#st-labels").textContent = s.labels_total + " frames";
   $("#st-embs").textContent = (s.cache_counts.embeddings || 0) + " cached";
   // Hide options that depend on missing deps
   if (!s.mediapipe) $("#opt-eye-gate").parentElement.style.opacity = ".4";
+  if (!s.insightface) {
+    const facesOpt = document.querySelector('#opt-strategy option[value="faces"]');
+    if (facesOpt) facesOpt.disabled = true;
+  }
 }
 
 loadRecent();

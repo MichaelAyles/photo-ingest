@@ -9,7 +9,10 @@ from pathlib import Path
 import imagehash
 import numpy as np
 
-from banger import aesthetic, dedup, eyes as eyes_mod, face, metrics as metrics_mod, scene_kmeans, scenes, select, server, state, taste_head
+from banger import (
+    aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
+    metrics as metrics_mod, scene_kmeans, scenes, select, server, state, taste_head,
+)
 from banger import develop as develop_mod
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
@@ -104,15 +107,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--strategy",
-        choices=["topk", "mmr", "kmeans"],
+        choices=["topk", "mmr", "kmeans", "faces"],
         default="kmeans",
         help=(
             "Top-N selection strategy. 'topk' = pure aesthetic ranking, "
             "no diversity. 'mmr' = continuous knob via --diversity. "
             "'kmeans' (default) = cluster the candidates by CLIP embedding "
             "into N visual groups and pick the highest-scoring frame from "
-            "each — best for portfolio-style output where you want "
-            "scenery + portrait + group + detail rather than 10 portraits."
+            "each. 'faces' = the Aftershoot trick: cluster by face identity "
+            "via insightface, pick one good shot per person, fill remainder "
+            "with kmeans-on-CLIP. Best when the dataset has recurring people "
+            "and you're tired of seeing the same crew in every pick."
         ),
     )
     run.add_argument(
@@ -284,6 +289,9 @@ def cmd_run(
             and "face_sharpness" in cached_meta
         )
         eye_data_ok = (not eye_gate) or (cached_meta is not None and "eyes" in cached_meta)
+        face_id_data_ok = (strategy != "faces") or (
+            cached_meta is not None and "face_embeddings" in cached_meta
+        )
 
         # Fast path: every per-frame input we need is on disk → don't decode.
         cache_hit = (
@@ -292,6 +300,7 @@ def cmd_run(
             and cached_emb is not None
             and face_data_ok
             and eye_data_ok
+            and face_id_data_ok
             and report_path is None  # thumb requires preview
         )
 
@@ -381,10 +390,18 @@ def cmd_run(
                         except Exception as e:
                             log.warning("eyes skip %s: %s", f.display_name, e)
                             frame_eyes = None
+                    face_embs_payload = None
+                    if strategy == "faces":
+                        try:
+                            embs = face_id_mod.extract_face_embeddings(preview)
+                            face_embs_payload = face_id_mod.encode_for_cache(embs)
+                        except Exception as e:
+                            log.warning("face_id skip %s: %s", f.display_name, e)
                     state.cache_frame_metadata(
                         sha, sharp, str(phash), ts,
                         face_count=face_count, face_sharpness=face_sharp,
                         metrics=frame_metrics, eyes=frame_eyes,
+                        face_embeddings=face_embs_payload,
                     )
                     aesthetic_done += 1
                 except Exception as e:
@@ -595,6 +612,23 @@ def cmd_run(
                 )
                 chosen = select.select_diverse_top_n(
                     candidates, n=top_n, diversity_lambda=diversity
+                )
+            elif strategy == "faces":
+                face_embs_per_item: list[list[np.ndarray]] = []
+                for r, _s, _e in candidates:
+                    sha2 = state.sha256_of(r.frame.classify_path)
+                    meta2 = state.load_frame_metadata(sha2) or {}
+                    face_embs_per_item.append(
+                        face_id_mod.decode_from_cache(meta2.get("face_embeddings"))
+                    )
+                n_people = sum(1 for embs in face_embs_per_item if embs)
+                log.info(
+                    "selecting top %d (face-diverse) from %d candidates "
+                    "(%d carry face embeddings)",
+                    top_n, len(candidates), n_people,
+                )
+                chosen = select.select_faces_top_n(
+                    candidates, face_embs_per_item=face_embs_per_item, n=top_n,
                 )
             else:  # kmeans
                 log.info(
