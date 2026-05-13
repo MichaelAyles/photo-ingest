@@ -113,3 +113,59 @@ def test_label_rejects_unknown_sha(client):
 def test_thumb_404_on_unknown_sha(client):
     res = client.get("/api/thumb/" + "0" * 64)
     assert res.status_code == 404
+
+
+def test_unlabelled_uncertain_no_head(client):
+    """With no taste head saved, endpoint still answers — just unsorted."""
+    res = client.get("/api/unlabelled-uncertain")
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["head_loaded"] is False
+    assert data["total_unlabelled"] == 3
+    assert data["scored_count"] == 0
+    assert len(data["ordered"]) == 3
+
+
+def test_unlabelled_uncertain_with_head(client, monkeypatch):
+    """When the head exists, unlabelled frames come back ordered by |predicted|."""
+    import re
+
+    body = client.get("/").get_data(as_text=True)
+    shas = re.findall(r'"sha":\s*"([0-9a-f]{64})"', body)
+    assert len(shas) == 3
+
+    # Cache fake embeddings so the endpoint has something to score.
+    from banger import state, taste_head
+
+    for sha in shas:
+        state.cache_embedding(sha, np.zeros(8, dtype=np.float32))
+
+    class FakeHead:
+        def predict(self, X):
+            # Deterministic per-sha "predicted" score driven by row index.
+            # All-zero embedding maps to a constant in real Ridge; the test
+            # patches `predict_score` directly so we control the values.
+            return np.array([0.0] * X.shape[0])
+
+    monkeypatch.setattr(taste_head, "load", lambda: FakeHead())
+    # Assign each sha a different |predicted| score in registration order.
+    scores = {shas[0]: 2.5, shas[1]: -0.1, shas[2]: 1.2}
+    monkeypatch.setattr(taste_head, "predict_score", lambda model, emb: scores[shas[_lookup_sha(emb, shas)]])
+
+    res = client.get("/api/unlabelled-uncertain")
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["head_loaded"] is True
+    assert data["scored_count"] == 3
+    # Most uncertain = smallest |score| = shas[1] (|-0.1| = 0.1).
+    assert data["ordered"][0]["sha"] == shas[1]
+    assert abs(data["ordered"][0]["predicted"] + 0.1) < 1e-6
+
+
+def _lookup_sha(_emb, shas):
+    """Round-robin index for the mocked predict_score in the test above."""
+    if not hasattr(_lookup_sha, "_i"):
+        _lookup_sha._i = 0
+    i = _lookup_sha._i
+    _lookup_sha._i = (i + 1) % len(shas)
+    return i

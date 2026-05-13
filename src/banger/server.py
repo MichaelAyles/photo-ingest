@@ -30,7 +30,7 @@ from pathlib import Path
 import cv2
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from banger import aesthetic, state
+from banger import aesthetic, state, taste_head
 from banger.frames import discover_frames
 from banger.preview import load_preview
 from banger.report import encode_thumbnail_bytes
@@ -178,6 +178,40 @@ def serve(input_dir: Path, port: int = 8000) -> None:
             conn.execute("DELETE FROM labels WHERE sha256=?", (sha,))
         return jsonify({"sha": sha, "score": None})
 
+    @app.route("/api/unlabelled-uncertain")
+    def unlabelled_uncertain():
+        """Return unlabelled frames ordered by |predicted score| ascending.
+
+        Active-learning play: the head is least confident about frames whose
+        predicted taste score sits near zero. Labelling those grows the training
+        set on confusion cases instead of uniform sampling, which is where a
+        personalised head gets its leverage with small N. Frames with no cached
+        embedding fall to the back (we can't score them yet without preview load).
+        """
+        head = taste_head.load()
+        labels = state.labels_dict()
+        scored: list[tuple[float, dict, bool]] = []  # (|score|, view, scored?)
+        for f_view in frames_view:
+            sha = f_view["sha"]
+            if sha in labels:
+                continue
+            if head is not None:
+                emb = state.load_embedding(sha)
+                if emb is not None:
+                    pred = taste_head.predict_score(head, emb)
+                    scored.append((abs(pred), {**f_view, "predicted": round(pred, 3)}, True))
+                    continue
+            scored.append((float("inf"), f_view, False))
+        scored.sort(key=lambda t: t[0])
+        return jsonify(
+            {
+                "head_loaded": head is not None,
+                "ordered": [v for _, v, _ in scored],
+                "scored_count": sum(1 for _, _, s in scored if s),
+                "total_unlabelled": len(scored),
+            }
+        )
+
     @app.route("/api/stats")
     def stats():
         labels = state.labels_dict()
@@ -268,6 +302,10 @@ _TEMPLATE = r"""<!doctype html>
     </div>
     <span id="hist-summary"></span>
   </div>
+  <button id="mode-toggle" title="Switch ordering to uncertain frames (active learning)"
+          style="margin-left: .5rem; background: #1f1f1f; color: #ccc; border: 1px solid #333; border-radius: 3px; padding: 2px 8px; font-size: .7rem; cursor: pointer;">
+    order: random
+  </button>
   <div class="help">
     <kbd>1</kbd>-<kbd>5</kbd> = -5..-1 &nbsp; <kbd>6</kbd>-<kbd>9</kbd>+<kbd>0</kbd> = +1..+5 &nbsp;·&nbsp;
     <kbd>←</kbd><kbd>→</kbd> move &nbsp;·&nbsp; <kbd>Space</kbd> skip &nbsp;·&nbsp; <kbd>Bksp</kbd> clear
@@ -288,7 +326,7 @@ _TEMPLATE = r"""<!doctype html>
 <div id="filmstrip"></div>
 
 <script>
-const FRAMES = {{ frames | tojson }};
+let FRAMES = {{ frames | tojson }};
 const LABELS = {{ labels | tojson }};
 const SCORES = [-5,-4,-3,-2,-1,0,1,2,3,4,5];
 const KEY_TO_SCORE = {
@@ -492,6 +530,43 @@ document.addEventListener("keydown", e => {
   } else if (e.key === " ") {
     e.preventDefault();
     setFocus(focusIdx + 1);
+  }
+});
+
+let mode = "random";
+const modeToggle = document.getElementById("mode-toggle");
+modeToggle.addEventListener("click", async () => {
+  if (mode === "random") {
+    modeToggle.textContent = "order: loading…";
+    modeToggle.disabled = true;
+    try {
+      const res = await fetch("/api/unlabelled-uncertain");
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      if (!data.head_loaded) {
+        modeToggle.textContent = "order: random (train head first)";
+        modeToggle.disabled = false;
+        return;
+      }
+      // Replace the in-memory frames list with the uncertainty-ordered one,
+      // then append the labelled set at the end so nothing falls off the strip.
+      const labelledSet = new Set(Object.keys(LABELS));
+      const labelledFrames = FRAMES.filter(f => labelledSet.has(f.sha));
+      FRAMES = [...data.ordered, ...labelledFrames];
+      mode = "uncertain";
+      modeToggle.textContent = `order: uncertain (n=${data.scored_count} scored)`;
+      buildFilmstrip();
+      setFocus(0);
+    } catch (e) {
+      console.error("uncertain fetch failed:", e);
+      modeToggle.textContent = "order: random (fetch failed)";
+    } finally {
+      modeToggle.disabled = false;
+    }
+  } else {
+    // We don't keep the original random ordering on the client; reloading
+    // is the simplest way to reset and it's exactly what the user expects.
+    location.reload();
   }
 });
 
