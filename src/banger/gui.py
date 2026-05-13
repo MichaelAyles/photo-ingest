@@ -1578,11 +1578,15 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .onboarding-actions button:hover { border-color: var(--accent); background: var(--bg2); }
 
   /* editor */
-  .ed-shell { display: flex; height: 100%; min-height: 0; }
-  .ed-canvas { flex: 1 1 auto; background: #000; display: flex; align-items: center; justify-content: center; min-width: 0; position: relative; padding: 1rem; }
+  .ed-shell { display: flex; height: 100%; min-height: 0; overflow: hidden; }
+  .ed-canvas { flex: 1 1 auto; background: #000; display: flex; align-items: center; justify-content: center; min-width: 0; min-height: 0; position: relative; padding: 1rem; overflow: hidden; }
   .ed-canvas img { max-width: 100%; max-height: 100%; object-fit: contain; }
   .ed-info { position: absolute; top: 1rem; left: 1rem; color: var(--dim); font-size: .75rem; font-family: ui-monospace, monospace; background: rgba(0,0,0,.6); padding: .25rem .55rem; border-radius: 4px; }
-  .ed-sidebar { flex: 0 0 320px; background: #0a0a0a; border-left: 1px solid var(--line); overflow-y: auto; }
+  .ed-sidebar { flex: 0 0 320px; background: #0a0a0a; border-left: 1px solid var(--line); overflow-y: auto; overflow-x: hidden; min-height: 0; }
+  .ed-sidebar::-webkit-scrollbar { width: 8px; }
+  .ed-sidebar::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+  .ed-sidebar::-webkit-scrollbar-thumb:hover { background: #444; }
+  .ed-sidebar::-webkit-scrollbar-track { background: transparent; }
   .ed-toolbar { position: sticky; top: 0; background: #0a0a0a; padding: .6rem .8rem; border-bottom: 1px solid var(--line); display: flex; gap: .3rem; flex-wrap: wrap; z-index: 2; }
   .ed-toolbar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .7rem; font-size: .75rem; cursor: pointer; }
   .ed-toolbar button:hover { border-color: var(--accent); }
@@ -1745,7 +1749,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
   </div>
 </section>
 
-<section class="view hidden" id="view-editor" style="padding:0">
+<section class="view hidden" id="view-editor" style="padding:0;overflow:hidden">
   <div class="ed-shell">
     <div class="ed-canvas">
       <img id="ed-img" alt="">
