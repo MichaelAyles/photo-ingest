@@ -39,7 +39,7 @@ import imagehash
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from banger import aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod
+from banger import aesthetic, caption as caption_mod, dedup, eyes as eyes_mod, face, face_id as face_id_mod
 from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
 from banger import xmp as xmp_mod
@@ -571,6 +571,31 @@ def build_app(window_holder: dict | None = None) -> Flask:
             return jsonify({"error": str(e)}), 500
         return jsonify({"ok": True})
 
+    @app.route("/api/caption/<sha>")
+    def caption_for(sha):
+        """Return a cached BLIP caption, or generate one now.
+
+        Lazy by design: the model load + first generate cost ~10-15s, only
+        paid the first time the user clicks any photo. The result lands in
+        metadata/<sha>.json so subsequent opens of the same photo are instant.
+        """
+        meta = state.load_frame_metadata(sha) or {}
+        if "caption" in meta:
+            return jsonify({"caption": meta["caption"], "cached": True})
+
+        f = sha_to_frame.get(sha)
+        if f is None:
+            return jsonify({"error": "unknown sha"}), 404
+        try:
+            preview = load_preview(f.classify_path)
+        except Exception as e:
+            return jsonify({"caption": "", "error": str(e)}), 200
+
+        text = caption_mod.caption(preview)
+        if text:
+            state.update_frame_metadata(sha, caption=text)
+        return jsonify({"caption": text, "cached": False})
+
     @app.route("/api/details/<sha>")
     def details(sha):
         """Return everything we know about one frame: scores, metrics, EXIF.
@@ -598,6 +623,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
             "face_count": meta.get("face_count"),
             "face_sharpness": meta.get("face_sharpness"),
             "sharpness": meta.get("sharpness"),
+            "caption": meta.get("caption"),
             "exif": exif,
         })
 
@@ -1226,14 +1252,31 @@ async function openHero(pick) {
   $("#overlay-img").src = "/api/preview/" + pick.sha;
   $("#overlay-panel").innerHTML = renderPanelLoading(pick);
   $("#overlay").classList.add("show");
+  let details = null;
   try {
     const res = await fetch("/api/details/" + pick.sha);
     if (!res.ok) throw new Error(await res.text());
-    const d = await res.json();
-    $("#overlay-panel").innerHTML = renderPanel(pick, d);
+    details = await res.json();
+    $("#overlay-panel").innerHTML = renderPanel(pick, details);
   } catch (e) {
     $("#overlay-panel").innerHTML = renderPanelLoading(pick) +
       `<p class="empty">details fetch failed: ${escapeHtml(e.message)}</p>`;
+    return;
+  }
+  // If no cached caption, fetch one lazily and slot it into the panel.
+  if (!details.caption) {
+    const target = document.getElementById("caption-slot-" + pick.sha);
+    if (target) target.textContent = "Generating description (first call loads BLIP, ~10-15s)…";
+    try {
+      const res = await fetch("/api/caption/" + pick.sha);
+      const d = await res.json();
+      if (target) {
+        if (d.caption) target.textContent = d.caption;
+        else target.textContent = "(captioning unavailable)";
+      }
+    } catch (e) {
+      if (target) target.textContent = "(caption fetch failed)";
+    }
   }
 }
 
@@ -1327,12 +1370,18 @@ function renderPanel(pick, d) {
     ? `<dl>${exifPairs.map(([k,v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>`
     : '<p class="empty">no EXIF data (or non-JPEG source)</p>';
 
+  const captionHtml = d.caption
+    ? `<p style="margin:.3rem 0 0;font-size:.85rem;color:#ddd;line-height:1.35">${escapeHtml(d.caption)}</p>`
+    : `<p id="caption-slot-${pick.sha}" style="margin:.3rem 0 0;font-size:.8rem;color:var(--dim);font-style:italic">loading description…</p>`;
+
   return `
     <div class="head">
       <span class="rank">#${pick.rank}</span>
       <span class="stars">${stars}</span>
       <span class="stem">${escapeHtml(pick.display)}</span>
     </div>
+    <h3>What's in it</h3>
+    ${captionHtml}
     <h3>Why it was picked</h3>
     <dl>
       <dt>aesthetic</dt><dd>${score} <span style="color:var(--dim);font-size:.7rem">(${escapeHtml(pick.aesthetic_source || "—")})</span></dd>

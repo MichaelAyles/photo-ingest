@@ -150,6 +150,23 @@ def cache_frame_metadata(
     (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
+def update_frame_metadata(sha: str, **fields) -> None:
+    """Merge fields into an existing metadata file. Used by lazy enrichers
+    (captions, recomputed metrics) that produce data after the initial
+    pipeline pass. No-op if the metadata file doesn't exist yet."""
+    import json
+
+    p = METADATA_DIR / f"{sha}.json"
+    if not p.exists():
+        return
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    payload.update(fields)
+    p.write_text(json.dumps(payload), encoding="utf-8")
+
+
 def load_frame_metadata(sha: str) -> dict | None:
     import json
 
