@@ -676,6 +676,20 @@ def serve(port: int = 8765, open_window: bool = True) -> None:
     t = threading.Thread(target=_flask, daemon=True)
     t.start()
 
+    # Warm-load CLIP in parallel with the window opening. Without this, the
+    # first frame of the first run pays ~15s of model-load latency before
+    # any progress shows. With it, model load overlaps with the user picking
+    # a folder, so by the time they click 'open' the model is usually ready.
+    def _warm_clip():
+        t0 = time.monotonic()
+        try:
+            aesthetic._load()
+            log.info("CLIP warmed in %.1fs", time.monotonic() - t0)
+        except Exception as e:
+            log.warning("CLIP warm-load failed: %s", e)
+
+    threading.Thread(target=_warm_clip, daemon=True).start()
+
     # Wait briefly for the Flask socket so the webview's first nav doesn't
     # race-fail. 200 ms is plenty on a modern machine; on a slow one we
     # retry up to 2 s.
