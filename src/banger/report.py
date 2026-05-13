@@ -27,6 +27,8 @@ class Row:
     scene_preset: str | None = None  # picked darktable preset name
     scene_score: float | None = None
     scene_fell_back: bool = False
+    metrics: dict | None = None  # cv2-only multi-dim quality scores (banger.metrics)
+    eyes: dict | None = None  # optional EAR/blink data (banger.eyes), only when --eye-gate
 
 
 def encode_thumbnail_bytes(preview: np.ndarray) -> bytes:

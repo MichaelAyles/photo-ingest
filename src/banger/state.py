@@ -117,8 +117,16 @@ def cache_frame_metadata(
     timestamp: float,
     face_count: int | None = None,
     face_sharpness: float | None = None,
+    metrics: dict | None = None,
+    eyes: dict | None = None,
 ) -> None:
-    """Cache the per-frame inputs needed by `cmd_run` so re-runs skip preview loads."""
+    """Cache the per-frame inputs needed by `cmd_run` so re-runs skip preview loads.
+
+    `metrics` is the cv2-only multi-dim dict from banger.metrics. `eyes` is the
+    optional per-face EAR/blink dict from banger.eyes. Both are merged into
+    the JSON so downstream consumers (report, XMP encoder, UI) can read them
+    without recomputing.
+    """
     import json
 
     METADATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -132,6 +140,10 @@ def cache_frame_metadata(
         payload["face_count"] = int(face_count)
     if face_sharpness is not None:
         payload["face_sharpness"] = float(face_sharpness)
+    if metrics:
+        payload["metrics"] = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in metrics.items()}
+    if eyes:
+        payload["eyes"] = eyes
     (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 

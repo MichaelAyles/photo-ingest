@@ -9,7 +9,7 @@ from pathlib import Path
 import imagehash
 import numpy as np
 
-from banger import aesthetic, dedup, face, scenes, select, server, state, taste_head
+from banger import aesthetic, dedup, eyes as eyes_mod, face, metrics as metrics_mod, scenes, select, server, state, taste_head
 from banger import develop as develop_mod
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
@@ -81,6 +81,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "Also reject frames whose detected faces are softer than "
             f"face.FACE_SHARPNESS_THRESHOLD (={face.FACE_SHARPNESS_THRESHOLD}). "
             "Frames without a detected face still go through the global gate only."
+        ),
+    )
+    run.add_argument(
+        "--eye-gate",
+        action="store_true",
+        help=(
+            "Reject frames where any detected face has Eye Aspect Ratio below "
+            f"eyes.EYE_AR_THRESHOLD (={eyes_mod.EYE_AR_THRESHOLD}). Requires mediapipe; "
+            "a no-op (and a warning) if mediapipe isn't installed. Off by default."
+        ),
+    )
+    run.add_argument(
+        "--xmp",
+        action="store_true",
+        help=(
+            "Also write a sidecar .xmp next to each source frame with star rating "
+            "(top 10%% = 5★, next 20%% = 4★, etc) and a colour label encoding the "
+            "scene cluster. Non-destructive: no copying, no developing. Picked up "
+            "automatically by darktable/Lightroom on next library scan."
         ),
     )
     run.add_argument(
@@ -177,6 +196,8 @@ def cmd_run(
     output_dir: Path | None = None,
     top_n: int = DEFAULT_TOP_N,
     face_gate: bool = False,
+    eye_gate: bool = False,
+    write_xmp: bool = False,
     diversity: float = 0.5,
     strategy: str = "kmeans",
 ) -> int:
@@ -192,6 +213,13 @@ def cmd_run(
 
     threshold = SHARPNESS_CONFIG["threshold"]
     head = taste_head.load()
+
+    if eye_gate and not eyes_mod.mediapipe_available():
+        log.warning(
+            "--eye-gate requested but mediapipe is not installed; "
+            "gate disabled (pip install mediapipe to enable)"
+        )
+        eye_gate = False
     log.info(
         "processing %d frames (sharpness threshold=%.1f, aesthetic=%s, recursive=%s, report=%s)",
         len(frames),
@@ -209,6 +237,8 @@ def cmd_run(
     aesthetic_skipped = 0
     cache_hits = 0
     face_gated = 0  # rejected by face-aware gate (in addition to global gate)
+    eye_gated = 0  # rejected by eye-aware gate
+    metrics_done = 0
     t0 = time.monotonic()
     for f in frames:
         sha = state.sha256_of(f.classify_path)
@@ -221,6 +251,7 @@ def cmd_run(
             and "face_count" in cached_meta
             and "face_sharpness" in cached_meta
         )
+        eye_data_ok = (not eye_gate) or (cached_meta is not None and "eyes" in cached_meta)
 
         # Fast path: every per-frame input we need is on disk → don't decode.
         cache_hit = (
@@ -228,11 +259,14 @@ def cmd_run(
             and "phash_hex" in cached_meta
             and cached_emb is not None
             and face_data_ok
+            and eye_data_ok
             and report_path is None  # thumb requires preview
         )
 
         face_count = (cached_meta or {}).get("face_count", 0)
         face_sharp = (cached_meta or {}).get("face_sharpness", 0.0)
+        frame_metrics = (cached_meta or {}).get("metrics")
+        frame_eyes = (cached_meta or {}).get("eyes")
 
         if cache_hit:
             sharp = float(cached_meta["sharpness"])
@@ -285,6 +319,8 @@ def cmd_run(
             phash = None
             ts = 0.0
             emb = None
+            frame_metrics = None
+            frame_eyes = None
             if sharp >= threshold:
                 try:
                     emb = aesthetic.encode_image(preview)
@@ -301,9 +337,22 @@ def cmd_run(
                     # Always populate face data on cold path so future warm runs
                     # don't need a preview reload even if face-gate is later asked for.
                     face_count, face_sharp = face.best_face_sharpness(preview)
+                    try:
+                        frame_metrics = metrics_mod.compute_all(preview)
+                        metrics_done += 1
+                    except Exception as e:
+                        log.warning("metrics skip %s: %s", f.display_name, e)
+                        frame_metrics = None
+                    if eye_gate:
+                        try:
+                            frame_eyes = eyes_mod.analyse_eyes(preview)
+                        except Exception as e:
+                            log.warning("eyes skip %s: %s", f.display_name, e)
+                            frame_eyes = None
                     state.cache_frame_metadata(
                         sha, sharp, str(phash), ts,
                         face_count=face_count, face_sharpness=face_sharp,
+                        metrics=frame_metrics, eyes=frame_eyes,
                     )
                     aesthetic_done += 1
                 except Exception as e:
@@ -332,26 +381,37 @@ def cmd_run(
                 face_sharp, face.FACE_SHARPNESS_THRESHOLD, f.display_name,
             )
 
-        if not cache_hit:
-            row = Row(
-                frame=f,
-                sharpness=sharp,
-                aesthetic=a_score,
-                aesthetic_breakdown=breakdown,
-                aesthetic_source=source,
-                thumb_b64=thumb,
+        # Eye-aware gate: same shape as face-gate but on EAR via mediapipe.
+        if (
+            eye_gate
+            and a_score is not None
+            and frame_eyes is not None
+            and frame_eyes.get("face_count", 0) > 0
+            and frame_eyes.get("ear_min", 1.0) < eyes_mod.EYE_AR_THRESHOLD
+        ):
+            eye_gated += 1
+            sharp = min(sharp, threshold - 0.01)
+            a_score = None
+            breakdown = None
+            source = None
+            emb = None
+            phash = None
+            log.info(
+                "REJECT (eyes closed, EAR=%.2f < %.2f) %s",
+                frame_eyes["ear_min"], eyes_mod.EYE_AR_THRESHOLD, f.display_name,
             )
-            rows.append(row)
-        else:
-            row = Row(
-                frame=f,
-                sharpness=sharp,
-                aesthetic=a_score,
-                aesthetic_breakdown=breakdown,
-                aesthetic_source=source,
-                thumb_b64="",
-            )
-            rows.append(row)
+
+        row = Row(
+            frame=f,
+            sharpness=sharp,
+            aesthetic=a_score,
+            aesthetic_breakdown=breakdown,
+            aesthetic_source=source,
+            thumb_b64=("" if cache_hit else thumb),
+            metrics=frame_metrics,
+            eyes=frame_eyes,
+        )
+        rows.append(row)
 
         if phash is not None and a_score is not None and emb is not None:
             dedup_inputs.append(
@@ -405,7 +465,7 @@ def cmd_run(
     log.info(
         "summary: %d final kept (= %d sharpness-pass − %d burst dupes), %d rejected of "
         "%d frames in %.1fs (aesthetic done=%d skipped=%d, %d bursts found, "
-        "%d scenes classified, %d cache hits, %d face-gated)",
+        "%d scenes classified, %d cache hits, %d face-gated, %d eye-gated, %d metrics computed)",
         final_kept,
         sharp_kept,
         suppressed_count,
@@ -418,6 +478,8 @@ def cmd_run(
         scene_done,
         cache_hits,
         face_gated,
+        eye_gated,
+        metrics_done,
     )
 
     if scene_done:
@@ -803,6 +865,8 @@ def main(argv: list[str] | None = None) -> int:
             output_dir=args.output,
             top_n=args.top_n,
             face_gate=args.face_gate,
+            eye_gate=args.eye_gate,
+            write_xmp=args.xmp,
             diversity=args.diversity,
             strategy=args.strategy,
         )
