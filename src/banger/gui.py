@@ -1592,8 +1592,10 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .lib-grid { flex: 1 1 auto; overflow-y: auto; padding: .8rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .5rem; align-content: start; }
   .lib-cell { background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color .12s; position: relative; }
   .lib-cell:hover { border-color: var(--accent); }
-  .lib-cell .lib-img-wrap { aspect-ratio: 4/3; background: #000; }
-  .lib-cell .lib-img-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  /* padding-bottom 75% gives a guaranteed 4:3 box regardless of aspect-ratio
+     CSS support quirks in WebView2. img is absolutely positioned inside. */
+  .lib-cell .lib-img-wrap { position: relative; width: 100%; padding-bottom: 75%; background: #000; overflow: hidden; }
+  .lib-cell .lib-img-wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
   .lib-cell .lib-label { padding: .3rem .5rem; font-size: .7rem; color: #ccc; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lib-cell .lib-label .lib-rating { color: #ffd56a; margin-right: .35rem; }
   .lib-cell .lib-badges { position: absolute; top: 4px; left: 4px; display: flex; gap: 3px; }

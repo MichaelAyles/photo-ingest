@@ -129,9 +129,21 @@ def _conn() -> sqlite3.Connection:
                 )
                 """
             )
+            # Migrations: add geotag columns if a pre-geotag DB is upgraded.
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(frames)")]
+            for col, ddl in (
+                ("lat", "ALTER TABLE frames ADD COLUMN lat REAL"),
+                ("lon", "ALTER TABLE frames ADD COLUMN lon REAL"),
+                ("place_city", "ALTER TABLE frames ADD COLUMN place_city TEXT"),
+                ("place_region", "ALTER TABLE frames ADD COLUMN place_region TEXT"),
+                ("place_country", "ALTER TABLE frames ADD COLUMN place_country TEXT"),
+            ):
+                if col not in cols:
+                    conn.execute(ddl)
             conn.execute("CREATE INDEX IF NOT EXISTS frames_root_idx ON frames(root_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS frames_taken_idx ON frames(taken_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS frames_camera_idx ON frames(camera_model)")
+            conn.execute("CREATE INDEX IF NOT EXISTS frames_city_idx ON frames(place_city)")
             conn.commit()
             _inited = True
     return conn
