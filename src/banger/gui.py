@@ -699,20 +699,45 @@ def serve(port: int = 8765, open_window: bool = True) -> None:
     t = threading.Thread(target=_flask, daemon=True)
     t.start()
 
-    # Warm-load CLIP in parallel with the window opening. Without this, the
-    # first frame of the first run pays ~15s of model-load latency before
-    # any progress shows. With it, model load overlaps with the user picking
-    # a folder, so by the time they click 'open' the model is usually ready.
-    def _warm_clip():
-        t0 = time.monotonic()
-        try:
-            aesthetic._load()
-            log.info("CLIP warmed in %.1fs", time.monotonic() - t0)
-        except Exception as e:
-            log.warning("CLIP warm-load failed: %s", e)
-
-    threading.Thread(target=_warm_clip, daemon=True).start()
+    # auto-setup loads CLIP synchronously at its start, so a separate
+    # warm-clip thread would race it (both calling the same lru_cache'd
+    # load triggers torch's "meta tensor" error). Single thread only.
+    log.info("spawning auto-setup thread")
     threading.Thread(target=_auto_setup, daemon=True).start()
+
+    # Wait briefly for the Flask socket so the webview's first nav doesn't
+    # race-fail. 200 ms is plenty on a modern machine; on a slow one we
+    # retry up to 2 s.
+    import socket as _socket
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with _socket.socket() as s:
+            try:
+                s.connect(("127.0.0.1", port))
+                break
+            except OSError:
+                time.sleep(0.05)
+
+    if not open_window:
+        log.info("flask running on http://127.0.0.1:%d (no webview, headless mode)", port)
+        t.join()
+        return
+
+    try:
+        import webview
+    except ImportError:
+        log.error("pywebview is not installed; install with `pip install banger[gui]`")
+        return
+
+    win = webview.create_window(
+        title="banger",
+        url=f"http://127.0.0.1:{port}/gui",
+        width=1280, height=820, min_size=(900, 600),
+        background_color="#0c0c0c",
+    )
+    window_holder["win"] = win
+    webview.start()
 
 
 def _auto_setup() -> None:
@@ -726,6 +751,17 @@ def _auto_setup() -> None:
     """
     import subprocess
     import sys
+
+    # Load CLIP synchronously before anything that needs text embeddings.
+    # Otherwise scene_kmeans.fit can race the concurrent CLIP-warm thread
+    # and hit "Cannot copy out of meta tensor" when both touch the same
+    # lru_cache'd load at the same time.
+    _setup_state["phase"] = "clip"
+    _setup_state["message"] = "Loading CLIP model (one-time, ~8s)…"
+    try:
+        aesthetic._load()
+    except Exception as e:
+        log.warning("auto-setup: CLIP load failed: %s", e)
 
     _setup_state["phase"] = "scenes"
     _setup_state["message"] = "Fitting scene clusters…"
@@ -759,16 +795,22 @@ def _auto_setup() -> None:
 
     _setup_state["phase"] = "mediapipe"
     _setup_state["message"] = "Installing mediapipe (one-time, ~30-60s)…"
+    log_path = state.STATE_DIR / "mediapipe_install.log"
+    proc = None
     try:
         state.STATE_DIR.mkdir(parents=True, exist_ok=True)
         marker.touch()
-        log_path = state.STATE_DIR / "mediapipe_install.log"
         creationflags = 0
         if os.name == "nt":
             creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        # `--no-deps` skips opencv-contrib-python which conflicts with the
+        # running process's loaded cv2.pyd (Windows file lock). mediapipe at
+        # runtime uses the already-installed opencv-python for image ops.
         with open(log_path, "w", encoding="utf-8") as fp:
-            subprocess.Popen(
-                [sys.executable, "-m", "pip", "install", "mediapipe"],
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "--no-deps", "mediapipe",
+                 "absl-py", "attrs", "flatbuffers", "jax", "matplotlib", "protobuf",
+                 "sounddevice", "sentencepiece"],
                 stdout=fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                 creationflags=creationflags, close_fds=True,
             )
@@ -779,8 +821,9 @@ def _auto_setup() -> None:
         _setup_state["message"] = f"mediapipe install spawn failed: {e}"
         return
 
-    # Poll the import every 2s. Once mediapipe lands in site-packages, the
-    # fresh import attempt in mediapipe_available() succeeds and we flip.
+    # Poll the subprocess + the import every 2s. Subprocess exit + still-not-
+    # importable means the install failed; show the tail of the log so the
+    # splash explains why.
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         time.sleep(2.0)
@@ -789,42 +832,23 @@ def _auto_setup() -> None:
             _setup_state["message"] = "mediapipe installed"
             log.info("auto-setup: mediapipe install completed")
             return
+        if proc is not None and proc.poll() is not None:
+            # Subprocess exited but import still fails: that's an install error.
+            tail = ""
+            try:
+                tail = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                tail = " | ".join(tail[-3:])
+            except OSError:
+                pass
+            _setup_state["phase"] = "ready"
+            _setup_state["message"] = (
+                f"mediapipe install failed (rc={proc.returncode}). "
+                f"See {log_path}. Last lines: {tail[-200:]}"
+            )
+            log.warning("auto-setup: mediapipe install exited rc=%d", proc.returncode)
+            return
     _setup_state["phase"] = "ready"
     _setup_state["message"] = "mediapipe install still running (check log later)"
-
-    # Wait briefly for the Flask socket so the webview's first nav doesn't
-    # race-fail. 200 ms is plenty on a modern machine; on a slow one we
-    # retry up to 2 s.
-    import socket
-
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        with socket.socket() as s:
-            try:
-                s.connect(("127.0.0.1", port))
-                break
-            except OSError:
-                time.sleep(0.05)
-
-    if not open_window:
-        log.info("flask running on http://127.0.0.1:%d (no webview, headless mode)", port)
-        t.join()
-        return
-
-    try:
-        import webview
-    except ImportError:
-        log.error("pywebview is not installed; install with `pip install banger[gui]`")
-        return
-
-    win = webview.create_window(
-        title="banger",
-        url=f"http://127.0.0.1:{port}/gui",
-        width=1280, height=820, min_size=(900, 600),
-        background_color="#0c0c0c",
-    )
-    window_holder["win"] = win
-    webview.start()
 
 
 # ---------------------------------------------------------------------------
