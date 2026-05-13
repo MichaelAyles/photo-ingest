@@ -304,3 +304,60 @@ def export_jpeg(
 def default_export_path(src_path: Path) -> Path:
     """`/foo/IMG_123.JPG` -> `/foo/IMG_123_edit.jpg`. Avoids overwriting source."""
     return src_path.with_name(f"{src_path.stem}_edit.jpg")
+
+
+# ---------------------------------------------------------------------------
+# Auto-edit: derive sensible DevelopParams from the cached quality metrics
+# ---------------------------------------------------------------------------
+
+def auto_params(metrics: dict | None) -> DevelopParams:
+    """Pick a reasonable develop preset for a frame from its quality metrics.
+
+    Not a substitute for a human edit, but good enough for the "give me the
+    bangers, ready to share" workflow. Reads the cv2 metrics dict that the
+    pipeline writes during indexing and nudges each adjustment based on what
+    the image actually looks like:
+
+    - very dark (mean_lum < 0.4)   -> +exposure
+    - very bright (mean_lum > 0.6) -> -exposure
+    - shadows clipped              -> lift shadows
+    - highlights clipped (and not a silhouette) -> recover highlights
+    - low contrast metric          -> +contrast
+    - colour image with mid sat    -> +vibrance (less heavy-handed than saturation)
+    - monochrome                   -> leave saturation alone, slight contrast bump
+
+    All deltas are conservative on purpose; bulk-export is the wrong place to
+    surprise the user with aggressive looks. They can always open the editor
+    on any pick and dial it in further.
+    """
+    p = DevelopParams()
+    if not metrics:
+        # No metrics cached: tasteful neutral bump.
+        p.contrast = 8
+        p.vibrance = 10
+        return p
+
+    mean_lum = float(metrics.get("mean_luminance", 0.5) or 0.5)
+    if mean_lum < 0.4:
+        p.exposure = round(min(0.6, (0.45 - mean_lum) * 2.0), 2)
+    elif mean_lum > 0.6:
+        p.exposure = round(max(-0.4, (0.55 - mean_lum) * 1.5), 2)
+
+    if metrics.get("shadow_clipped"):
+        p.shadows = 25
+    if metrics.get("highlight_clipped") and not metrics.get("is_silhouette"):
+        p.highlights = -30
+
+    contrast_metric = float(metrics.get("contrast", 5.0) or 5.0)
+    if contrast_metric < 5.0:
+        p.contrast = 15
+    elif contrast_metric < 7.5:
+        p.contrast = 8
+    # very high contrast images get left alone
+
+    if not metrics.get("is_monochrome"):
+        # Vibrance is gentler than saturation; nudges the dull-coloured areas
+        # without over-cooking already-saturated ones.
+        p.vibrance = 12
+
+    return p

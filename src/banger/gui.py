@@ -634,6 +634,113 @@ def build_app(window_holder: dict | None = None) -> Flask:
             return ("encode failed", 500)
         return Response(buf.tobytes(), mimetype="image/jpeg")
 
+    @app.route("/api/export-bangers", methods=["POST"])
+    def export_bangers():
+        """The cull + auto-edit + ship workflow in one call.
+
+        Body: {shas: [sha, sha, ...], output_root: str | None,
+               auto_edit: bool = True, label: str | None}
+        Creates ~/Pictures/bangers/<ts>/raw and /edits, copies sources to
+        /raw, and renders auto-edited JPEGs to /edits. Returns the folder
+        path so the UI can offer 'reveal in explorer'.
+
+        Synchronous because the typical export is N<=50 files and we want a
+        single response with the final path. A background-job version with
+        progress is the obvious next step if users start exporting in bulk.
+        """
+        import datetime as _dt
+        import shutil
+
+        data = request.get_json(silent=True) or {}
+        shas = data.get("shas") or []
+        if not shas:
+            return jsonify({"error": "shas list required"}), 400
+        auto_edit = data.get("auto_edit", True)
+        label_hint = (data.get("label") or "").strip()
+
+        root_raw = (data.get("output_root") or "").strip()
+        if root_raw:
+            root = Path(root_raw).expanduser()
+        else:
+            root = Path.home() / "Pictures" / "bangers"
+        ts = _dt.datetime.now().strftime("%Y-%m-%d_%H%M")
+        if label_hint:
+            ts = f"{ts}_{label_hint}"
+        folder = root / ts
+        raw_dir = folder / "raw"
+        edits_dir = folder / "edits"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        edits_dir.mkdir(parents=True, exist_ok=True)
+
+        copied = 0
+        edited = 0
+        errors: list[str] = []
+        manifest: list[dict] = []
+
+        for rank, sha in enumerate(shas, start=1):
+            src = _resolve_path(sha)
+            if src is None:
+                errors.append(f"unknown sha: {sha}")
+                continue
+
+            # Copy original to /raw. Preserve filename + extension so subsequent
+            # darktable / Lightroom workflows can match by name.
+            raw_dst = raw_dir / src.name
+            if not raw_dst.exists():
+                try:
+                    shutil.copy2(src, raw_dst)
+                    copied += 1
+                except OSError as e:
+                    errors.append(f"copy {src.name}: {e}")
+                    continue
+            else:
+                copied += 1
+
+            # Auto-develop. Pull cached develop params if the user has already
+            # edited this frame; otherwise derive from metrics.
+            meta = state.load_frame_metadata(sha) or {}
+            params = editor_mod.from_dict(meta.get("develop") or {})
+            is_default = params == editor_mod.DevelopParams()
+            if auto_edit and is_default:
+                params = editor_mod.auto_params(meta.get("metrics"))
+            edit_name = f"{rank:02d}_{src.stem}.jpg"
+            edit_dst = edits_dir / edit_name
+            try:
+                editor_mod.export_jpeg(src, params, edit_dst)
+                edited += 1
+                manifest.append({
+                    "rank": rank, "sha": sha,
+                    "source": src.name, "edit": edit_name,
+                    "params": editor_mod.to_dict(params),
+                    "auto_edited": auto_edit and is_default,
+                })
+            except Exception as e:
+                errors.append(f"edit {src.name}: {e}")
+
+        # Drop a manifest so the user can see what was applied.
+        try:
+            import json as _json
+            (folder / "manifest.json").write_text(
+                _json.dumps({
+                    "exported_at": int(time.time()),
+                    "count": len(manifest),
+                    "auto_edit": auto_edit,
+                    "items": manifest,
+                }, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        return jsonify({
+            "folder": str(folder),
+            "raw_dir": str(raw_dir),
+            "edits_dir": str(edits_dir),
+            "copied": copied,
+            "edited": edited,
+            "errors": errors[:10],  # truncate for response sanity
+        })
+
     @app.route("/api/develop/<sha>/export", methods=["POST"])
     def develop_export(sha):
         """Render full-res and write a JPEG next to the source (or at `path`)."""
@@ -1813,6 +1920,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
     <div class="meta" id="results-meta"></div>
     <button id="btn-label">Label these</button>
     <button id="btn-rerun">Run again</button>
+    <button id="btn-export-bangers" class="primary">Export bangers ↗</button>
   </div>
   <div class="grid" id="results-grid"></div>
 </section>
@@ -1863,7 +1971,8 @@ _SPA_TEMPLATE = r"""<!doctype html>
         <button id="lib-import" style="margin-left:auto">Import…</button>
         <button id="lib-scan">Rescan</button>
         <button id="lib-index" title="Pre-compute tags, faces, scenes, scores for everything in the library so culling later is instant">Index all</button>
-        <button id="lib-score" class="primary">Score this view</button>
+        <button id="lib-score">Score this view</button>
+        <button id="lib-export" class="primary" title="Cull current view + export top N to ~/Pictures/bangers/&lt;timestamp&gt;/{raw,edits}">Export bangers ↗</button>
       </div>
       <div class="lib-grid" id="lib-grid">
         <div class="lib-onboarding" id="lib-onboarding">
@@ -2118,10 +2227,15 @@ async function pollJob() {
         lastResults = j;
         $("#nav-results").style.display = "";
         renderResults(j);
-        // Auto-open Results only if user is still on Library (most common
-        // flow). If they navigated elsewhere don't yank them.
-        if (currentView === "library") show("results");
-        else toast("Scoring complete — see Results tab");
+        // If the user kicked this via "Export bangers" in the library, run
+        // the export now instead of switching them to Results.
+        if (_pendingExportLabel !== null) {
+          _maybeAutoExport(j);
+        } else if (currentView === "library") {
+          show("results");
+        } else {
+          toast("Scoring complete — see Results tab");
+        }
       } else {
         toast(j.error || "job errored");
       }
@@ -2457,6 +2571,41 @@ document.addEventListener("keydown", e => {
 });
 
 $("#btn-rerun").addEventListener("click", () => show("welcome"));
+$("#btn-export-bangers").addEventListener("click", async () => {
+  if (!lastResults || !lastResults.picks.length) {
+    toast("Nothing to export yet"); return;
+  }
+  const shas = lastResults.picks.map(p => p.sha);
+  const label = prompt(
+    `Export ${shas.length} bangers to ~/Pictures/bangers/<timestamp>/raw + /edits.\n\n` +
+    `Originals get copied, edits get rendered with auto-tone derived from each photo's metrics. ` +
+    `Optional label appended to the folder name (e.g. 'caminito-trip'):`,
+    ""
+  );
+  if (label === null) return;  // cancel
+  const btn = $("#btn-export-bangers");
+  btn.disabled = true;
+  btn.textContent = "Exporting…";
+  try {
+    const res = await fetch("/api/export-bangers", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({shas, label, auto_edit: true}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    toast(`Exported ${d.edited} edits + ${d.copied} originals to ${d.folder}`, 4000);
+    // Open the folder in OS file explorer.
+    await fetch("/api/open-folder", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path: d.folder}),
+    });
+  } catch (e) {
+    toast("Export failed: " + e.message, 4000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Export bangers ↗";
+  }
+});
 $("#btn-label").addEventListener("click", async () => {
   if (!lastResults) return;
   // We spawn (or reuse) a `banger ui <folder>` subprocess; once it's up,
@@ -3051,7 +3200,6 @@ $("#lib-index").addEventListener("click", async () => {
 });
 $("#lib-score").addEventListener("click", async () => {
   if (libState.activeRootId === null) return;
-  // Resolve the folder path: root.path + (subdir if selected).
   const rootsRes = await fetch("/api/library/roots");
   const rd = await rootsRes.json();
   const root = rd.roots.find(r => r.id === libState.activeRootId);
@@ -3059,6 +3207,55 @@ $("#lib-score").addEventListener("click", async () => {
   const path = libState.activeSubdir ? `${root.path}/${libState.activeSubdir}` : root.path;
   startRun(path);
 });
+
+$("#lib-export").addEventListener("click", async () => {
+  // Cull-and-export: run the scoring pipeline on the current scope, then
+  // export the top N as bangers. Reuses startRun's job mechanism; the
+  // pollJob done handler will trigger export when results land.
+  if (libState.activeRootId === null) { toast("Select a folder first"); return; }
+  const n = parseInt(prompt("How many bangers?", "10")) || 10;
+  const label = prompt(
+    `Optional label for the output folder (e.g. 'caminito-trip', appended to timestamp):`,
+    libState.activeSubdir || ""
+  );
+  if (label === null) return;
+  const rootsRes = await fetch("/api/library/roots");
+  const rd = await rootsRes.json();
+  const root = rd.roots.find(r => r.id === libState.activeRootId);
+  if (!root) return;
+  const path = libState.activeSubdir ? `${root.path}/${libState.activeSubdir}` : root.path;
+  // Queue the export to fire when this run finishes.
+  _pendingExportLabel = label;
+  _pendingExportN = n;
+  toast(`Culling ${path.split(/[\\/]/).pop()} then exporting top ${n}…`, 2500);
+  startRun(path);
+});
+
+let _pendingExportLabel = null;
+let _pendingExportN = null;
+
+async function _maybeAutoExport(job) {
+  if (_pendingExportLabel === null || !job.picks || !job.picks.length) return;
+  const shas = job.picks.slice(0, _pendingExportN || job.picks.length).map(p => p.sha);
+  const label = _pendingExportLabel;
+  _pendingExportLabel = null;
+  _pendingExportN = null;
+  try {
+    const res = await fetch("/api/export-bangers", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({shas, label, auto_edit: true}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    toast(`Exported ${d.edited} bangers to ${d.folder}`, 4000);
+    await fetch("/api/open-folder", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path: d.folder}),
+    });
+  } catch (e) {
+    toast("Auto-export failed: " + e.message);
+  }
+}
 
 async function startLibraryScan(rootId) {
   toast("Scanning…", 1500);
