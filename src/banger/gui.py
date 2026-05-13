@@ -560,7 +560,16 @@ def build_app(window_holder: dict | None = None) -> Flask:
     @app.route("/")
     @app.route("/gui")
     def root():
-        return render_template_string(_SPA_TEMPLATE)
+        # WebView2 happily caches the HTML across launches, which means
+        # "I shipped a fix" can look like "fix didn't land" to the user.
+        # Force a no-store policy on the SPA shell so every launch fetches
+        # fresh markup + inline CSS / JS.
+        from flask import make_response
+        resp = make_response(render_template_string(_SPA_TEMPLATE))
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
 
     @app.route("/api/develop/<sha>", methods=["GET"])
     def develop_get(sha):
@@ -763,7 +772,9 @@ def build_app(window_holder: dict | None = None) -> Flask:
 
     @app.route("/api/tagger/start", methods=["POST"])
     def tagger_start():
-        return jsonify(tagger_mod.start().to_view())
+        data = request.get_json(silent=True) or {}
+        full = bool(data.get("full"))
+        return jsonify(tagger_mod.start(full=full).to_view())
 
     @app.route("/api/tagger/status")
     def tagger_status():
@@ -1833,6 +1844,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
         <span class="lib-meta" id="lib-tagger-meta" style="color:#c9c"></span>
         <button id="lib-import" style="margin-left:auto">Import…</button>
         <button id="lib-scan">Rescan</button>
+        <button id="lib-index" title="Pre-compute tags, faces, scenes, scores for everything in the library so culling later is instant">Index all</button>
         <button id="lib-score" class="primary">Score this view</button>
       </div>
       <div class="lib-grid" id="lib-grid">
@@ -2733,7 +2745,8 @@ function updateBgStrip() {
   }
   if (tagging) {
     const tp = (tagger.processed / tagger.total) * 100;
-    parts.push(`tagging · ${tagger.processed}/${tagger.total}`);
+    const label = (tagger.mode === "full") ? "indexing" : "tagging";
+    parts.push(`${label} · ${tagger.processed}/${tagger.total}`);
     pct = Math.max(pct, tp);
   }
   text.textContent = parts.join(" · ");
@@ -2999,6 +3012,20 @@ $("#lib-search").addEventListener("input", e => {
 $("#lib-scan").addEventListener("click", () => {
   if (libState.activeRootId === null) return;
   startLibraryScan(libState.activeRootId);
+});
+$("#lib-index").addEventListener("click", async () => {
+  if (!confirm("Pre-index every photo across all watched folders?\\n\\nThis runs tags + face identity + scene cluster + taste score on every frame so future culls are instant. Slow first time (~1s per face-bearing frame), idempotent on re-run.")) return;
+  try {
+    const res = await fetch("/api/tagger/start", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({full: true}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    toast("Full index started — watch the bottom strip", 2200);
+    pollTaggerStatus();
+  } catch (e) {
+    toast("Index start failed: " + e.message);
+  }
 });
 $("#lib-score").addEventListener("click", async () => {
   if (libState.activeRootId === null) return;

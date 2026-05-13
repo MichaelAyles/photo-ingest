@@ -24,7 +24,10 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from banger import aesthetic, dedup, face, library, state, tags as tags_mod
+from banger import (
+    aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
+    library, scene_kmeans, state, tags as tags_mod, taste_head,
+)
 from banger.preview import load_preview
 
 log = logging.getLogger("banger.tagger")
@@ -33,10 +36,13 @@ log = logging.getLogger("banger.tagger")
 @dataclass
 class TaggerProgress:
     phase: str = "idle"  # idle | running | done | error
+    mode: str = "tags"  # tags | full
     total: int = 0
     processed: int = 0
     embedded: int = 0
     tagged: int = 0
+    faces_done: int = 0
+    scored: int = 0
     skipped: int = 0
     started_at: float = 0.0
     finished_at: float | None = None
@@ -59,13 +65,29 @@ def status() -> TaggerProgress:
     return _progress
 
 
-def _tag_one(sha: str, src_path) -> tuple[bool, bool]:
-    """Tag one frame. Returns (embedded?, tagged?). Idempotent."""
+def _tag_one(sha: str, src_path, full: bool = False) -> dict:
+    """Enrich one frame. Returns a dict of what was newly computed.
+
+    Keys: embedded, tagged, faces, scored, scene. Each True only when that
+    enrichment ran AND wasn't already cached. Idempotent.
+
+    `full=True` adds insightface face detections, scene cluster assignment,
+    and taste head scoring on top of the default tags-only pass. The full
+    pass is slow (~1s/frame for insightface) but means later cull/sort
+    operations don't need to touch the original file at all.
+    """
     meta = state.load_frame_metadata(sha) or {}
     have_emb = state.load_embedding(sha) is not None
     have_tags = bool(meta.get("tags"))
-    if have_emb and have_tags:
-        return False, False
+    have_faces = "face_detections" in meta
+    have_score = "taste_score" in meta
+    have_scene = "scene_cluster" in meta
+
+    if have_emb and have_tags and (not full or (have_faces and have_score and have_scene)):
+        return {}
+
+    out = {"embedded": False, "tagged": False, "faces": False, "scored": False, "scene": False}
+    preview = None
 
     if have_emb:
         emb = state.load_embedding(sha)
@@ -74,15 +96,14 @@ def _tag_one(sha: str, src_path) -> tuple[bool, bool]:
             preview = load_preview(src_path)
         except Exception as e:
             log.warning("tagger: preview fail %s: %s", src_path, e)
-            return False, False
+            return out
         try:
             emb = aesthetic.encode_image(preview)
             state.cache_embedding(sha, emb)
+            out["embedded"] = True
         except Exception as e:
             log.warning("tagger: embed fail %s: %s", src_path, e)
-            return False, False
-        # Opportunistically cache the cheap stuff while we have the preview
-        # loaded; future runs benefit from it.
+            return out
         try:
             from banger.sharpness import sharpness_from_preview
             sharp = sharpness_from_preview(preview)
@@ -96,23 +117,68 @@ def _tag_one(sha: str, src_path) -> tuple[bool, bool]:
         except Exception as e:
             log.warning("tagger: side-cache fail %s: %s", src_path, e)
 
-    try:
-        pairs = tags_mod.tag_from_embedding(emb)
-        serial = [[t, round(s, 4)] for t, s in pairs]
-        state.update_frame_metadata(sha, tags=serial)
-    except Exception as e:
-        log.warning("tagger: tag compute fail %s: %s", src_path, e)
-        return not have_emb, False
-    return not have_emb, True
+    if not have_tags:
+        try:
+            pairs = tags_mod.tag_from_embedding(emb)
+            serial = [[t, round(s, 4)] for t, s in pairs]
+            state.update_frame_metadata(sha, tags=serial)
+            out["tagged"] = True
+        except Exception as e:
+            log.warning("tagger: tag compute fail %s: %s", src_path, e)
+
+    if not full:
+        return out
+
+    # Full mode: face identity + scene cluster + taste score. Each is opt-in
+    # and degrades gracefully if its dep isn't installed.
+    if not have_faces:
+        try:
+            if preview is None:
+                preview = load_preview(src_path)
+            detections = face_id_mod.extract_face_detections(preview)
+            payload = face_id_mod.encode_detections_for_cache(detections)
+            state.update_frame_metadata(sha, face_detections=payload)
+            out["faces"] = True
+        except Exception as e:
+            log.warning("tagger: face_id fail %s: %s", src_path, e)
+
+    if not have_scene:
+        try:
+            sc = scene_kmeans.load()
+            if sc is not None:
+                info = sc.classify_embedding(emb)
+                state.update_frame_metadata(
+                    sha,
+                    scene_cluster=int(info.cluster_id),
+                    scene_preset=info.preset,
+                )
+                out["scene"] = True
+        except Exception as e:
+            log.warning("tagger: scene fail %s: %s", src_path, e)
+
+    if not have_score:
+        try:
+            head = taste_head.load()
+            if head is not None:
+                score = taste_head.predict_score(head, emb)
+                state.update_frame_metadata(sha, taste_score=round(float(score), 3))
+                out["scored"] = True
+        except Exception as e:
+            log.warning("tagger: score fail %s: %s", src_path, e)
+
+    return out
 
 
-def _run() -> None:
+def _run(full: bool = False) -> None:
     p = _progress
     p.phase = "running"
+    p.mode = "full" if full else "tags"
     p.started_at = time.monotonic()
     p.processed = 0
     p.embedded = 0
     p.tagged = 0
+    p.faces_done = 0
+    p.scored = 0
     p.skipped = 0
     p.error = None
     try:
@@ -131,25 +197,26 @@ def _run() -> None:
             p.current = abs_path
             p.processed += 1
             try:
-                e, t = _tag_one(sha, abs_path)
+                r = _tag_one(sha, abs_path, full=full)
             except Exception as e_:
                 log.warning("tagger: skip %s: %s", abs_path, e_)
                 p.skipped += 1
                 continue
-            if not e and not t:
+            if not any(r.values()):
                 p.skipped += 1
                 continue
-            if e:
-                p.embedded += 1
-            if t:
-                p.tagged += 1
+            if r.get("embedded"): p.embedded += 1
+            if r.get("tagged"): p.tagged += 1
+            if r.get("faces"): p.faces_done += 1
+            if r.get("scored"): p.scored += 1
 
         p.phase = "done"
         p.finished_at = time.monotonic()
         p.current = None
         log.info(
-            "tagger: finished in %.1fs (embedded=%d, tagged=%d, skipped=%d, total=%d)",
-            p.finished_at - p.started_at, p.embedded, p.tagged, p.skipped, p.total,
+            "tagger: finished %s in %.1fs (embedded=%d tagged=%d faces=%d scored=%d skipped=%d of %d)",
+            p.mode, p.finished_at - p.started_at,
+            p.embedded, p.tagged, p.faces_done, p.scored, p.skipped, p.total,
         )
     except Exception as e:
         log.exception("tagger crashed")
@@ -158,12 +225,18 @@ def _run() -> None:
         p.finished_at = time.monotonic()
 
 
-def start() -> TaggerProgress:
-    """Kick the tagger if not already running. Returns the progress object."""
+def start(full: bool = False) -> TaggerProgress:
+    """Kick the tagger if not already running. Returns the progress object.
+
+    `full=True` does the heavy enrichment pass (insightface faces, scene
+    cluster, taste score) in addition to tags. Slow but means subsequent
+    cull operations on the library are pure SQL/JSON reads.
+    """
     global _progress
     with _lock:
         if _progress.phase == "running":
             return _progress
         _progress = TaggerProgress()
-        threading.Thread(target=_run, daemon=True).start()
+        _progress.mode = "full" if full else "tags"
+        threading.Thread(target=_run, args=(full,), daemon=True).start()
         return _progress
