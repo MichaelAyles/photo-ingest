@@ -192,6 +192,21 @@ def _build_parser() -> argparse.ArgumentParser:
     ui.add_argument("input_dir", type=Path)
     ui.add_argument("--port", type=int, default=8000)
 
+    bench = sub.add_parser(
+        "benchmark",
+        help="Run banger (and optionally facet) on the same input, write a markdown report.",
+    )
+    bench.add_argument("input_dir", type=Path)
+    bench.add_argument("-r", "--recursive", action="store_true")
+    bench.add_argument("--top-n", type=int, default=DEFAULT_TOP_N)
+    bench.add_argument("--vs", choices=["facet"], default=None,
+                       help="Comparison target. Currently only 'facet'.")
+    bench.add_argument("--facet-path", type=Path,
+                       default=Path("C:/Users/mikea/OneDrive/Desktop/Projects/facet"),
+                       help="Path to the facet checkout.")
+    bench.add_argument("--output", type=Path, default=None,
+                       help="Where to write the markdown report (default benchmarks/<date>.md).")
+
     return parser
 
 
@@ -904,6 +919,16 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_label(args.input_dir, args.recursive, args.score, args.stems)
     if args.command == "train":
         return cmd_train()
+    if args.command == "benchmark":
+        from banger import benchmark as bench_mod
+        return bench_mod.cmd_benchmark(
+            input_dir=args.input_dir,
+            vs_facet=(args.vs == "facet"),
+            top_n=args.top_n,
+            output=args.output,
+            facet_path=args.facet_path,
+            recursive=args.recursive,
+        )
     if args.command == "scenes":
         if args.scenes_action == "fit":
             return 0 if scene_kmeans.fit(k=args.k) is not None else 2

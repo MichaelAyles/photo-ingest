@@ -2,7 +2,7 @@
 
 The original scenes.py picks the closest of seven hand-written prompts.
 That worked OK in v0 but in practice 97% of frames fell back at the
-0.25 threshold and 90% fell back at 0.20 — CLIP text-image sims for these
+0.25 threshold and 90% fell back at 0.20, CLIP text-image sims for these
 prompts cluster too tightly to discriminate confidently. Replacing the
 prompt-vs-image cosine routine with KMeans over the image embeddings
 themselves sidesteps that ambiguity: clusters drop out of the actual
@@ -18,7 +18,7 @@ breaks before you run the fit step.
 
 Each cluster maps to a preset slot named cluster_NN. Authoring is then
 "build a darktable XMP for cluster_03 that suits the photos in that
-cluster's gallery" — concrete and grounded in your data, where the
+cluster's gallery", concrete and grounded in your data, where the
 prompt approach asked you to guess in advance.
 """
 
@@ -208,7 +208,7 @@ def exists() -> bool:
 def print_summary() -> int:
     """CLI helper: print the persisted summary, or a hint to fit."""
     if not SCENE_SUMMARY_PATH.exists():
-        print("(no scene-kmeans model — run `banger scenes fit -k 5`)")
+        print("(no scene-kmeans model, run `banger scenes fit -k 5`)")
         return 0
     summary = json.loads(SCENE_SUMMARY_PATH.read_text(encoding="utf-8"))
     print(f"KMeans(k={summary['k']}) trained on {summary['trained_on']} embeddings")

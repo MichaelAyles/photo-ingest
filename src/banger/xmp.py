@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 log = logging.getLogger("banger")
 
 
-# Eight colour labels we have to play with — darktable supports five.
+# Eight colour labels we have to play with, darktable supports five.
 # Map cluster ids modulo 5 onto them so any k from KMeans gets a colour.
 CLUSTER_COLOURS = ["red", "yellow", "green", "blue", "purple"]
 
