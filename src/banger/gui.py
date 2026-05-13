@@ -783,6 +783,19 @@ def build_app(window_holder: dict | None = None) -> Flask:
             "cameras": [{"model": m, "count": c} for m, c in library.cameras()],
         })
 
+    @app.route("/api/library/places")
+    def library_places():
+        return jsonify({
+            "places": [{"name": p, "count": c} for p, c in library.places()],
+        })
+
+    @app.route("/api/library/geocode-backfill", methods=["POST"])
+    def library_geocode_backfill():
+        """Backfill place names for frames indexed before reverse_geocoder was
+        installed. Cheap, runs once on demand."""
+        n = library.reverse_geocode_unreferenced()
+        return jsonify({"updated": n})
+
     @app.route("/api/library/folders/<int:root_id>")
     def library_folders(root_id):
         return jsonify({
@@ -803,6 +816,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
         face_name = request.args.get("face") or None
         min_score = request.args.get("min_score", type=int)
         q = (request.args.get("q") or "").strip().lower() or None
+        place_filter = (request.args.get("place") or "").strip() or None
 
         rows = library.query_frames(
             root_id=root_id, subdir=subdir, camera=camera,
@@ -831,13 +845,18 @@ def build_app(window_holder: dict | None = None) -> Flask:
                     continue
             if min_score is not None and (label is None or label < min_score):
                 continue
+            if place_filter is not None and r.place_city != place_filter:
+                continue
             if q is not None:
-                # Search across stem, rel_path, camera, and tags. Cheap
+                # Search across stem, rel_path, camera, place, and tags. Cheap
                 # substring match; not BM25 but good enough for a 50k-frame
                 # library where the user already has root+camera filters.
                 blob_parts = [r.stem.lower(), r.rel_path.lower()]
                 if r.camera_model:
                     blob_parts.append(r.camera_model.lower())
+                for place in (r.place_city, r.place_region, r.place_country):
+                    if place:
+                        blob_parts.append(place.lower())
                 for t in (meta.get("tags") or []):
                     if isinstance(t, (list, tuple)) and t:
                         blob_parts.append(str(t[0]).lower())
@@ -1153,6 +1172,25 @@ def build_app(window_holder: dict | None = None) -> Flask:
             return jsonify({"error": "unknown sha"}), 404
         meta = state.load_frame_metadata(sha) or {}
         exif = _extract_exif(f.classify_path)
+        # Augment with reverse-geocoded place from the library DB.
+        gps_lat = exif.get("gps_lat")
+        gps_lon = exif.get("gps_lon")
+        if gps_lat is None or gps_lon is None:
+            with library._conn() as conn:  # noqa: SLF001
+                row = conn.execute(
+                    "SELECT lat, lon, place_city, place_region, place_country "
+                    "FROM frames WHERE sha=?",
+                    (sha,),
+                ).fetchone()
+            if row:
+                lat, lon, city, region, country = row
+                if lat is not None:
+                    exif["gps_lat"] = lat
+                    exif["gps_lon"] = lon
+                parts = [city, region, country]
+                place = ", ".join(p for p in parts if p)
+                if place:
+                    exif["place"] = place
         # The original pick dict is held in the job; we don't have it here
         # without the job_id, so the SPA passes the pick info client-side and
         # this endpoint just adds the heavy-to-fetch bits (metrics, EXIF).
@@ -1347,6 +1385,18 @@ def _auto_setup() -> None:
     except Exception as e:
         log.warning("auto-setup: scene fit failed: %s", e)
 
+    # GPS / place backfill: always runs, regardless of mediapipe state. Cheap
+    # when there's nothing to do (one SELECT).
+    try:
+        gps_n = library.backfill_gps()
+        if gps_n:
+            log.info("auto-setup: backfilled GPS on %d frames", gps_n)
+        place_n = library.reverse_geocode_unreferenced()
+        if place_n:
+            log.info("auto-setup: reverse-geocoded %d frames", place_n)
+    except Exception as e:
+        log.warning("auto-setup: geocode backfill failed: %s", e)
+
     if eyes_mod.mediapipe_available():
         _setup_state["phase"] = "ready"
         _setup_state["message"] = "ready"
@@ -1507,6 +1557,15 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .settings-card h3 { margin: 0 0 .6rem; font-size: .85rem; color: var(--dim); font-weight: 400; text-transform: uppercase; letter-spacing: .08em; }
   .settings-card label { display: flex; align-items: center; gap: .6rem; margin: .35rem 0; font-size: .85rem; }
   .settings-card label span.k { color: var(--dim); width: 130px; flex-shrink: 0; }
+  /* Bottom background-work strip. Subtle, hides when idle. Click expand to
+     jump to the full Running view. */
+  .bg-strip { position: fixed; left: 0; right: 0; bottom: 0; height: 28px; background: rgba(15,15,15,.94); border-top: 1px solid var(--line); display: flex; align-items: center; gap: .75rem; padding: 0 .8rem; z-index: 40; font-size: .72rem; color: #bbb; backdrop-filter: blur(4px); }
+  .bg-strip-bar { flex: 0 0 160px; height: 4px; background: var(--bg2); border-radius: 2px; overflow: hidden; }
+  .bg-strip-bar > div { height: 100%; background: var(--accent); width: 0; transition: width .4s ease; }
+  .bg-strip-text { flex: 1 1 auto; font-family: ui-monospace, monospace; font-size: .7rem; color: #ccc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bg-strip button { background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 3px; padding: 1px 7px; font-size: .65rem; cursor: pointer; }
+  .bg-strip button:hover { color: var(--accent); border-color: var(--accent); }
+
   .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--bg3); border: 1px solid var(--accent); padding: .5rem .9rem; border-radius: 4px; font-size: .8rem; opacity: 0; transition: opacity .2s; pointer-events: none; }
   .toast.show { opacity: 1; }
   .badge { padding: 1px 6px; border-radius: 3px; font-size: .65rem; font-family: ui-monospace, monospace; }
@@ -1755,6 +1814,9 @@ _SPA_TEMPLATE = r"""<!doctype html>
         <label class="lib-filter-row">face
           <select id="lib-filter-face"><option value="">any</option></select>
         </label>
+        <label class="lib-filter-row">place
+          <select id="lib-filter-place"><option value="">any</option></select>
+        </label>
         <label class="lib-filter-row">min star
           <select id="lib-filter-star">
             <option value="">any</option>
@@ -1932,6 +1994,12 @@ _SPA_TEMPLATE = r"""<!doctype html>
 
 <div class="toast" id="toast"></div>
 
+<div id="bg-strip" class="bg-strip" style="display:none">
+  <div class="bg-strip-bar"><div id="bg-strip-fill"></div></div>
+  <div class="bg-strip-text" id="bg-strip-text">working…</div>
+  <button id="bg-strip-expand" title="See full status">expand ↗</button>
+</div>
+
 <div class="splash" id="splash">
   <h2>banger</h2>
   <div class="msg" id="splash-msg">starting up…</div>
@@ -1997,8 +2065,8 @@ async function startRun(input_dir) {
   const data = await res.json();
   currentJob = data.job_id;
   $("#nav-running").style.display = "";
-  show("running");
   $("#run-log").innerHTML = "";
+  toast(`Scoring kicked off in the background — see the strip at the bottom`, 2200);
   pollJob();
 }
 
@@ -2009,16 +2077,21 @@ async function pollJob() {
     if (!res.ok) throw new Error(await res.text());
     const j = await res.json();
     renderJob(j);
+    updateBgStrip();
     if (j.status === "done" || j.status === "error") {
       clearTimeout(pollTimer);
       if (j.status === "done") {
         lastResults = j;
         $("#nav-results").style.display = "";
         renderResults(j);
-        show("results");
+        // Auto-open Results only if user is still on Library (most common
+        // flow). If they navigated elsewhere don't yank them.
+        if (currentView === "library") show("results");
+        else toast("Scoring complete — see Results tab");
       } else {
         toast(j.error || "job errored");
       }
+      updateBgStrip();
       return;
     }
   } catch (e) { console.error(e); }
@@ -2026,6 +2099,7 @@ async function pollJob() {
 }
 
 function renderJob(j) {
+  _bgJobSnapshot = j;
   $("#run-stage").textContent = j.stage;
   const pct = j.total ? (j.progress / j.total * 100) : 0;
   $("#run-bar").style.width = pct + "%";
@@ -2034,6 +2108,7 @@ function renderJob(j) {
   const log = $("#run-log");
   log.innerHTML = j.tail.map(l => `<div class="row">${escapeHtml(l)}</div>`).join("");
   log.scrollTop = log.scrollHeight;
+  updateBgStrip();
 }
 
 function escapeHtml(s) {
@@ -2278,6 +2353,12 @@ function renderPanel(pick, d) {
   if (exif.focal_length_mm) exifPairs.push(["focal length", exif.focal_length_mm + (exif.focal_length_35mm ? ` (≈${exif.focal_length_35mm}mm FF)` : "")]);
   if (exif.exposure_bias !== undefined && exif.exposure_bias !== null) exifPairs.push(["exposure comp", `${exif.exposure_bias > 0 ? "+" : ""}${exif.exposure_bias.toFixed(1)} EV`]);
   if (exif.date_taken) exifPairs.push(["taken", exif.date_taken]);
+  if (exif.gps_lat !== undefined && exif.gps_lat !== null) {
+    const placeText = exif.place
+      ? exif.place + ` (${exif.gps_lat.toFixed(4)}, ${exif.gps_lon.toFixed(4)})`
+      : `${exif.gps_lat.toFixed(4)}, ${exif.gps_lon.toFixed(4)}`;
+    exifPairs.push(["location", placeText]);
+  }
   if (exif.metering_mode) exifPairs.push(["metering", exif.metering_mode]);
   if (exif.flash) exifPairs.push(["flash", exif.flash]);
   if (exif.pixel_x && exif.pixel_y) exifPairs.push(["dimensions", `${exif.pixel_x} × ${exif.pixel_y}`]);
@@ -2574,6 +2655,7 @@ let libState = {
   cameraFilter: "",
   faceFilter: "",
   starFilter: "",
+  placeFilter: "",
   searchQuery: "",
 };
 let libSearchTimer = null;
@@ -2583,16 +2665,32 @@ async function loadLibrary() {
   await refreshLibraryRoots();
   await refreshLibraryFaces();
   await refreshLibraryCameras();
+  await refreshLibraryPlaces();
   await refreshLibraryGrid();
-  pollTaggerStatus();  // start the heartbeat once
+  pollTaggerStatus();
+}
+
+async function refreshLibraryPlaces() {
+  try {
+    const res = await fetch("/api/library/places");
+    const d = await res.json();
+    const sel = $("#lib-filter-place");
+    sel.innerHTML = '<option value="">any</option>' + (d.places || []).map(p =>
+      `<option value="${escapeHtml(p.name)}">${escapeHtml(p.name)} (${p.count})</option>`
+    ).join("");
+    sel.value = libState.placeFilter;
+  } catch (e) { console.error("places:", e); }
 }
 
 let _lastTaggerPhase = null;
+let _taggerSnapshot = {phase: "idle", processed: 0, total: 0, tagged: 0};
+
 async function pollTaggerStatus() {
-  const taggerMeta = $("#lib-tagger-meta");
   try {
     const res = await fetch("/api/tagger/status");
     const d = await res.json();
+    _taggerSnapshot = d;
+    const taggerMeta = $("#lib-tagger-meta");
     if (d.phase === "running" && d.total > 0) {
       const pct = ((d.processed / d.total) * 100).toFixed(0);
       taggerMeta.textContent = `tagging ${d.processed}/${d.total} (${pct}%)`;
@@ -2600,17 +2698,55 @@ async function pollTaggerStatus() {
       taggerMeta.textContent = "";
     }
     if (d.phase === "done" && _lastTaggerPhase === "running") {
-      // Just finished: refresh the grid so search picks up new tags.
       refreshLibraryGrid();
     }
     _lastTaggerPhase = d.phase;
+    updateBgStrip();
     const delay = d.phase === "running" ? 2000 : 5000;
     taggerPollTimer = setTimeout(() => { taggerPollTimer = null; pollTaggerStatus(); }, delay);
   } catch (e) {
-    taggerMeta.textContent = "";
     taggerPollTimer = setTimeout(() => { taggerPollTimer = null; pollTaggerStatus(); }, 5000);
   }
 }
+
+// Bottom strip combines tagger + active scoring job. Hides when both idle.
+let _bgJobSnapshot = null;  // last seen renderJob payload
+function updateBgStrip() {
+  const strip = $("#bg-strip");
+  const text = $("#bg-strip-text");
+  const fill = $("#bg-strip-fill");
+  const tagger = _taggerSnapshot;
+  const job = _bgJobSnapshot;
+  const jobRunning = job && (job.status === "running" || job.status === "queued");
+  const tagging = tagger && tagger.phase === "running" && tagger.total > 0;
+  if (!jobRunning && !tagging) {
+    strip.style.display = "none";
+    return;
+  }
+  strip.style.display = "flex";
+  let parts = [];
+  let pct = 0;
+  if (jobRunning) {
+    const jp = job.total ? (job.progress / job.total) * 100 : 0;
+    parts.push(`scoring · ${job.stage} · ${job.progress}/${job.total}`);
+    pct = Math.max(pct, jp);
+  }
+  if (tagging) {
+    const tp = (tagger.processed / tagger.total) * 100;
+    parts.push(`tagging · ${tagger.processed}/${tagger.total}`);
+    pct = Math.max(pct, tp);
+  }
+  text.textContent = parts.join(" · ");
+  fill.style.width = pct.toFixed(0) + "%";
+}
+
+$("#bg-strip-expand").addEventListener("click", () => {
+  if (_bgJobSnapshot && (_bgJobSnapshot.status === "running" || _bgJobSnapshot.status === "queued")) {
+    show("running");
+  } else {
+    show("settings");  // tagger-only: settings has status badges
+  }
+});
 
 async function refreshLibraryRoots() {
   try {
@@ -2724,6 +2860,7 @@ async function refreshLibraryGrid() {
   if (libState.cameraFilter) params.set("camera", libState.cameraFilter);
   if (libState.faceFilter) params.set("face", libState.faceFilter);
   if (libState.starFilter !== "") params.set("min_score", libState.starFilter);
+  if (libState.placeFilter) params.set("place", libState.placeFilter);
   if (libState.searchQuery) params.set("q", libState.searchQuery);
   params.set("limit", "500");
 
@@ -2844,6 +2981,10 @@ $("#lib-filter-camera").addEventListener("change", e => {
 });
 $("#lib-filter-face").addEventListener("change", e => {
   libState.faceFilter = e.target.value;
+  refreshLibraryGrid();
+});
+$("#lib-filter-place").addEventListener("change", e => {
+  libState.placeFilter = e.target.value;
   refreshLibraryGrid();
 });
 $("#lib-filter-star").addEventListener("change", e => {

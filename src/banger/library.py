@@ -205,20 +205,85 @@ def get_root(root_id: int) -> Root | None:
 # Scan
 # ---------------------------------------------------------------------------
 
-def _extract_camera_and_date(path: Path) -> tuple[str | None, int | None]:
-    """Pull camera model + capture timestamp from EXIF. Cheap one-shot read.
+def _gps_to_decimal(coord, ref) -> float | None:
+    """Convert EXIF (deg, min, sec) rationals plus N/S/E/W ref to decimal degrees."""
+    if not coord or not ref:
+        return None
+    try:
+        parts = []
+        for v in coord:
+            if hasattr(v, "numerator"):
+                parts.append(v.numerator / v.denominator if v.denominator else 0.0)
+            elif isinstance(v, tuple) and len(v) == 2:
+                parts.append(v[0] / v[1] if v[1] else 0.0)
+            else:
+                parts.append(float(v))
+        if len(parts) < 3:
+            return None
+        deg, mn, sec = parts[0], parts[1], parts[2]
+        val = deg + mn / 60.0 + sec / 3600.0
+        if isinstance(ref, bytes):
+            ref = ref.decode("ascii", errors="replace")
+        if str(ref).strip().upper() in ("S", "W"):
+            val = -val
+        return val
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
 
-    Falls back to None on RAW or anything PIL can't parse. The library still
-    indexes the file; the camera filter just won't include it.
+
+# reverse_geocoder loads ~110k cities into a kd-tree on first import (~1s).
+# We lazy-import on first scan; if it's not installed we skip place names.
+_geocoder = None
+_geocoder_imported = False
+
+
+def _maybe_reverse_geocode(lat: float, lon: float) -> tuple[str | None, str | None, str | None]:
+    """Return (city, region, country) for the coordinate, or (None, None, None)."""
+    global _geocoder, _geocoder_imported
+    if not _geocoder_imported:
+        try:
+            import reverse_geocoder as rg  # noqa: PLC0415
+            _geocoder = rg
+        except ImportError:
+            _geocoder = None
+        _geocoder_imported = True
+    if _geocoder is None:
+        return None, None, None
+    try:
+        result = _geocoder.search([(lat, lon)], mode=1, verbose=False)
+        if not result:
+            return None, None, None
+        r = result[0]
+        return r.get("name"), r.get("admin1"), r.get("cc")
+    except Exception as e:
+        log.warning("reverse-geocode failed for (%s, %s): %s", lat, lon, e)
+        return None, None, None
+
+
+def _extract_camera_and_date(path: Path) -> tuple[
+    str | None, int | None, float | None, float | None,
+    str | None, str | None, str | None
+]:
+    """Pull camera model, capture timestamp, and reverse-geocoded place from EXIF.
+
+    Returns (camera_model, taken_at, lat, lon, place_city, place_region, place_country).
+    All values may be None. Cheap one-shot read; falls back gracefully on
+    anything PIL can't parse (RAW, HEIC without pillow-heif, etc.).
     """
     if path.suffix.lower() not in (".jpg", ".jpeg"):
-        return None, None
+        return None, None, None, None, None, None, None
     try:
         from PIL import Image
         with Image.open(path) as im:
             exif = im.getexif() or {}
+            # GPSInfo lives in its own sub-IFD (tag 0x8825).
+            try:
+                gps_ifd = exif.get_ifd(0x8825) or {}
+            except Exception:
+                gps_ifd = {}
     except Exception:
-        return None, None
+        return None, None, None, None, None, None, None
+
     model = exif.get(272)
     if isinstance(model, bytes):
         try:
@@ -229,7 +294,7 @@ def _extract_camera_and_date(path: Path) -> tuple[str | None, int | None]:
         model = model.strip() or None
 
     date_taken = None
-    raw_date = exif.get(36867)  # DateTimeOriginal
+    raw_date = exif.get(36867)
     if isinstance(raw_date, str):
         try:
             import datetime
@@ -237,7 +302,14 @@ def _extract_camera_and_date(path: Path) -> tuple[str | None, int | None]:
             date_taken = int(dt.timestamp())
         except (ValueError, OSError):
             date_taken = None
-    return model, date_taken
+
+    lat = _gps_to_decimal(gps_ifd.get(2), gps_ifd.get(1))   # GPSLatitude / Ref
+    lon = _gps_to_decimal(gps_ifd.get(4), gps_ifd.get(3))   # GPSLongitude / Ref
+    city = region = country = None
+    if lat is not None and lon is not None:
+        city, region, country = _maybe_reverse_geocode(lat, lon)
+
+    return model, date_taken, lat, lon, city, region, country
 
 
 def scan_root(root_id: int, progress: ScanProgress | None = None) -> ScanProgress:
@@ -302,10 +374,10 @@ def scan_root(root_id: int, progress: ScanProgress | None = None) -> ScanProgres
                 shas = list(exe.map(lambda t: state.sha256_of(t[1]), to_hash))
             progress.phase = "exif"
             for (rel, src, mtime, stem, kind), sha in zip(to_hash, shas, strict=True):
-                cam, dt = _extract_camera_and_date(src)
+                cam, dt, lat, lon, city, region, country = _extract_camera_and_date(src)
                 new_rows.append((
                     sha, root_id, rel, stem, kind, int(mtime),
-                    cam, dt, int(time.time()),
+                    cam, dt, int(time.time()), lat, lon, city, region, country,
                 ))
                 if rel not in indexed:
                     progress.indexed_new += 1
@@ -321,8 +393,9 @@ def scan_root(root_id: int, progress: ScanProgress | None = None) -> ScanProgres
                 conn.executemany(
                     "INSERT OR REPLACE INTO frames "
                     "(sha, root_id, rel_path, stem, kind, mtime, "
-                    " camera_model, taken_at, indexed_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " camera_model, taken_at, indexed_at, "
+                    " lat, lon, place_city, place_region, place_country) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     new_rows,
                 )
             if gone:
@@ -366,8 +439,15 @@ class LibraryFrame:
     camera_model: str | None
     taken_at: int | None
     abs_path: str
+    lat: float | None = None
+    lon: float | None = None
+    place_city: str | None = None
+    place_region: str | None = None
+    place_country: str | None = None
 
     def to_view(self) -> dict:
+        place_parts = [self.place_city, self.place_region, self.place_country]
+        place = ", ".join(p for p in place_parts if p) or None
         return {
             "sha": self.sha,
             "root_id": self.root_id,
@@ -378,6 +458,12 @@ class LibraryFrame:
             "camera": self.camera_model,
             "taken_at": self.taken_at,
             "abs_path": self.abs_path,
+            "lat": self.lat,
+            "lon": self.lon,
+            "place": place,
+            "place_city": self.place_city,
+            "place_region": self.place_region,
+            "place_country": self.place_country,
         }
 
 
@@ -417,7 +503,8 @@ def query_frames(
     sql = (
         "SELECT frames.sha, frames.root_id, roots.label, frames.rel_path, "
         "       frames.stem, frames.kind, frames.camera_model, frames.taken_at, "
-        "       roots.path "
+        "       roots.path, frames.lat, frames.lon, frames.place_city, "
+        "       frames.place_region, frames.place_country "
         "FROM frames LEFT JOIN roots ON frames.root_id = roots.id "
         f"{where} "
         "ORDER BY COALESCE(frames.taken_at, 0) DESC, frames.rel_path "
@@ -427,12 +514,15 @@ def query_frames(
     with _conn() as conn:
         rows = conn.execute(sql, params).fetchall()
     out: list[LibraryFrame] = []
-    for sha, rid, rlabel, rel_path, stem, kind, cam, dt, rpath in rows:
+    for (sha, rid, rlabel, rel_path, stem, kind, cam, dt, rpath,
+         lat, lon, city, region, country) in rows:
         abs_path = str(Path(rpath) / rel_path) if rpath else rel_path
         out.append(LibraryFrame(
             sha=sha, root_id=rid, root_label=rlabel or "",
             rel_path=rel_path, stem=stem, kind=kind,
             camera_model=cam, taken_at=dt, abs_path=abs_path,
+            lat=lat, lon=lon, place_city=city,
+            place_region=region, place_country=country,
         ))
     return out
 
@@ -456,6 +546,70 @@ def cameras() -> list[tuple[str, int]]:
             "GROUP BY camera_model ORDER BY 2 DESC"
         ).fetchall()
     return [(m, int(c)) for m, c in rows]
+
+
+def places() -> list[tuple[str, int]]:
+    """All distinct reverse-geocoded cities seen, with frame counts."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT place_city, COUNT(*) FROM frames "
+            "WHERE place_city IS NOT NULL "
+            "GROUP BY place_city ORDER BY 2 DESC"
+        ).fetchall()
+    return [(p, int(c)) for p, c in rows]
+
+
+def backfill_gps() -> int:
+    """Walk every frame with no GPS data, re-read EXIF, persist any GPS+place
+    we find. Lets a library indexed before geotag-aware scan catch up
+    without re-hashing every file. Returns the count updated."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT frames.sha, roots.path, frames.rel_path "
+            "FROM frames JOIN roots ON frames.root_id = roots.id "
+            "WHERE frames.lat IS NULL"
+        ).fetchall()
+    n = 0
+    for sha, root_path, rel in rows:
+        src = Path(root_path) / rel
+        if not src.exists():
+            continue
+        _, _, lat, lon, city, region, country = _extract_camera_and_date(src)
+        if lat is None and lon is None:
+            continue
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE frames SET lat=?, lon=?, place_city=?, "
+                "place_region=?, place_country=? WHERE sha=?",
+                (lat, lon, city, region, country, sha),
+            )
+        n += 1
+    return n
+
+
+def reverse_geocode_unreferenced() -> int:
+    """Backfill place_city / region / country for frames that have lat/lon but
+    no place data. Returns the count updated. Cheap to call after the
+    reverse_geocoder package becomes available (the user installs it after
+    a scan)."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT sha, lat, lon FROM frames "
+            "WHERE lat IS NOT NULL AND lon IS NOT NULL AND place_city IS NULL"
+        ).fetchall()
+    n = 0
+    for sha, lat, lon in rows:
+        city, region, country = _maybe_reverse_geocode(lat, lon)
+        if city is None:
+            continue
+        with _conn() as conn:
+            conn.execute(
+                "UPDATE frames SET place_city=?, place_region=?, place_country=? "
+                "WHERE sha=?",
+                (city, region, country, sha),
+            )
+        n += 1
+    return n
 
 
 def folder_tree(root_id: int) -> list[tuple[str, int]]:
