@@ -290,7 +290,8 @@ def cmd_run(
         )
         eye_data_ok = (not eye_gate) or (cached_meta is not None and "eyes" in cached_meta)
         face_id_data_ok = (strategy != "faces") or (
-            cached_meta is not None and "face_embeddings" in cached_meta
+            cached_meta is not None
+            and ("face_detections" in cached_meta or "face_embeddings" in cached_meta)
         )
 
         # Fast path: every per-frame input we need is on disk → don't decode.
@@ -390,18 +391,18 @@ def cmd_run(
                         except Exception as e:
                             log.warning("eyes skip %s: %s", f.display_name, e)
                             frame_eyes = None
-                    face_embs_payload = None
+                    face_dets_payload = None
                     if strategy == "faces":
                         try:
-                            embs = face_id_mod.extract_face_embeddings(preview)
-                            face_embs_payload = face_id_mod.encode_for_cache(embs)
+                            dets = face_id_mod.extract_face_detections(preview)
+                            face_dets_payload = face_id_mod.encode_detections_for_cache(dets)
                         except Exception as e:
                             log.warning("face_id skip %s: %s", f.display_name, e)
                     state.cache_frame_metadata(
                         sha, sharp, str(phash), ts,
                         face_count=face_count, face_sharpness=face_sharp,
                         metrics=frame_metrics, eyes=frame_eyes,
-                        face_embeddings=face_embs_payload,
+                        face_detections=face_dets_payload,
                     )
                     aesthetic_done += 1
                 except Exception as e:
@@ -618,9 +619,8 @@ def cmd_run(
                 for r, _s, _e in candidates:
                     sha2 = state.sha256_of(r.frame.classify_path)
                     meta2 = state.load_frame_metadata(sha2) or {}
-                    face_embs_per_item.append(
-                        face_id_mod.decode_from_cache(meta2.get("face_embeddings"))
-                    )
+                    payload = meta2.get("face_detections") or meta2.get("face_embeddings")
+                    face_embs_per_item.append(face_id_mod.decode_from_cache(payload))
                 n_people = sum(1 for embs in face_embs_per_item if embs)
                 log.info(
                     "selecting top %d (face-diverse) from %d candidates "

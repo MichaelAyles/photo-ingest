@@ -76,6 +76,12 @@ def _app():
 
 def extract_face_embeddings(preview_bgr: np.ndarray) -> list[np.ndarray]:
     """Return one L2-normalised 512-dim embedding per detected face, or []."""
+    detections = extract_face_detections(preview_bgr)
+    return [d["embedding"] for d in detections]
+
+
+def extract_face_detections(preview_bgr: np.ndarray) -> list[dict]:
+    """Return full per-face details: {embedding, bbox, det_score}. Empty on no faces."""
     app = _app()
     if app is None or preview_bgr is None or preview_bgr.size == 0:
         return []
@@ -84,7 +90,7 @@ def extract_face_embeddings(preview_bgr: np.ndarray) -> list[np.ndarray]:
     except Exception as e:
         log.warning("insightface get() failed: %s", e)
         return []
-    out: list[np.ndarray] = []
+    out: list[dict] = []
     for f in faces:
         if not hasattr(f, "embedding") or f.embedding is None:
             continue
@@ -92,7 +98,11 @@ def extract_face_embeddings(preview_bgr: np.ndarray) -> list[np.ndarray]:
         norm = np.linalg.norm(emb)
         if norm <= 0:
             continue
-        out.append(emb / norm)
+        out.append({
+            "embedding": emb / norm,
+            "bbox": [int(v) for v in f.bbox.tolist()],
+            "det_score": float(getattr(f, "det_score", 0.0)),
+        })
     return out
 
 
@@ -102,17 +112,38 @@ def encode_for_cache(embeddings: list[np.ndarray]) -> list[list[float]]:
 
 
 def decode_from_cache(payload) -> list[np.ndarray]:
-    """Reverse of encode_for_cache. Tolerates missing/legacy formats."""
+    """Reverse of encode_for_cache. Tolerates missing/legacy formats.
+
+    Accepts either the legacy face_embeddings format (list-of-float-lists) or
+    the newer face_detections format (list-of-dicts with 'embedding' key).
+    """
     if not payload:
         return []
     out: list[np.ndarray] = []
     for entry in payload:
+        # New format: dict with 'embedding'.
+        if isinstance(entry, dict):
+            entry = entry.get("embedding")
+            if entry is None:
+                continue
         try:
             arr = np.asarray(entry, dtype=np.float32)
             if arr.ndim == 1 and arr.size > 0:
                 out.append(arr)
         except (TypeError, ValueError):
             continue
+    return out
+
+
+def encode_detections_for_cache(detections: list[dict]) -> list[dict]:
+    """JSON-safe form of extract_face_detections output."""
+    out: list[dict] = []
+    for d in detections:
+        out.append({
+            "embedding": d["embedding"].astype(np.float32).tolist(),
+            "bbox": list(d["bbox"]),
+            "det_score": float(d.get("det_score", 0.0)),
+        })
     return out
 
 

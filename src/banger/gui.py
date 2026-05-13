@@ -39,7 +39,7 @@ import imagehash
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from banger import aesthetic, caption as caption_mod, dedup, eyes as eyes_mod, face, face_id as face_id_mod
+from banger import aesthetic, caption as caption_mod, dedup, eyes as eyes_mod, face, face_id as face_id_mod, face_names, tags as tags_mod
 from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
 from banger import xmp as xmp_mod
@@ -164,7 +164,8 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
             cached_emb = state.load_embedding(sha)
 
             face_id_ok = (strategy != "faces") or (
-                cached_meta is not None and "face_embeddings" in cached_meta
+                cached_meta is not None
+                and ("face_detections" in cached_meta or "face_embeddings" in cached_meta)
             )
             if cached_meta and "phash_hex" in cached_meta and cached_emb is not None and face_id_ok:
                 sharp = float(cached_meta["sharpness"])
@@ -206,18 +207,18 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
                             frame_eyes = eyes_mod.analyse_eyes(preview)
                         except Exception as e:
                             log_line(f"eyes skip {f.display_name}: {e}")
-                    face_embs_payload = None
+                    face_dets_payload = None
                     if strategy == "faces":
                         try:
-                            embs = face_id_mod.extract_face_embeddings(preview)
-                            face_embs_payload = face_id_mod.encode_for_cache(embs)
+                            dets = face_id_mod.extract_face_detections(preview)
+                            face_dets_payload = face_id_mod.encode_detections_for_cache(dets)
                         except Exception as e:
                             log_line(f"face_id skip {f.display_name}: {e}")
                     state.cache_frame_metadata(
                         sha, sharp, str(phash), ts,
                         face_count=face_count, face_sharpness=face_sharp,
                         metrics=frame_metrics, eyes=frame_eyes,
-                        face_embeddings=face_embs_payload,
+                        face_detections=face_dets_payload,
                     )
                 except Exception as e:
                     log_line(f"score fail {f.display_name}: {e}")
@@ -283,9 +284,8 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
             for r, _s, _e in candidates:
                 sha2 = state.sha256_of(r.frame.classify_path)
                 meta2 = state.load_frame_metadata(sha2) or {}
-                face_embs_per_item.append(
-                    face_id_mod.decode_from_cache(meta2.get("face_embeddings"))
-                )
+                payload = meta2.get("face_detections") or meta2.get("face_embeddings")
+                face_embs_per_item.append(face_id_mod.decode_from_cache(payload))
             n_people_frames = sum(1 for embs in face_embs_per_item if embs)
             log_line(f"face-id: {n_people_frames}/{len(candidates)} candidates carry embeddings")
             chosen = select.select_faces_top_n(
@@ -571,6 +571,140 @@ def build_app(window_holder: dict | None = None) -> Flask:
             return jsonify({"error": str(e)}), 500
         return jsonify({"ok": True})
 
+    @app.route("/api/faces/<sha>")
+    def faces_for(sha):
+        """Return detected faces for a frame: bbox + sha-of-face + matched name.
+
+        Uses cached face_detections from metadata. If not yet cached (older
+        run that skipped insightface), extract on the fly. Each face gets a
+        face_idx so the naming endpoint can identify which one to update.
+        """
+        meta = state.load_frame_metadata(sha) or {}
+        detections = meta.get("face_detections")
+        if detections is None:
+            # Older metadata only has face_embeddings (no bboxes). If we have
+            # those, fall back to inferring positions by re-extracting; that
+            # requires reloading the preview though.
+            f = sha_to_frame.get(sha)
+            if f is None:
+                return jsonify({"faces": [], "error": "unknown sha"}), 404
+            try:
+                preview = load_preview(f.classify_path)
+            except Exception as e:
+                return jsonify({"faces": [], "error": str(e)}), 200
+            dets = face_id_mod.extract_face_detections(preview)
+            detections = []
+            for d in dets:
+                detections.append({
+                    "bbox": d["bbox"],
+                    "embedding": d["embedding"].astype(np.float32).tolist(),
+                    "det_score": d["det_score"],
+                })
+            state.update_frame_metadata(sha, face_detections=detections)
+
+        # Match each detection's embedding to the persistent name DB.
+        out = []
+        for idx, d in enumerate(detections):
+            emb = np.asarray(d.get("embedding") or [], dtype=np.float32)
+            matched_name = None
+            sim = 0.0
+            if emb.size == face_names.EMB_DIM:
+                matched_name, sim = face_names.match(emb)
+            out.append({
+                "face_idx": idx,
+                "bbox": d.get("bbox"),
+                "matched_name": matched_name,
+                "match_sim": round(sim, 3),
+                "det_score": d.get("det_score"),
+            })
+        return jsonify({"faces": out})
+
+    @app.route("/api/face-thumb/<sha>/<int:face_idx>")
+    def face_thumb(sha, face_idx):
+        """Crop the face region from the preview and return as JPEG."""
+        import cv2
+
+        meta = state.load_frame_metadata(sha) or {}
+        detections = meta.get("face_detections") or []
+        if face_idx < 0 or face_idx >= len(detections):
+            return ("face_idx out of range", 404)
+        bbox = detections[face_idx].get("bbox") or []
+        if len(bbox) != 4:
+            return ("no bbox", 404)
+
+        f = sha_to_frame.get(sha)
+        if f is None:
+            return ("unknown sha", 404)
+        try:
+            preview = load_preview(f.classify_path)
+        except Exception as e:
+            return (f"preview failed: {e}", 500)
+        h, w = preview.shape[:2]
+        x1, y1, x2, y2 = bbox
+        # Pad 25% around the bbox so we get hair + chin, not just face plane.
+        pw, ph = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
+        x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
+        x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+        if x2 <= x1 or y2 <= y1:
+            return ("empty crop", 500)
+        crop = preview[y1:y2, x1:x2]
+        crop = cv2.resize(crop, (128, 128), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            return ("encode failed", 500)
+        from flask import Response
+        return Response(buf.tobytes(), mimetype="image/jpeg")
+
+    @app.route("/api/face/name", methods=["POST"])
+    def face_name():
+        """Assign a name to a specific (sha, face_idx)."""
+        data = request.get_json(silent=True) or {}
+        sha = (data.get("sha") or "").strip()
+        face_idx = data.get("face_idx")
+        name = (data.get("name") or "").strip()
+        if not sha or face_idx is None or not name:
+            return jsonify({"error": "sha, face_idx, name all required"}), 400
+        meta = state.load_frame_metadata(sha) or {}
+        detections = meta.get("face_detections") or []
+        if face_idx < 0 or face_idx >= len(detections):
+            return jsonify({"error": "face_idx out of range"}), 400
+        emb = np.asarray(detections[face_idx].get("embedding") or [], dtype=np.float32)
+        if emb.size != face_names.EMB_DIM:
+            return jsonify({"error": "no embedding for that face"}), 400
+        try:
+            sim, count = face_names.assign(name, emb)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify({"name": name, "merged_with_sim": sim, "count": count})
+
+    @app.route("/api/face/names")
+    def face_names_list():
+        return jsonify({"names": face_names.all_names()})
+
+    @app.route("/api/tags/<sha>")
+    def tags_for(sha):
+        """Return cached tags, or compute them now from the cached CLIP embedding.
+
+        Fast: tags reuse the embedding we already wrote during scoring, so
+        this is one matmul plus a top-K. No model loading, no preview reload.
+        Stored under metadata.tags as a list of [tag, similarity] pairs.
+        """
+        meta = state.load_frame_metadata(sha) or {}
+        if "tags" in meta:
+            return jsonify({"tags": meta["tags"], "cached": True})
+        emb = state.load_embedding(sha)
+        if emb is None:
+            return jsonify({"tags": [], "error": "no cached embedding for this sha"}), 200
+        try:
+            pairs = tags_mod.tag_from_embedding(emb)
+        except Exception as e:
+            log.warning("tag compute failed for %s: %s", sha, e)
+            return jsonify({"tags": [], "error": str(e)}), 200
+        # Round the sim for compact JSON; stored once, read many times.
+        serial = [[t, round(s, 4)] for t, s in pairs]
+        state.update_frame_metadata(sha, tags=serial)
+        return jsonify({"tags": serial, "cached": False})
+
     @app.route("/api/caption/<sha>")
     def caption_for(sha):
         """Return a cached BLIP caption, or generate one now.
@@ -623,6 +757,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
             "face_count": meta.get("face_count"),
             "face_sharpness": meta.get("face_sharpness"),
             "sharpness": meta.get("sharpness"),
+            "tags": meta.get("tags"),
             "caption": meta.get("caption"),
             "exif": exif,
         })
@@ -994,6 +1129,14 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .overlay-panel .flag.on { background: rgba(160,95,95,.2); color: #e0a0a0; border: 1px solid rgba(160,95,95,.4); }
   .overlay-panel .flag.off { background: rgba(95,160,95,.12); color: #a0d0a0; border: 1px solid rgba(95,160,95,.3); }
   .overlay-panel .empty { color: var(--dim); font-style: italic; font-size: .75rem; }
+  .overlay-panel .tag-chips { display: flex; flex-wrap: wrap; gap: .25rem; margin: .3rem 0; }
+  .overlay-panel .tag-chip { background: var(--bg3); color: #cce0cc; border: 1px solid #2a3a2a; border-radius: 3px; padding: 2px 7px; font-size: .72rem; font-family: ui-monospace, monospace; }
+  .overlay-panel .face-row { display: flex; gap: .5rem; margin: .35rem 0; align-items: flex-start; flex-wrap: wrap; }
+  .overlay-panel .face-tile { display: flex; flex-direction: column; align-items: center; gap: .25rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; padding: .35rem; }
+  .overlay-panel .face-tile img { width: 64px; height: 64px; object-fit: cover; border-radius: 3px; background: #000; }
+  .overlay-panel .face-tile .name { font-size: .7rem; color: #ddd; font-family: ui-monospace, monospace; max-width: 90px; text-align: center; word-break: break-word; }
+  .overlay-panel .face-tile .name.unnamed { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+  .overlay-panel .face-tile input { background: var(--bg3); border: 1px solid var(--accent); color: var(--fg); border-radius: 3px; padding: 1px 4px; font: inherit; font-size: .7rem; width: 90px; }
   .overlay .close { position: absolute; top: 1rem; right: 1rem; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); padding: .35rem .8rem; border-radius: 4px; cursor: pointer; z-index: 1; }
   .overlay .hint { position: absolute; bottom: 1rem; left: 50%; transform: translateX(-50%); color: var(--dim); font-size: .7rem; pointer-events: none; }
 
@@ -1263,21 +1406,81 @@ async function openHero(pick) {
       `<p class="empty">details fetch failed: ${escapeHtml(e.message)}</p>`;
     return;
   }
-  // If no cached caption, fetch one lazily and slot it into the panel.
-  if (!details.caption) {
-    const target = document.getElementById("caption-slot-" + pick.sha);
-    if (target) target.textContent = "Generating description (first call loads BLIP, ~10-15s)…";
+  // If no cached tags, fetch them lazily (fast: just a matmul + top-K).
+  if (!details.tags) {
     try {
-      const res = await fetch("/api/caption/" + pick.sha);
+      const res = await fetch("/api/tags/" + pick.sha);
       const d = await res.json();
-      if (target) {
-        if (d.caption) target.textContent = d.caption;
-        else target.textContent = "(captioning unavailable)";
-      }
+      const slot = document.getElementById("tags-slot-" + pick.sha);
+      if (slot) slot.innerHTML = renderTagChips(d.tags || []);
     } catch (e) {
-      if (target) target.textContent = "(caption fetch failed)";
+      const slot = document.getElementById("tags-slot-" + pick.sha);
+      if (slot) slot.innerHTML = '<p class="empty">tag fetch failed</p>';
     }
   }
+
+  // Lazy-fetch faces (with name matching against the persistent DB).
+  try {
+    const res = await fetch("/api/faces/" + pick.sha);
+    const d = await res.json();
+    const slot = document.getElementById("faces-slot-" + pick.sha);
+    if (slot) slot.innerHTML = renderFaceRow(pick.sha, d.faces || []);
+    if (slot) wireFaceTiles(pick.sha);
+  } catch (e) {
+    const slot = document.getElementById("faces-slot-" + pick.sha);
+    if (slot) slot.innerHTML = '<p class="empty">faces unavailable</p>';
+  }
+}
+
+function renderFaceRow(sha, faces) {
+  if (!faces.length) return '<p class="empty">no faces detected</p>';
+  return '<div class="face-row">' + faces.map(f => {
+    const nameHtml = f.matched_name
+      ? `<span class="name" title="match sim ${f.match_sim}">${escapeHtml(f.matched_name)}</span>`
+      : `<span class="name unnamed" data-face-idx="${f.face_idx}">name…</span>`;
+    return `
+      <div class="face-tile" data-face-idx="${f.face_idx}">
+        <img src="/api/face-thumb/${sha}/${f.face_idx}" alt="face">
+        ${nameHtml}
+      </div>`;
+  }).join("") + '</div>';
+}
+
+function wireFaceTiles(sha) {
+  document.querySelectorAll(`#faces-slot-${sha} .name.unnamed`).forEach(el => {
+    el.addEventListener("click", () => {
+      const tile = el.closest(".face-tile");
+      const faceIdx = parseInt(tile.dataset.faceIdx);
+      el.outerHTML = `<input type="text" placeholder="name" data-face-idx="${faceIdx}" autofocus>`;
+      const input = tile.querySelector("input");
+      input.focus();
+      input.addEventListener("keydown", async (e) => {
+        if (e.key === "Escape") { wireFaceTiles(sha); /* rerender */; return; }
+        if (e.key !== "Enter") return;
+        const name = input.value.trim();
+        if (!name) return;
+        try {
+          const res = await fetch("/api/face/name", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({sha, face_idx: faceIdx, name}),
+          });
+          if (!res.ok) throw new Error(await res.text());
+          input.outerHTML = `<span class="name">${escapeHtml(name)}</span>`;
+          toast(`Named "${name}" (will match across future runs)`, 1800);
+        } catch (e) {
+          toast("name save failed: " + e.message);
+        }
+      });
+    });
+  });
+}
+
+function renderTagChips(pairs) {
+  if (!pairs || !pairs.length) return '<p class="empty">no confident tags</p>';
+  return '<div class="tag-chips">' + pairs.map(([t, s]) =>
+    `<span class="tag-chip" title="cosine ${s.toFixed(3)}">${escapeHtml(t)}</span>`
+  ).join("") + '</div>';
 }
 
 function bar(label, value, max=10) {
@@ -1335,7 +1538,7 @@ function renderPanel(pick, d) {
     ? `<dl>${extra.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`
     : "";
 
-  // Face / eyes block.
+  // Face / eyes block. Names + thumbs get loaded async after openHero.
   let faceBlock = "";
   if (d.face_count) {
     const faceRows = [
@@ -1346,7 +1549,10 @@ function renderPanel(pick, d) {
       faceRows.push(["min EAR", d.eyes.ear_min !== undefined ? d.eyes.ear_min.toFixed(3) : "—"]);
       faceRows.push(["blink detected", d.eyes.any_blink ? "yes" : "no"]);
     }
-    faceBlock = `<h3>Faces</h3><dl>${faceRows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+    faceBlock = `
+      <h3>Faces</h3>
+      <dl>${faceRows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
+      <div id="faces-slot-${pick.sha}"><p class="empty">loading faces…</p></div>`;
   }
 
   // EXIF block.
@@ -1370,9 +1576,9 @@ function renderPanel(pick, d) {
     ? `<dl>${exifPairs.map(([k,v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>`
     : '<p class="empty">no EXIF data (or non-JPEG source)</p>';
 
-  const captionHtml = d.caption
-    ? `<p style="margin:.3rem 0 0;font-size:.85rem;color:#ddd;line-height:1.35">${escapeHtml(d.caption)}</p>`
-    : `<p id="caption-slot-${pick.sha}" style="margin:.3rem 0 0;font-size:.8rem;color:var(--dim);font-style:italic">loading description…</p>`;
+  const tagsHtml = d.tags && d.tags.length
+    ? renderTagChips(d.tags)
+    : `<div id="tags-slot-${pick.sha}"><p class="empty">loading tags…</p></div>`;
 
   return `
     <div class="head">
@@ -1380,8 +1586,8 @@ function renderPanel(pick, d) {
       <span class="stars">${stars}</span>
       <span class="stem">${escapeHtml(pick.display)}</span>
     </div>
-    <h3>What's in it</h3>
-    ${captionHtml}
+    <h3>Tags</h3>
+    ${tagsHtml}
     <h3>Why it was picked</h3>
     <dl>
       <dt>aesthetic</dt><dd>${score} <span style="color:var(--dim);font-size:.7rem">(${escapeHtml(pick.aesthetic_source || "—")})</span></dd>
