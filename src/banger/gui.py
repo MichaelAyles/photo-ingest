@@ -306,6 +306,121 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
 PREVIEW_JPEG_QUALITY = 88
 
 
+_EXIF_FIELDS = {
+    # PIL tag id -> friendly key. Subset that's actually useful for "why did
+    # this shot work?" questions. Skips boring stuff like ColorSpace, YCbCrPositioning.
+    271: "camera_make",
+    272: "camera_model",
+    42036: "lens_model",
+    33434: "exposure_time",       # rational, seconds
+    33437: "f_number",            # rational
+    34855: "iso",
+    37386: "focal_length",        # rational, mm
+    41989: "focal_length_35mm",
+    36867: "date_taken",
+    37380: "exposure_bias",       # rational, stops
+    37383: "metering_mode",
+    37384: "light_source",
+    37385: "flash",
+    41986: "exposure_mode",
+    41987: "white_balance",
+    41988: "digital_zoom",
+    41990: "scene_capture_type",
+    34850: "exposure_program",
+    40962: "pixel_x",
+    40963: "pixel_y",
+}
+
+
+def _rational_to_float(v) -> float | None:
+    try:
+        if hasattr(v, "numerator") and hasattr(v, "denominator"):
+            return v.numerator / v.denominator if v.denominator else None
+        if isinstance(v, tuple) and len(v) == 2:
+            return v[0] / v[1] if v[1] else None
+        return float(v)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _format_exposure(secs: float | None) -> str | None:
+    if secs is None:
+        return None
+    if secs >= 1:
+        return f"{secs:.1f}s"
+    if secs <= 0:
+        return None
+    return f"1/{round(1.0 / secs)}s"
+
+
+_METERING_MODES = {0: "unknown", 1: "average", 2: "centre-weighted", 3: "spot",
+                   4: "multi-spot", 5: "matrix", 6: "partial"}
+_FLASH_FIRED = lambda v: "fired" if (isinstance(v, int) and v & 1) else "no flash"
+
+
+def _extract_exif(path: Path) -> dict:
+    """Return a flat dict of friendly-named EXIF fields, or {} on any error."""
+    if path.suffix.lower() not in (".jpg", ".jpeg"):
+        return {}
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            top = im.getexif() or {}
+            # ExifIFD (0x8769) holds the camera-settings tags (aperture, shutter,
+            # ISO, etc). PIL's top-level getexif only returns the main IFD, so
+            # we have to fetch the sub-IFD explicitly and merge.
+            try:
+                sub = top.get_ifd(0x8769) or {}
+            except Exception:
+                sub = {}
+            raw = {**dict(top), **dict(sub)}
+    except Exception:
+        return {}
+
+    out: dict = {}
+    for tag_id, key in _EXIF_FIELDS.items():
+        if tag_id not in raw:
+            continue
+        v = raw[tag_id]
+        if key in ("exposure_time", "f_number", "focal_length", "exposure_bias"):
+            v = _rational_to_float(v)
+        elif key == "metering_mode" and isinstance(v, int):
+            v = _METERING_MODES.get(v, str(v))
+        elif key == "flash" and isinstance(v, int):
+            v = _FLASH_FIRED(v)
+        elif isinstance(v, bytes):
+            try:
+                v = v.decode("utf-8", errors="replace").strip("\x00")
+            except Exception:
+                continue
+        out[key] = v
+
+    # Pretty-format the ones that read better as strings.
+    if out.get("exposure_time") is not None:
+        out["shutter"] = _format_exposure(out["exposure_time"])
+    if out.get("f_number") is not None:
+        out["aperture"] = f"f/{out['f_number']:.1f}"
+    if out.get("focal_length") is not None:
+        out["focal_length_mm"] = f"{out['focal_length']:.0f}mm"
+
+    # PIL's IFDRational and Pillow byte-string surrogates aren't JSON safe.
+    # Convert anything that survived to a primitive, drop the rest.
+    safe: dict = {}
+    for k, v in out.items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            safe[k] = v
+        else:
+            f = _rational_to_float(v)
+            if f is not None:
+                safe[k] = f
+            else:
+                try:
+                    safe[k] = str(v)
+                except Exception:
+                    continue
+    return safe
+
+
 def _encode_preview_jpeg(preview_bgr) -> bytes:
     import cv2
 
@@ -421,6 +536,36 @@ def build_app(window_holder: dict | None = None) -> Flask:
         except OSError as e:
             return jsonify({"error": str(e)}), 500
         return jsonify({"ok": True})
+
+    @app.route("/api/details/<sha>")
+    def details(sha):
+        """Return everything we know about one frame: scores, metrics, EXIF.
+
+        Used by the click-on-photo detail overlay. Pulls cached metadata from
+        disk (computed during the pipeline run) and reads EXIF from the source
+        JPEG with PIL. RAW EXIF would need rawpy + a separate parser, deferred
+        until a real ARW shoot lands in test_photos.
+        """
+        f = sha_to_frame.get(sha)
+        if f is None:
+            return jsonify({"error": "unknown sha"}), 404
+        meta = state.load_frame_metadata(sha) or {}
+        exif = _extract_exif(f.classify_path)
+        # The original pick dict is held in the job; we don't have it here
+        # without the job_id, so the SPA passes the pick info client-side and
+        # this endpoint just adds the heavy-to-fetch bits (metrics, EXIF).
+        return jsonify({
+            "sha": sha,
+            "display": f.display_name,
+            "kind": f.kind,
+            "src_path": str(f.classify_path),
+            "metrics": meta.get("metrics"),
+            "eyes": meta.get("eyes"),
+            "face_count": meta.get("face_count"),
+            "face_sharpness": meta.get("face_sharpness"),
+            "sharpness": meta.get("sharpness"),
+            "exif": exif,
+        })
 
     @app.route("/api/label-spawn", methods=["POST"])
     def label_spawn():
@@ -633,11 +778,32 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .badge.warn { background: rgba(160,95,95,.15); color: var(--red); border: 1px solid rgba(160,95,95,.3); }
 
   /* hero detail overlay */
-  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.92); display: none; align-items: center; justify-content: center; z-index: 50; flex-direction: column; padding: 2rem; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.92); display: none; z-index: 50; padding: 2rem; cursor: zoom-out; }
   .overlay.show { display: flex; }
-  .overlay img { max-width: 90%; max-height: 80%; object-fit: contain; border-radius: 4px; }
-  .overlay .info { margin-top: 1rem; color: #ccc; font-family: ui-monospace, monospace; font-size: .8rem; text-align: center; }
-  .overlay .close { position: absolute; top: 1rem; right: 1rem; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); padding: .35rem .8rem; border-radius: 4px; }
+  .overlay-inner { margin: auto; display: flex; gap: 1.5rem; max-width: 1500px; width: 100%; height: 100%; align-items: stretch; cursor: default; }
+  .overlay-image { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; min-width: 0; }
+  .overlay-image img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 4px; box-shadow: 0 10px 60px rgba(0,0,0,.6); }
+  .overlay-panel { flex: 0 0 360px; overflow-y: auto; padding-right: .4rem; }
+  .overlay-panel h3 { margin: 1.2rem 0 .4rem; font-size: .7rem; color: var(--dim); font-weight: 500; text-transform: uppercase; letter-spacing: .12em; }
+  .overlay-panel h3:first-child { margin-top: 0; }
+  .overlay-panel .head { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+  .overlay-panel .head .rank { font-family: ui-monospace, monospace; color: var(--accent); font-size: .85rem; }
+  .overlay-panel .head .stars { color: #ffd56a; font-size: 1rem; letter-spacing: -1px; }
+  .overlay-panel .head .stem { font-family: ui-monospace, monospace; font-size: .85rem; word-break: break-all; }
+  .overlay-panel dl { display: grid; grid-template-columns: minmax(110px, auto) 1fr; gap: .25rem .8rem; margin: 0; font-size: .8rem; }
+  .overlay-panel dt { color: var(--dim); font-size: .75rem; }
+  .overlay-panel dd { margin: 0; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; color: #ddd; word-break: break-all; }
+  .overlay-panel .bar-row { display: grid; grid-template-columns: 110px 1fr 40px; gap: .5rem; align-items: center; margin: .15rem 0; font-size: .75rem; }
+  .overlay-panel .bar-row .label { color: var(--dim); }
+  .overlay-panel .bar-row .meter { height: 5px; background: var(--bg3); border-radius: 2px; overflow: hidden; }
+  .overlay-panel .bar-row .meter > div { height: 100%; background: var(--accent); border-radius: 2px; }
+  .overlay-panel .bar-row .val { font-family: ui-monospace, monospace; color: #ddd; text-align: right; font-variant-numeric: tabular-nums; }
+  .overlay-panel .flag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: .65rem; margin-right: .25rem; font-family: ui-monospace, monospace; }
+  .overlay-panel .flag.on { background: rgba(160,95,95,.2); color: #e0a0a0; border: 1px solid rgba(160,95,95,.4); }
+  .overlay-panel .flag.off { background: rgba(95,160,95,.12); color: #a0d0a0; border: 1px solid rgba(95,160,95,.3); }
+  .overlay-panel .empty { color: var(--dim); font-style: italic; font-size: .75rem; }
+  .overlay .close { position: absolute; top: 1rem; right: 1rem; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); padding: .35rem .8rem; border-radius: 4px; cursor: pointer; z-index: 1; }
+  .overlay .hint { position: absolute; bottom: 1rem; left: 50%; transform: translateX(-50%); color: var(--dim); font-size: .7rem; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -736,8 +902,11 @@ _SPA_TEMPLATE = r"""<!doctype html>
 
 <div class="overlay" id="overlay">
   <button class="close" id="overlay-close">close</button>
-  <img id="overlay-img">
-  <div class="info" id="overlay-info"></div>
+  <div class="overlay-inner" id="overlay-inner">
+    <div class="overlay-image"><img id="overlay-img"></div>
+    <aside class="overlay-panel" id="overlay-panel"></aside>
+  </div>
+  <div class="hint">click outside, or press Esc, to close</div>
 </div>
 
 <script>
@@ -843,11 +1012,11 @@ function renderResults(j) {
   $("#results-meta").textContent =
     `${total} picks · ${j.elapsed.toFixed(1)}s` +
     (j.xmp_written ? ` · ${j.xmp_written} XMP written` : "");
-  grid.innerHTML = j.picks.map(p => {
+  grid.innerHTML = j.picks.map((p, i) => {
     const stars = "★".repeat(starsFromRank(p.rank, total)) + "☆".repeat(5 - starsFromRank(p.rank, total));
     const score = p.aesthetic !== null ? p.aesthetic.toFixed(2) : "—";
     return `
-      <div class="card" data-sha="${p.sha}" data-display="${escapeHtml(p.display)}">
+      <div class="card" data-idx="${i}">
         <div class="img-wrap">
           <img loading="lazy" src="/api/thumb/${p.sha}" alt="${escapeHtml(p.display)}">
           <div class="rank">#${p.rank}</div>
@@ -863,18 +1032,152 @@ function renderResults(j) {
       </div>`;
   }).join("");
   grid.querySelectorAll(".card").forEach(card => {
-    card.addEventListener("click", () => openHero(card.dataset.sha, card.dataset.display));
+    const idx = parseInt(card.dataset.idx);
+    card.addEventListener("click", () => openHero(j.picks[idx]));
   });
 }
 
-function openHero(sha, display) {
-  $("#overlay-img").src = "/api/preview/" + sha;
-  $("#overlay-info").textContent = display;
+async function openHero(pick) {
+  $("#overlay-img").src = "/api/preview/" + pick.sha;
+  $("#overlay-panel").innerHTML = renderPanelLoading(pick);
   $("#overlay").classList.add("show");
+  try {
+    const res = await fetch("/api/details/" + pick.sha);
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    $("#overlay-panel").innerHTML = renderPanel(pick, d);
+  } catch (e) {
+    $("#overlay-panel").innerHTML = renderPanelLoading(pick) +
+      `<p class="empty">details fetch failed: ${escapeHtml(e.message)}</p>`;
+  }
 }
-$("#overlay-close").addEventListener("click", () => $("#overlay").classList.remove("show"));
+
+function bar(label, value, max=10) {
+  if (value === null || value === undefined) return "";
+  const pct = Math.max(0, Math.min(100, (value / max) * 100));
+  return `<div class="bar-row"><span class="label">${label}</span>` +
+         `<span class="meter"><div style="width:${pct}%"></div></span>` +
+         `<span class="val">${Number(value).toFixed(1)}</span></div>`;
+}
+
+function renderPanelLoading(pick) {
+  const total = lastResults ? lastResults.picks.length : 10;
+  const stars = "★".repeat(starsFromRank(pick.rank, total)) + "☆".repeat(5 - starsFromRank(pick.rank, total));
+  const score = pick.aesthetic !== null ? pick.aesthetic.toFixed(2) : "—";
+  return `
+    <div class="head">
+      <span class="rank">#${pick.rank}</span>
+      <span class="stars">${stars}</span>
+      <span class="stem">${escapeHtml(pick.display)}</span>
+    </div>
+    <h3>Why it was picked</h3>
+    <dl>
+      <dt>aesthetic</dt><dd>${score} <span style="color:var(--dim);font-size:.7rem">(${escapeHtml(pick.aesthetic_source || "—")})</span></dd>
+      <dt>sharpness</dt><dd>${pick.sharpness.toFixed(0)}</dd>
+      <dt>scene</dt><dd>${escapeHtml(pick.scene_preset || "—")}</dd>
+      <dt>file kind</dt><dd>${escapeHtml(pick.kind)}</dd>
+    </dl>
+    <p class="empty">loading metrics + EXIF…</p>`;
+}
+
+function renderPanel(pick, d) {
+  const total = lastResults ? lastResults.picks.length : 10;
+  const stars = "★".repeat(starsFromRank(pick.rank, total)) + "☆".repeat(5 - starsFromRank(pick.rank, total));
+  const score = pick.aesthetic !== null ? pick.aesthetic.toFixed(2) : "—";
+
+  // Quality bars from the cv2 metrics dict.
+  const m = d.metrics || {};
+  const dims = ["exposure", "contrast", "color_harmony", "composition", "leading_lines"];
+  const bars = dims.map(k => bar(k.replace("_", " "), m[k])).join("");
+
+  // Flags from exposure analysis.
+  const flagList = [];
+  if (m.is_silhouette) flagList.push('<span class="flag off">silhouette</span>');
+  if (m.shadow_clipped) flagList.push('<span class="flag on">shadows clipped</span>');
+  if (m.highlight_clipped) flagList.push('<span class="flag on">highlights clipped</span>');
+  if (m.is_monochrome) flagList.push('<span class="flag off">monochrome</span>');
+  const flags = flagList.length ? `<div style="margin:.4rem 0">${flagList.join("")}</div>` : "";
+
+  // Extra numeric fields below the bars.
+  const extra = [];
+  if (m.noise !== undefined) extra.push(["noise", m.noise.toFixed(1) + " σ"]);
+  if (m.dynamic_range !== undefined) extra.push(["dynamic range", m.dynamic_range.toFixed(1) + " stops"]);
+  if (m.mean_luminance !== undefined) extra.push(["mean luminance", m.mean_luminance.toFixed(2)]);
+  const extraHtml = extra.length
+    ? `<dl>${extra.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`
+    : "";
+
+  // Face / eyes block.
+  let faceBlock = "";
+  if (d.face_count) {
+    const faceRows = [
+      ["faces detected", d.face_count],
+      ["face sharpness", d.face_sharpness !== null && d.face_sharpness !== undefined ? d.face_sharpness.toFixed(0) : "—"],
+    ];
+    if (d.eyes) {
+      faceRows.push(["min EAR", d.eyes.ear_min !== undefined ? d.eyes.ear_min.toFixed(3) : "—"]);
+      faceRows.push(["blink detected", d.eyes.any_blink ? "yes" : "no"]);
+    }
+    faceBlock = `<h3>Faces</h3><dl>${faceRows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+  }
+
+  // EXIF block.
+  const exif = d.exif || {};
+  const exifPairs = [];
+  if (exif.camera_make || exif.camera_model) {
+    exifPairs.push(["camera", [exif.camera_make, exif.camera_model].filter(Boolean).join(" ")]);
+  }
+  if (exif.lens_model) exifPairs.push(["lens", exif.lens_model]);
+  if (exif.aperture) exifPairs.push(["aperture", exif.aperture]);
+  if (exif.shutter) exifPairs.push(["shutter", exif.shutter]);
+  if (exif.iso) exifPairs.push(["ISO", exif.iso]);
+  if (exif.focal_length_mm) exifPairs.push(["focal length", exif.focal_length_mm + (exif.focal_length_35mm ? ` (≈${exif.focal_length_35mm}mm FF)` : "")]);
+  if (exif.exposure_bias !== undefined && exif.exposure_bias !== null) exifPairs.push(["exposure comp", `${exif.exposure_bias > 0 ? "+" : ""}${exif.exposure_bias.toFixed(1)} EV`]);
+  if (exif.date_taken) exifPairs.push(["taken", exif.date_taken]);
+  if (exif.metering_mode) exifPairs.push(["metering", exif.metering_mode]);
+  if (exif.flash) exifPairs.push(["flash", exif.flash]);
+  if (exif.pixel_x && exif.pixel_y) exifPairs.push(["dimensions", `${exif.pixel_x} × ${exif.pixel_y}`]);
+
+  const exifHtml = exifPairs.length
+    ? `<dl>${exifPairs.map(([k,v]) => `<dt>${k}</dt><dd>${escapeHtml(String(v))}</dd>`).join("")}</dl>`
+    : '<p class="empty">no EXIF data (or non-JPEG source)</p>';
+
+  return `
+    <div class="head">
+      <span class="rank">#${pick.rank}</span>
+      <span class="stars">${stars}</span>
+      <span class="stem">${escapeHtml(pick.display)}</span>
+    </div>
+    <h3>Why it was picked</h3>
+    <dl>
+      <dt>aesthetic</dt><dd>${score} <span style="color:var(--dim);font-size:.7rem">(${escapeHtml(pick.aesthetic_source || "—")})</span></dd>
+      <dt>sharpness</dt><dd>${pick.sharpness.toFixed(0)} (global), ${d.face_sharpness ? d.face_sharpness.toFixed(0) + " face" : "no face"}</dd>
+      <dt>scene</dt><dd>${escapeHtml(pick.scene_preset || "—")}</dd>
+      <dt>file</dt><dd>${escapeHtml(pick.kind)}</dd>
+    </dl>
+    <h3>Quality dims</h3>
+    ${bars || '<p class="empty">metrics not computed</p>'}
+    ${flags}
+    ${extraHtml}
+    ${faceBlock}
+    <h3>EXIF</h3>
+    ${exifHtml}
+    <h3>Source</h3>
+    <dl>
+      <dt>path</dt><dd style="font-size:.7rem">${escapeHtml(d.src_path)}</dd>
+      <dt>sha</dt><dd style="font-size:.7rem">${escapeHtml(pick.sha.slice(0, 16))}…</dd>
+    </dl>`;
+}
+
+function closeOverlay() { $("#overlay").classList.remove("show"); }
+
+$("#overlay-close").addEventListener("click", closeOverlay);
+// Click on the overlay backdrop closes; clicks inside .overlay-inner don't.
+$("#overlay").addEventListener("click", e => {
+  if (e.target === $("#overlay")) closeOverlay();
+});
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") $("#overlay").classList.remove("show");
+  if (e.key === "Escape") closeOverlay();
 });
 
 $("#btn-rerun").addEventListener("click", () => show("welcome"));
