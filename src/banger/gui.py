@@ -95,6 +95,15 @@ _jobs_lock = threading.Lock()
 _recent_folders: list[str] = []
 _label_subprocesses: dict[str, dict] = {}  # input_dir -> {"port": int, "proc": subprocess.Popen}
 
+# Auto-setup status, polled by the SPA splash. Updated by _auto_setup as it
+# walks through scene fit / mediapipe install. The splash overlay polls
+# /api/setup-status and disappears once phase == "ready".
+_setup_state: dict = {
+    "phase": "starting",   # starting | clip | scenes | mediapipe | ready
+    "message": "starting up…",
+    "started_at": time.monotonic(),
+}
+
 
 def _record_folder(folder: Path) -> None:
     """Most-recent-first list of folders the user has run on. Bounded at 6."""
@@ -640,6 +649,20 @@ def build_app(window_holder: dict | None = None) -> Flask:
 
         return jsonify({"url": f"http://127.0.0.1:{free_port}/", "reused": False})
 
+    @app.route("/api/setup-status")
+    def setup_status():
+        # eyes_mod.mediapipe_available() does a fresh import attempt so it
+        # picks up a freshly-installed package without process restart.
+        if _setup_state["phase"] == "mediapipe" and eyes_mod.mediapipe_available():
+            _setup_state["phase"] = "ready"
+            _setup_state["message"] = "ready"
+        return jsonify({
+            **_setup_state,
+            "elapsed": round(time.monotonic() - _setup_state["started_at"], 1),
+            "mediapipe": eyes_mod.mediapipe_available(),
+            "scene_model": scene_kmeans.exists(),
+        })
+
     @app.route("/api/state")
     def gui_state():
         """One-shot snapshot the UI needs at boot: defaults, head present, etc."""
@@ -693,17 +716,19 @@ def serve(port: int = 8765, open_window: bool = True) -> None:
 
 
 def _auto_setup() -> None:
-    """Best-effort background bootstrap. Runs once per GUI launch:
+    """Background bootstrap. Updates _setup_state so the GUI splash shows
+    progress. Three phases:
 
-    1. If scene KMeans isn't fit and we have enough cached embeddings,
-       fit it silently. Fast (~5s on 1k embeddings), no network.
-    2. If mediapipe isn't installed, pip-install it. Enables the eye-gate
-       on the next run. Quiet on success, logged on failure. Doesn't block
-       anything if the install fails (the gate has its own fallback path).
+    1. scenes: fit KMeans on cached embeddings if not already fit
+    2. mediapipe: spawn detached pip install if not installed (survives GUI
+       close), poll for completion by trying the import periodically
+    3. ready: splash dismisses
     """
     import subprocess
     import sys
 
+    _setup_state["phase"] = "scenes"
+    _setup_state["message"] = "Fitting scene clusters…"
     try:
         if not scene_kmeans.exists():
             stats = state.cache_stats()
@@ -716,35 +741,56 @@ def _auto_setup() -> None:
     except Exception as e:
         log.warning("auto-setup: scene fit failed: %s", e)
 
-    if not eyes_mod.mediapipe_available():
-        marker = state.STATE_DIR / "mediapipe_install_attempted"
-        if marker.exists():
-            log.info("auto-setup: mediapipe install previously failed, skipping retry")
-        else:
-            log.info("auto-setup: spawning detached mediapipe install (~30-60s)…")
-            try:
-                state.STATE_DIR.mkdir(parents=True, exist_ok=True)
-                marker.touch()  # set first so we don't retry on every crash-during-install
-                log_path = state.STATE_DIR / "mediapipe_install.log"
-                creationflags = 0
-                if os.name == "nt":
-                    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP so the pip
-                    # process survives the GUI window closing.
-                    creationflags = 0x00000008 | 0x00000200
-                with open(log_path, "w", encoding="utf-8") as fp:
-                    subprocess.Popen(
-                        [sys.executable, "-m", "pip", "install", "mediapipe"],
-                        stdout=fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                        creationflags=creationflags,
-                        close_fds=True,
-                    )
-                log.info(
-                    "auto-setup: mediapipe install detached (log: %s). "
-                    "Restart GUI when it finishes to enable --eye-gate.",
-                    log_path,
-                )
-            except OSError as e:
-                log.warning("auto-setup: mediapipe install spawn failed: %s", e)
+    if eyes_mod.mediapipe_available():
+        _setup_state["phase"] = "ready"
+        _setup_state["message"] = "ready"
+        return
+
+    marker = state.STATE_DIR / "mediapipe_install_attempted"
+    if marker.exists() and not eyes_mod.mediapipe_available():
+        # Previous install attempt failed; don't loop. User can delete the
+        # marker if they want to retry.
+        _setup_state["phase"] = "ready"
+        _setup_state["message"] = (
+            "mediapipe install previously failed; --eye-gate disabled. "
+            "Delete ~/.local/share/banger-pipeline/mediapipe_install_attempted to retry."
+        )
+        return
+
+    _setup_state["phase"] = "mediapipe"
+    _setup_state["message"] = "Installing mediapipe (one-time, ~30-60s)…"
+    try:
+        state.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        log_path = state.STATE_DIR / "mediapipe_install.log"
+        creationflags = 0
+        if os.name == "nt":
+            creationflags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        with open(log_path, "w", encoding="utf-8") as fp:
+            subprocess.Popen(
+                [sys.executable, "-m", "pip", "install", "mediapipe"],
+                stdout=fp, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                creationflags=creationflags, close_fds=True,
+            )
+        log.info("auto-setup: mediapipe install detached (log: %s)", log_path)
+    except OSError as e:
+        log.warning("auto-setup: mediapipe install spawn failed: %s", e)
+        _setup_state["phase"] = "ready"
+        _setup_state["message"] = f"mediapipe install spawn failed: {e}"
+        return
+
+    # Poll the import every 2s. Once mediapipe lands in site-packages, the
+    # fresh import attempt in mediapipe_available() succeeds and we flip.
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        time.sleep(2.0)
+        if eyes_mod.mediapipe_available():
+            _setup_state["phase"] = "ready"
+            _setup_state["message"] = "mediapipe installed"
+            log.info("auto-setup: mediapipe install completed")
+            return
+    _setup_state["phase"] = "ready"
+    _setup_state["message"] = "mediapipe install still running (check log later)"
 
     # Wait briefly for the Flask socket so the webview's first nav doesn't
     # race-fail. 200 ms is plenty on a modern machine; on a slow one we
@@ -900,6 +946,16 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .overlay-panel .empty { color: var(--dim); font-style: italic; font-size: .75rem; }
   .overlay .close { position: absolute; top: 1rem; right: 1rem; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); padding: .35rem .8rem; border-radius: 4px; cursor: pointer; z-index: 1; }
   .overlay .hint { position: absolute; bottom: 1rem; left: 50%; transform: translateX(-50%); color: var(--dim); font-size: .7rem; pointer-events: none; }
+
+  /* setup splash (full-screen blocker during auto-setup) */
+  .splash { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 100; flex-direction: column; gap: 1.2rem; }
+  .splash.show { display: flex; }
+  .splash h2 { margin: 0; font-weight: 500; font-size: 1.3rem; letter-spacing: .04em; }
+  .splash .msg { color: var(--dim); font-size: .85rem; max-width: 480px; text-align: center; }
+  .splash .bar { width: 360px; height: 4px; background: var(--bg2); border-radius: 2px; overflow: hidden; position: relative; }
+  .splash .bar > div { height: 100%; background: var(--accent); width: 30%; position: absolute; left: -30%; animation: slide 1.4s ease-in-out infinite; }
+  .splash .meta { color: var(--dim); font-size: .7rem; font-variant-numeric: tabular-nums; }
+  @keyframes slide { 0% { left: -30%; } 100% { left: 100%; } }
 </style>
 </head>
 <body>
@@ -997,6 +1053,13 @@ _SPA_TEMPLATE = r"""<!doctype html>
 </main>
 
 <div class="toast" id="toast"></div>
+
+<div class="splash" id="splash">
+  <h2>banger</h2>
+  <div class="msg" id="splash-msg">starting up…</div>
+  <div class="bar"><div></div></div>
+  <div class="meta" id="splash-meta"></div>
+</div>
 
 <div class="overlay" id="overlay">
   <button class="close" id="overlay-close">close</button>
@@ -1362,9 +1425,38 @@ async function loadState() {
   }
 }
 
+async function pollSetup() {
+  try {
+    const res = await fetch("/api/setup-status");
+    if (!res.ok) throw new Error(await res.text());
+    const s = await res.json();
+    $("#splash-msg").textContent = s.message;
+    $("#splash-meta").textContent = `${s.phase} · ${s.elapsed.toFixed(1)}s`;
+    if (s.phase === "ready") {
+      $("#splash").classList.remove("show");
+      loadState();  // refresh badges now that scenes/mediapipe may have flipped
+      return;
+    }
+  } catch (e) { console.error("setup poll:", e); }
+  setTimeout(pollSetup, 700);
+}
+
+async function bootstrap() {
+  // Initial setup-status fetch decides whether to show the splash.
+  try {
+    const res = await fetch("/api/setup-status");
+    const s = await res.json();
+    if (s.phase !== "ready") {
+      $("#splash").classList.add("show");
+      pollSetup();
+    }
+  } catch (e) { /* server may still be coming up */ }
+}
+
 loadRecent();
 loadState();
 show("welcome");
+bootstrap();
 </script>
 
 </body>
