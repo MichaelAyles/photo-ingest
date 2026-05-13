@@ -40,8 +40,8 @@ import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from banger import (
-    aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
-    face_names, library, tags as tags_mod,
+    aesthetic, dedup, editor as editor_mod, eyes as eyes_mod, face,
+    face_id as face_id_mod, face_names, library, tags as tags_mod,
 )
 from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
@@ -463,6 +463,50 @@ def _extract_exif(path: Path) -> dict:
     return safe
 
 
+def _subfolder_for(path: Path, scheme: str) -> str:
+    """Compute the destination subfolder for an import file.
+
+    by_date: YYYY-MM-DD pulled from EXIF DateTimeOriginal (JPEG) or file mtime.
+    by_camera: camera model slug (slashes stripped), or "unknown".
+    flat: empty string (everything goes in the destination root).
+    """
+    if scheme == "flat":
+        return ""
+    if scheme == "by_camera":
+        if path.suffix.lower() in (".jpg", ".jpeg"):
+            try:
+                from PIL import Image
+                with Image.open(path) as im:
+                    raw = im.getexif() or {}
+                model = raw.get(272)
+                if isinstance(model, bytes):
+                    model = model.decode("utf-8", errors="replace").strip("\x00")
+                if isinstance(model, str) and model.strip():
+                    return model.strip().replace("/", "_").replace("\\", "_")
+            except Exception:
+                pass
+        return "unknown"
+    # default: by_date
+    if path.suffix.lower() in (".jpg", ".jpeg"):
+        try:
+            from PIL import Image
+            with Image.open(path) as im:
+                raw = im.getexif() or {}
+            dt = raw.get(36867)
+            if isinstance(dt, str):
+                from datetime import datetime as _dt
+                d = _dt.strptime(dt, "%Y:%m:%d %H:%M:%S")
+                return d.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # Fallback to mtime.
+    try:
+        from datetime import datetime as _dt
+        return _dt.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d")
+    except OSError:
+        return "unknown-date"
+
+
 def _encode_preview_jpeg(preview_bgr) -> bytes:
     import cv2
 
@@ -516,6 +560,148 @@ def build_app(window_holder: dict | None = None) -> Flask:
     @app.route("/gui")
     def root():
         return render_template_string(_SPA_TEMPLATE)
+
+    @app.route("/api/develop/<sha>", methods=["GET"])
+    def develop_get(sha):
+        p = editor_mod.load_params(sha)
+        return jsonify({
+            "params": editor_mod.to_dict(p),
+            "has_edits": editor_mod.has_edits(sha),
+        })
+
+    @app.route("/api/develop/<sha>", methods=["POST"])
+    def develop_save(sha):
+        data = request.get_json(silent=True) or {}
+        p = editor_mod.from_dict(data.get("params") or {})
+        editor_mod.save_params(sha, p)
+        return jsonify({"saved": True, "params": editor_mod.to_dict(p)})
+
+    @app.route("/api/develop/<sha>/render")
+    def develop_render(sha):
+        """Render the preview-size image with the given params, return JPEG.
+
+        Params come via query string so the SPA can fire a fast GET on each
+        slider move. We always render from the 1024px preview cache; the
+        full-size export endpoint is separate.
+        """
+        from flask import Response
+        import cv2
+
+        params_dict = {}
+        for k in editor_mod.DevelopParams.__dataclass_fields__:
+            v = request.args.get(k)
+            if v is None:
+                continue
+            if k == "crop":
+                # crop comes as "x,y,w,h" normalised.
+                try:
+                    parts = [float(x) for x in v.split(",")]
+                    if len(parts) == 4:
+                        params_dict["crop"] = {"x": parts[0], "y": parts[1],
+                                              "w": parts[2], "h": parts[3]}
+                except ValueError:
+                    pass
+            else:
+                try:
+                    params_dict[k] = float(v)
+                except ValueError:
+                    pass
+
+        params = editor_mod.from_dict(params_dict)
+        # Reuse cached preview if present; else load + cache.
+        preview_path = state.preview_jpeg_path(sha)
+        if preview_path.exists():
+            img = cv2.imread(str(preview_path), cv2.IMREAD_COLOR)
+        else:
+            src = _resolve_path(sha)
+            if src is None:
+                return ("unknown sha", 404)
+            img = load_preview(src)
+            state.cache_preview_jpeg(sha, _encode_preview_jpeg(img))
+        out = editor_mod.apply_develop(img, params)
+        ok, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return ("encode failed", 500)
+        return Response(buf.tobytes(), mimetype="image/jpeg")
+
+    @app.route("/api/develop/<sha>/export", methods=["POST"])
+    def develop_export(sha):
+        """Render full-res and write a JPEG next to the source (or at `path`)."""
+        data = request.get_json(silent=True) or {}
+        src = _resolve_path(sha)
+        if src is None:
+            return jsonify({"error": "unknown sha"}), 404
+        params = editor_mod.from_dict(data.get("params") or {})
+        # Persist the params so reopening shows the same edits.
+        editor_mod.save_params(sha, params)
+        dst_raw = (data.get("path") or "").strip()
+        dst = Path(dst_raw).expanduser() if dst_raw else editor_mod.default_export_path(src)
+        try:
+            out = editor_mod.export_jpeg(src, params, dst)
+        except Exception as e:
+            log.exception("export failed")
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"path": str(out)})
+
+    @app.route("/api/import", methods=["POST"])
+    def import_files():
+        """Copy photos from a source directory into a destination, organised
+        by date / camera / flat, then add the destination to the library and
+        kick a scan.
+
+        For now this runs synchronously since most imports are small. A
+        background-job version with progress would come if the typical
+        import grows past ~1k files.
+        """
+        import shutil
+        from datetime import datetime as _dt
+
+        data = request.get_json(silent=True) or {}
+        src_raw = (data.get("source") or "").strip()
+        dst_raw = (data.get("destination") or "").strip()
+        scheme = (data.get("scheme") or "by_date").strip()
+        if not src_raw or not dst_raw:
+            return jsonify({"error": "source and destination required"}), 400
+        src = Path(src_raw).expanduser()
+        dst = Path(dst_raw).expanduser()
+        if not src.is_dir():
+            return jsonify({"error": f"not a folder: {src}"}), 400
+        dst.mkdir(parents=True, exist_ok=True)
+
+        from banger.frames import discover_frames as _discover
+        frames = _discover(src, recursive=True)
+        copied = 0
+        skipped = 0
+        for f in frames:
+            srcp = f.classify_path
+            subfolder = _subfolder_for(srcp, scheme)
+            target_dir = dst / subfolder if subfolder else dst
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / srcp.name
+            if target.exists() and target.stat().st_size == srcp.stat().st_size:
+                skipped += 1
+                continue
+            shutil.copy2(srcp, target)
+            # Also copy the sibling RAW or JPEG if present.
+            other = f.raw if f.classify_path == f.jpeg else f.jpeg
+            if other is not None and other != srcp and other.exists():
+                shutil.copy2(other, target_dir / other.name)
+            copied += 1
+
+        root = library.add_root(dst)
+        # Kick a scan (synchronous so the response reflects the new frames).
+        progress = library.ScanProgress(
+            root_id=root.id, root_path=root.path, started_at=time.monotonic()
+        )
+        with _scan_lock:
+            _scan_progress[root.id] = progress
+        library.scan_root(root.id, progress=progress)
+        return jsonify({
+            "copied": copied,
+            "skipped": skipped,
+            "root_id": root.id,
+            "scan": progress.to_view(),
+        })
 
     @app.route("/api/library/roots", methods=["GET"])
     def library_roots():
@@ -1384,6 +1570,49 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .lib-cell .lib-badge.scored { color: var(--green); }
   .lib-cell .lib-badge.face { color: #c9d; }
 
+  .lib-onboarding { grid-column: 1 / -1; max-width: 560px; margin: 4rem auto; text-align: center; padding: 2rem 1rem; }
+  .lib-onboarding h2 { font-weight: 500; margin: 0 0 .6rem; font-size: 1.3rem; }
+  .lib-onboarding p { color: var(--dim); line-height: 1.5; margin: 0 0 1.6rem; font-size: .85rem; }
+  .onboarding-actions { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; }
+  .onboarding-actions button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 6px; padding: 1rem 1.5rem; font-size: .9rem; cursor: pointer; transition: border-color .12s, background .12s; }
+  .onboarding-actions button:hover { border-color: var(--accent); background: var(--bg2); }
+
+  /* editor */
+  .ed-shell { display: flex; height: 100%; min-height: 0; }
+  .ed-canvas { flex: 1 1 auto; background: #000; display: flex; align-items: center; justify-content: center; min-width: 0; position: relative; padding: 1rem; }
+  .ed-canvas img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .ed-info { position: absolute; top: 1rem; left: 1rem; color: var(--dim); font-size: .75rem; font-family: ui-monospace, monospace; background: rgba(0,0,0,.6); padding: .25rem .55rem; border-radius: 4px; }
+  .ed-sidebar { flex: 0 0 320px; background: #0a0a0a; border-left: 1px solid var(--line); overflow-y: auto; }
+  .ed-toolbar { position: sticky; top: 0; background: #0a0a0a; padding: .6rem .8rem; border-bottom: 1px solid var(--line); display: flex; gap: .3rem; flex-wrap: wrap; z-index: 2; }
+  .ed-toolbar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .7rem; font-size: .75rem; cursor: pointer; }
+  .ed-toolbar button:hover { border-color: var(--accent); }
+  .ed-toolbar button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
+  .ed-toolbar button.muted { background: transparent; color: var(--dim); }
+  .ed-section { padding: .8rem 1rem; border-bottom: 1px solid var(--line); }
+  .ed-section h3 { margin: 0 0 .6rem; font-size: .65rem; color: var(--dim); font-weight: 500; text-transform: uppercase; letter-spacing: .12em; }
+  .slider-row { display: grid; grid-template-columns: 90px 1fr 40px; gap: .5rem; align-items: center; font-size: .8rem; margin: .3rem 0; }
+  .slider-row label { color: #bbb; font-size: .75rem; }
+  .slider-row .val { text-align: right; color: var(--fg); font-family: ui-monospace, monospace; font-size: .72rem; }
+  .slider-row input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  /* import modal */
+  .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 90; }
+  .modal { background: var(--bg2); border: 1px solid var(--line); border-radius: 8px; padding: 1.4rem 1.6rem; max-width: 520px; width: 90%; }
+  .modal h2 { margin: 0 0 .4rem; font-weight: 500; font-size: 1.1rem; }
+  .modal-hint { color: var(--dim); font-size: .8rem; line-height: 1.45; margin: 0 0 1rem; }
+  .modal-row { display: flex; flex-direction: column; gap: .25rem; margin: .6rem 0; }
+  .modal-row > label { color: var(--dim); font-size: .7rem; text-transform: uppercase; letter-spacing: .08em; }
+  .modal-input { display: flex; gap: .35rem; }
+  .modal-input input { flex: 1 1 auto; background: var(--bg3); border: 1px solid var(--line); color: var(--fg); border-radius: 4px; padding: .35rem .5rem; font: inherit; font-size: .8rem; font-family: ui-monospace, monospace; }
+  .modal-input button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .7rem; font-size: .75rem; cursor: pointer; }
+  .modal-input button:hover { border-color: var(--accent); }
+  .modal select { background: var(--bg3); border: 1px solid var(--line); color: var(--fg); border-radius: 4px; padding: .35rem .5rem; font: inherit; font-size: .8rem; }
+  .modal-actions { display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem; }
+  .modal-actions button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .4rem 1rem; font-size: .8rem; cursor: pointer; }
+  .modal-actions button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
+  .modal-actions button.muted { color: var(--dim); }
+  .modal-status { color: var(--dim); font-size: .75rem; margin: .6rem 0 0; min-height: 1em; }
+
   /* setup splash (full-screen blocker during auto-setup) */
   .splash { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 100; flex-direction: column; gap: 1.2rem; }
   .splash.show { display: flex; }
@@ -1400,8 +1629,9 @@ _SPA_TEMPLATE = r"""<!doctype html>
 <header>
   <h1>banger</h1>
   <nav>
-    <button data-view="welcome" class="active">Welcome</button>
-    <button data-view="library">Library</button>
+    <button data-view="library" class="active">Library</button>
+    <button data-view="welcome">Quick run</button>
+    <button data-view="editor" id="nav-editor" style="display:none">Editor</button>
     <button data-view="running" id="nav-running" style="display:none">Running</button>
     <button data-view="results" id="nav-results" style="display:none">Results</button>
     <button data-view="label" id="nav-label" style="display:none">Label</button>
@@ -1411,7 +1641,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
 
 <main>
 
-<section class="view" id="view-welcome">
+<section class="view hidden" id="view-welcome">
   <div class="welcome-wrap">
     <h2>Pick a folder, get your bangers</h2>
     <p class="lead">Drop a folder of photos here, or click to browse. Banger scores them, dedups bursts, and shows you the top picks.</p>
@@ -1462,7 +1692,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
   <div class="grid" id="results-grid"></div>
 </section>
 
-<section class="view hidden" id="view-library" style="padding:0;display:none">
+<section class="view" id="view-library" style="padding:0">
   <div class="lib-shell">
     <aside class="lib-sidebar">
       <div class="lib-section">
@@ -1497,17 +1727,127 @@ _SPA_TEMPLATE = r"""<!doctype html>
       <div class="lib-toolbar">
         <h2 id="lib-title">Library</h2>
         <span class="lib-meta" id="lib-meta"></span>
-        <button id="lib-scan" style="margin-left:auto">Rescan</button>
+        <button id="lib-import" style="margin-left:auto">Import…</button>
+        <button id="lib-scan">Rescan</button>
         <button id="lib-score" class="primary">Score this view</button>
       </div>
       <div class="lib-grid" id="lib-grid">
-        <p class="empty" style="grid-column:1/-1;color:var(--dim);text-align:center;padding:3rem">
-          Add a watched folder on the left to get started.
-        </p>
+        <div class="lib-onboarding" id="lib-onboarding">
+          <h2>Welcome to your library</h2>
+          <p>Point banger at the folders you already keep your photos in, or pull them in from a camera / SD card. We'll index, score, tag, name faces, and let you edit; nothing leaves your machine.</p>
+          <div class="onboarding-actions">
+            <button id="onb-add-folder">📁 Open folder</button>
+            <button id="onb-import">📷 Import from device</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 </section>
+
+<section class="view hidden" id="view-editor" style="padding:0">
+  <div class="ed-shell">
+    <div class="ed-canvas">
+      <img id="ed-img" alt="">
+      <div class="ed-info" id="ed-info"></div>
+    </div>
+    <aside class="ed-sidebar">
+      <div class="ed-toolbar">
+        <button id="ed-back" title="Back to library">← Library</button>
+        <button id="ed-before-after" title="Hold to see original">Before/After</button>
+        <button id="ed-reset" class="muted">Reset</button>
+        <button id="ed-export" class="primary">Export…</button>
+      </div>
+      <div class="ed-section">
+        <h3>Light</h3>
+        <div class="slider-row" data-key="exposure">
+          <label>Exposure</label><span class="val">0</span>
+          <input type="range" min="-2" max="2" step="0.05" value="0">
+        </div>
+        <div class="slider-row" data-key="contrast">
+          <label>Contrast</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="highlights">
+          <label>Highlights</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="shadows">
+          <label>Shadows</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="whites">
+          <label>Whites</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="blacks">
+          <label>Blacks</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+      </div>
+      <div class="ed-section">
+        <h3>Colour</h3>
+        <div class="slider-row" data-key="saturation">
+          <label>Saturation</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="vibrance">
+          <label>Vibrance</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="temp">
+          <label>Temperature</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+        <div class="slider-row" data-key="tint">
+          <label>Tint</label><span class="val">0</span>
+          <input type="range" min="-100" max="100" step="1" value="0">
+        </div>
+      </div>
+      <div class="ed-section">
+        <h3>Geometry</h3>
+        <div class="slider-row" data-key="rotation">
+          <label>Rotation</label><span class="val">0°</span>
+          <input type="range" min="-15" max="15" step="0.1" value="0">
+        </div>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<div class="modal-backdrop" id="import-modal" style="display:none">
+  <div class="modal">
+    <h2>Import photos</h2>
+    <p class="modal-hint">Copies files from a source folder (or SD card) into a destination, organised the way you choose. The destination is added to your library and scanned automatically.</p>
+    <div class="modal-row">
+      <label>Source</label>
+      <div class="modal-input">
+        <input type="text" id="imp-source" placeholder="e.g. E:/DCIM/100MSDCF">
+        <button id="imp-pick-source">Browse…</button>
+      </div>
+    </div>
+    <div class="modal-row">
+      <label>Destination</label>
+      <div class="modal-input">
+        <input type="text" id="imp-dest" placeholder="e.g. C:/Users/you/Pictures/2026">
+        <button id="imp-pick-dest">Browse…</button>
+      </div>
+    </div>
+    <div class="modal-row">
+      <label>Organise as</label>
+      <select id="imp-scheme">
+        <option value="by_date">By date (YYYY-MM-DD/)</option>
+        <option value="by_camera">By camera</option>
+        <option value="flat">Flat (no subfolders)</option>
+      </select>
+    </div>
+    <div class="modal-actions">
+      <button id="imp-cancel" class="muted">Cancel</button>
+      <button id="imp-go" class="primary">Import</button>
+    </div>
+    <p class="modal-status" id="imp-status"></p>
+  </div>
+</div>
 
 <section class="view hidden" id="view-label" style="padding:0">
   <iframe id="label-frame" src="about:blank" style="width:100%;height:100%;border:0;background:#0c0c0c;display:block"></iframe>
@@ -1559,6 +1899,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
 
 <div class="overlay" id="overlay">
   <button class="close" id="overlay-close">close</button>
+  <button class="close" id="overlay-edit" style="right: 5.5rem">Edit ✎</button>
   <div class="overlay-inner" id="overlay-inner">
     <div class="overlay-image"><img id="overlay-img"></div>
     <aside class="overlay-panel" id="overlay-panel"></aside>
@@ -1939,6 +2280,17 @@ function renderPanel(pick, d) {
 function closeOverlay() { $("#overlay").classList.remove("show"); }
 
 $("#overlay-close").addEventListener("click", closeOverlay);
+$("#overlay-edit").addEventListener("click", () => {
+  const img = $("#overlay-img");
+  // Pull the sha from the preview URL we set when opening the overlay.
+  const m = img.src.match(/\/api\/preview\/([0-9a-f]+)/);
+  if (!m) return;
+  const sha = m[1];
+  const info = $("#overlay-info");
+  const display = info ? info.textContent : sha.slice(0, 12);
+  closeOverlay();
+  openEditor(sha, display);
+});
 // Click on the overlay backdrop closes; clicks inside .overlay-inner don't.
 $("#overlay").addEventListener("click", e => {
   if (e.target === $("#overlay")) closeOverlay();
@@ -2006,6 +2358,172 @@ async function loadRecent() {
   ul.innerHTML = data.folders.map(f => `<li data-path="${escapeHtml(f)}"><span>${escapeHtml(f)}</span><span class="go">↵ run</span></li>`).join("");
   ul.querySelectorAll("li[data-path]").forEach(li => li.addEventListener("click", () => startRun(li.dataset.path)));
 }
+
+// ===== Editor =====
+let edState = {
+  sha: null,
+  display: null,
+  params: null,
+  rendering: false,
+  pendingParams: null,  // last params asked for while a render was in-flight
+  renderTimer: null,
+};
+
+const ED_KEYS = ["exposure","contrast","highlights","shadows","whites","blacks",
+                 "saturation","vibrance","temp","tint","rotation"];
+
+function edDefaults() {
+  const p = {};
+  ED_KEYS.forEach(k => p[k] = 0);
+  p.crop = null;
+  return p;
+}
+
+async function openEditor(sha, display) {
+  edState.sha = sha;
+  edState.display = display;
+  $("#nav-editor").style.display = "";
+  $("#ed-info").textContent = display;
+  $("#ed-img").src = "/api/preview/" + sha;  // baseline shown while we fetch params
+  try {
+    const res = await fetch("/api/develop/" + sha);
+    const d = await res.json();
+    edState.params = {...edDefaults(), ...(d.params || {})};
+  } catch (e) {
+    edState.params = edDefaults();
+  }
+  applyParamsToSliders();
+  show("editor");
+  scheduleRender();
+}
+
+function applyParamsToSliders() {
+  document.querySelectorAll("#view-editor .slider-row").forEach(row => {
+    const key = row.dataset.key;
+    const input = row.querySelector("input[type=range]");
+    const val = row.querySelector(".val");
+    const v = edState.params[key] ?? 0;
+    input.value = v;
+    val.textContent = key === "rotation" ? `${v.toFixed(1)}°`
+                    : key === "exposure" ? v.toFixed(2)
+                    : v.toFixed(0);
+  });
+}
+
+function readSliders() {
+  const p = {};
+  document.querySelectorAll("#view-editor .slider-row").forEach(row => {
+    const key = row.dataset.key;
+    const input = row.querySelector("input[type=range]");
+    p[key] = parseFloat(input.value);
+  });
+  return p;
+}
+
+function paramsToQuery(p) {
+  const parts = [];
+  for (const k of ED_KEYS) {
+    if (p[k] !== undefined && p[k] !== 0) parts.push(`${k}=${p[k]}`);
+  }
+  if (p.crop) parts.push(`crop=${p.crop.x},${p.crop.y},${p.crop.w},${p.crop.h}`);
+  return parts.join("&");
+}
+
+function scheduleRender() {
+  if (!edState.sha) return;
+  if (edState.renderTimer) clearTimeout(edState.renderTimer);
+  edState.renderTimer = setTimeout(doRender, 80);
+}
+
+async function doRender() {
+  if (!edState.sha) return;
+  if (edState.rendering) {
+    edState.pendingParams = readSliders();
+    return;
+  }
+  edState.rendering = true;
+  try {
+    const p = readSliders();
+    edState.params = {...(edState.params || {}), ...p};
+    const q = paramsToQuery(p);
+    const url = `/api/develop/${edState.sha}/render${q ? '?' + q : ''}`;
+    // Preload into a temp image so we don't see a flash; swap on load.
+    await new Promise((resolve) => {
+      const im = new Image();
+      im.onload = () => { $("#ed-img").src = im.src; resolve(); };
+      im.onerror = () => resolve();
+      im.src = url;
+    });
+  } finally {
+    edState.rendering = false;
+    if (edState.pendingParams) {
+      edState.pendingParams = null;
+      scheduleRender();
+    }
+  }
+}
+
+document.querySelectorAll("#view-editor .slider-row input[type=range]").forEach(input => {
+  const row = input.closest(".slider-row");
+  const val = row.querySelector(".val");
+  const key = row.dataset.key;
+  input.addEventListener("input", () => {
+    const v = parseFloat(input.value);
+    val.textContent = key === "rotation" ? `${v.toFixed(1)}°`
+                    : key === "exposure" ? v.toFixed(2)
+                    : v.toFixed(0);
+    scheduleRender();
+  });
+});
+
+$("#ed-reset").addEventListener("click", () => {
+  edState.params = edDefaults();
+  applyParamsToSliders();
+  scheduleRender();
+});
+
+$("#ed-back").addEventListener("click", async () => {
+  // Auto-save the current params before leaving.
+  if (edState.sha && edState.params) {
+    try {
+      await fetch("/api/develop/" + edState.sha, {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({params: edState.params}),
+      });
+    } catch (e) { /* ignore, edits stay in memory */ }
+  }
+  edState.sha = null;
+  $("#nav-editor").style.display = "none";
+  show("library");
+});
+
+$("#ed-export").addEventListener("click", async () => {
+  if (!edState.sha) return;
+  $("#ed-export").disabled = true;
+  $("#ed-export").textContent = "Exporting…";
+  try {
+    const res = await fetch(`/api/develop/${edState.sha}/export`, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({params: edState.params}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    toast(`Exported to ${d.path}`, 3000);
+  } catch (e) {
+    toast("Export failed: " + e.message, 3000);
+  } finally {
+    $("#ed-export").disabled = false;
+    $("#ed-export").textContent = "Export…";
+  }
+});
+
+// Hold to see the original; release to see edited.
+const beforeAfterBtn = $("#ed-before-after");
+beforeAfterBtn.addEventListener("mousedown", () => {
+  if (edState.sha) $("#ed-img").src = "/api/preview/" + edState.sha;
+});
+beforeAfterBtn.addEventListener("mouseup", () => doRender());
+beforeAfterBtn.addEventListener("mouseleave", () => doRender());
 
 // ===== Library tab =====
 let libState = {
@@ -2117,7 +2635,15 @@ async function refreshLibraryGrid() {
   const grid = $("#lib-grid");
   const meta = $("#lib-meta");
   if (libState.activeRootId === null) {
-    grid.innerHTML = '<p class="empty" style="grid-column:1/-1;color:var(--dim);text-align:center;padding:3rem">Add a watched folder on the left to get started.</p>';
+    grid.innerHTML = `
+      <div class="lib-onboarding">
+        <h2>Welcome to your library</h2>
+        <p>Point banger at the folders you already keep your photos in, or pull them in from a camera / SD card. We'll index, score, tag, name faces, and let you edit; nothing leaves your machine.</p>
+        <div class="onboarding-actions">
+          <button onclick="document.getElementById('lib-add-root').click()">📁 Open folder</button>
+          <button onclick="openImporter()">📷 Import from device</button>
+        </div>
+      </div>`;
     meta.textContent = "";
     return;
   }
@@ -2157,8 +2683,6 @@ async function refreshLibraryGrid() {
       const sha = cell.dataset.sha;
       const display = cell.dataset.display;
       cell.addEventListener("click", () => {
-        // Synthesise a pick-shaped object so the existing openHero / detail
-        // overlay code works unchanged.
         const pick = {
           sha, rank: 0, stem: display.split("/").pop().replace(/\.[^.]+$/, ""),
           subdir: display.includes("/") ? display.substring(0, display.lastIndexOf("/")) : "",
@@ -2167,12 +2691,58 @@ async function refreshLibraryGrid() {
         };
         openHero(pick);
       });
+      // Double-click jumps straight to the editor, skipping the previewer.
+      cell.addEventListener("dblclick", () => openEditor(sha, display));
     });
   } catch (e) {
     console.error("grid:", e);
     meta.textContent = "load failed";
     grid.innerHTML = `<p class="empty" style="grid-column:1/-1;color:var(--red);text-align:center;padding:3rem">${escapeHtml(e.message)}</p>`;
   }
+}
+
+$("#lib-import").addEventListener("click", () => openImporter());
+$("#imp-cancel").addEventListener("click", () => $("#import-modal").style.display = "none");
+$("#imp-pick-source").addEventListener("click", async () => {
+  const res = await fetch("/api/folder-pick", {method: "POST"});
+  const d = await res.json();
+  if (d.path) $("#imp-source").value = d.path;
+});
+$("#imp-pick-dest").addEventListener("click", async () => {
+  const res = await fetch("/api/folder-pick", {method: "POST"});
+  const d = await res.json();
+  if (d.path) $("#imp-dest").value = d.path;
+});
+$("#imp-go").addEventListener("click", async () => {
+  const source = $("#imp-source").value.trim();
+  const destination = $("#imp-dest").value.trim();
+  const scheme = $("#imp-scheme").value;
+  if (!source || !destination) { $("#imp-status").textContent = "source and destination required"; return; }
+  $("#imp-status").textContent = "Copying… (this may take a while)";
+  $("#imp-go").disabled = true;
+  try {
+    const res = await fetch("/api/import", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({source, destination, scheme}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    $("#imp-status").textContent = `Imported ${d.copied}, skipped ${d.skipped} duplicates. Scanned: ${d.scan.indexed_new} new frames.`;
+    libState.activeRootId = d.root_id;
+    setTimeout(() => {
+      $("#import-modal").style.display = "none";
+      loadLibrary();
+    }, 1500);
+  } catch (e) {
+    $("#imp-status").textContent = "Failed: " + e.message;
+  } finally {
+    $("#imp-go").disabled = false;
+  }
+});
+
+function openImporter() {
+  $("#imp-status").textContent = "";
+  $("#import-modal").style.display = "flex";
 }
 
 $("#lib-add-root").addEventListener("click", async () => {
@@ -2380,7 +2950,8 @@ async function bootstrap() {
 
 loadRecent();
 loadState();
-show("welcome");
+loadLibrary();
+show("library");
 bootstrap();
 </script>
 
