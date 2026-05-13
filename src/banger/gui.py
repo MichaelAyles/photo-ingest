@@ -41,7 +41,8 @@ from flask import Flask, jsonify, render_template_string, request, send_file
 
 from banger import (
     aesthetic, dedup, editor as editor_mod, eyes as eyes_mod, face,
-    face_id as face_id_mod, face_names, library, tags as tags_mod,
+    face_id as face_id_mod, face_names, library, tagger as tagger_mod,
+    tags as tags_mod,
 )
 from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
@@ -750,8 +751,23 @@ def build_app(window_holder: dict | None = None) -> Flask:
                 library.scan_root(root_id, progress=progress)
             except Exception as e:
                 log.exception("scan failed: %s", e)
+            # Kick the tagger so newly-indexed frames get embeddings + tags
+            # without the user clicking anything. Idempotent: re-runs on
+            # already-tagged frames are quick skips.
+            try:
+                tagger_mod.start()
+            except Exception as e:
+                log.warning("tagger auto-start failed: %s", e)
         threading.Thread(target=_go, daemon=True).start()
         return jsonify({"status": "started", **progress.to_view()})
+
+    @app.route("/api/tagger/start", methods=["POST"])
+    def tagger_start():
+        return jsonify(tagger_mod.start().to_view())
+
+    @app.route("/api/tagger/status")
+    def tagger_status():
+        return jsonify(tagger_mod.status().to_view())
 
     @app.route("/api/library/scan-status/<int:root_id>")
     def library_scan_status(root_id):
@@ -786,6 +802,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
         offset = request.args.get("offset", type=int, default=0)
         face_name = request.args.get("face") or None
         min_score = request.args.get("min_score", type=int)
+        q = (request.args.get("q") or "").strip().lower() or None
 
         rows = library.query_frames(
             root_id=root_id, subdir=subdir, camera=camera,
@@ -814,6 +831,18 @@ def build_app(window_holder: dict | None = None) -> Flask:
                     continue
             if min_score is not None and (label is None or label < min_score):
                 continue
+            if q is not None:
+                # Search across stem, rel_path, camera, and tags. Cheap
+                # substring match; not BM25 but good enough for a 50k-frame
+                # library where the user already has root+camera filters.
+                blob_parts = [r.stem.lower(), r.rel_path.lower()]
+                if r.camera_model:
+                    blob_parts.append(r.camera_model.lower())
+                for t in (meta.get("tags") or []):
+                    if isinstance(t, (list, tuple)) and t:
+                        blob_parts.append(str(t[0]).lower())
+                if q not in " | ".join(blob_parts):
+                    continue
             out.append({
                 **r.to_view(),
                 "label": label,
@@ -1551,6 +1580,8 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .lib-add button:hover { color: var(--accent); border-color: var(--accent); }
   .lib-filter-row { display: flex; justify-content: space-between; align-items: center; gap: .4rem; font-size: .75rem; color: var(--dim); margin: .25rem 0; }
   .lib-filter-row select { background: var(--bg2); border: 1px solid var(--line); color: var(--fg); border-radius: 3px; padding: 2px 5px; font: inherit; font-size: .75rem; flex: 1 1 auto; max-width: 140px; }
+  #lib-search { width: 100%; background: var(--bg2); border: 1px solid var(--line); color: var(--fg); border-radius: 4px; padding: .35rem .55rem; font: inherit; font-size: .8rem; }
+  #lib-search:focus { border-color: var(--accent); outline: none; }
   .lib-main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
   .lib-toolbar { flex: 0 0 auto; padding: .8rem 1rem; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: .8rem; background: #0f0f0f; }
   .lib-toolbar h2 { margin: 0; font-weight: 500; font-size: 1rem; }
@@ -1561,8 +1592,8 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .lib-grid { flex: 1 1 auto; overflow-y: auto; padding: .8rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .5rem; align-content: start; }
   .lib-cell { background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color .12s; position: relative; }
   .lib-cell:hover { border-color: var(--accent); }
-  .lib-cell .lib-img-wrap { aspect-ratio: 3/2; background: #000; }
-  .lib-cell .lib-img-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .lib-cell .lib-img-wrap { aspect-ratio: 4/3; background: #000; }
+  .lib-cell .lib-img-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .lib-cell .lib-label { padding: .3rem .5rem; font-size: .7rem; color: #ccc; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lib-cell .lib-label .lib-rating { color: #ffd56a; margin-right: .35rem; }
   .lib-cell .lib-badges { position: absolute; top: 4px; left: 4px; display: flex; gap: 3px; }
@@ -1711,6 +1742,10 @@ _SPA_TEMPLATE = r"""<!doctype html>
         <ul class="lib-folders" id="lib-folders"></ul>
       </div>
       <div class="lib-section">
+        <h3>Search</h3>
+        <input type="text" id="lib-search" placeholder="tag, name, camera…" autocomplete="off">
+      </div>
+      <div class="lib-section">
         <h3>Filter</h3>
         <label class="lib-filter-row">camera
           <select id="lib-filter-camera"><option value="">any</option></select>
@@ -1731,6 +1766,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
       <div class="lib-toolbar">
         <h2 id="lib-title">Library</h2>
         <span class="lib-meta" id="lib-meta"></span>
+        <span class="lib-meta" id="lib-tagger-meta" style="color:#c9c"></span>
         <button id="lib-import" style="margin-left:auto">Import…</button>
         <button id="lib-scan">Rescan</button>
         <button id="lib-score" class="primary">Score this view</button>
@@ -2536,13 +2572,42 @@ let libState = {
   cameraFilter: "",
   faceFilter: "",
   starFilter: "",
+  searchQuery: "",
 };
+let libSearchTimer = null;
+let taggerPollTimer = null;
 
 async function loadLibrary() {
   await refreshLibraryRoots();
   await refreshLibraryFaces();
   await refreshLibraryCameras();
   await refreshLibraryGrid();
+  pollTaggerStatus();  // start the heartbeat once
+}
+
+let _lastTaggerPhase = null;
+async function pollTaggerStatus() {
+  const taggerMeta = $("#lib-tagger-meta");
+  try {
+    const res = await fetch("/api/tagger/status");
+    const d = await res.json();
+    if (d.phase === "running" && d.total > 0) {
+      const pct = ((d.processed / d.total) * 100).toFixed(0);
+      taggerMeta.textContent = `tagging ${d.processed}/${d.total} (${pct}%)`;
+    } else {
+      taggerMeta.textContent = "";
+    }
+    if (d.phase === "done" && _lastTaggerPhase === "running") {
+      // Just finished: refresh the grid so search picks up new tags.
+      refreshLibraryGrid();
+    }
+    _lastTaggerPhase = d.phase;
+    const delay = d.phase === "running" ? 2000 : 5000;
+    taggerPollTimer = setTimeout(() => { taggerPollTimer = null; pollTaggerStatus(); }, delay);
+  } catch (e) {
+    taggerMeta.textContent = "";
+    taggerPollTimer = setTimeout(() => { taggerPollTimer = null; pollTaggerStatus(); }, 5000);
+  }
 }
 
 async function refreshLibraryRoots() {
@@ -2657,6 +2722,7 @@ async function refreshLibraryGrid() {
   if (libState.cameraFilter) params.set("camera", libState.cameraFilter);
   if (libState.faceFilter) params.set("face", libState.faceFilter);
   if (libState.starFilter !== "") params.set("min_score", libState.starFilter);
+  if (libState.searchQuery) params.set("q", libState.searchQuery);
   params.set("limit", "500");
 
   meta.textContent = "loading…";
@@ -2781,6 +2847,11 @@ $("#lib-filter-face").addEventListener("change", e => {
 $("#lib-filter-star").addEventListener("change", e => {
   libState.starFilter = e.target.value;
   refreshLibraryGrid();
+});
+$("#lib-search").addEventListener("input", e => {
+  libState.searchQuery = e.target.value.trim();
+  if (libSearchTimer) clearTimeout(libSearchTimer);
+  libSearchTimer = setTimeout(refreshLibraryGrid, 200);
 });
 $("#lib-scan").addEventListener("click", () => {
   if (libState.activeRootId === null) return;
