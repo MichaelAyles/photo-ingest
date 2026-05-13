@@ -76,6 +76,12 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
     pass is slow (~1s/frame for insightface) but means later cull/sort
     operations don't need to touch the original file at all.
     """
+    from pathlib import Path
+    # Library passes abs_path as a string; load_preview wants Path so the
+    # `.suffix` lookup works. Without this coercion the warm-path face_id
+    # branch raises AttributeError silently inside its try, and 990 of
+    # 1000 frames never actually get faces extracted.
+    src_path = Path(src_path) if not isinstance(src_path, Path) else src_path
     meta = state.load_frame_metadata(sha) or {}
     have_emb = state.load_embedding(sha) is not None
     have_tags = bool(meta.get("tags"))
@@ -140,7 +146,7 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
             state.update_frame_metadata(sha, face_detections=payload)
             out["faces"] = True
         except Exception as e:
-            log.warning("tagger: face_id fail %s: %s", src_path, e)
+            log.exception("tagger: face_id fail %s: %s", src_path, e)
 
     if not have_scene:
         try:
@@ -209,6 +215,22 @@ def _run(full: bool = False) -> None:
             if r.get("tagged"): p.tagged += 1
             if r.get("faces"): p.faces_done += 1
             if r.get("scored"): p.scored += 1
+
+        # Full pass implies the user wants every signal computed. Cluster
+        # face embeddings into named-or-anonymous people so the library shows
+        # everyone, not just frames the user manually opened. Cheap on top of
+        # the per-frame work that just finished.
+        if full:
+            try:
+                from banger import face_names as fn
+                summary = fn.discover_clusters()
+                log.info(
+                    "tagger: discovered people: added=%d matched=%d clusters=%d faces=%d",
+                    summary["added"], summary["matched"],
+                    summary["total_clusters"], summary["total_faces"],
+                )
+            except Exception as e:
+                log.warning("tagger: discover failed: %s", e)
 
         p.phase = "done"
         p.finished_at = time.monotonic()

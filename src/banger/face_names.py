@@ -194,3 +194,160 @@ def all_names() -> list[dict]:
         {"name": name, "count": count}
         for name, _, count in _all()
     ]
+
+
+def _next_auto_name() -> str:
+    """Find the next free 'Person N' slot for auto-discovered clusters."""
+    existing = {n for n, _, _ in _all()}
+    i = 1
+    while True:
+        candidate = f"Person {i}"
+        if candidate not in existing:
+            return candidate
+        i += 1
+
+
+def discover_clusters(eps: float = 0.5, min_samples: int = 3) -> dict:
+    """DBSCAN every cached face embedding across the library, match each
+    cluster to a named centroid where possible, and auto-create unnamed
+    'Person N' entries for the rest.
+
+    Returns a summary dict: {added, matched, total_clusters, total_faces}.
+
+    The eps is the cosine-distance same-person threshold for clustering, same
+    as banger.face_id. We hold min_samples=3 to avoid creating a face entry
+    from a single weak detection; one-off faces stay anonymous and the user
+    can name them manually via the detail overlay.
+    """
+    import json
+    from banger import state
+
+    # Collect every face embedding from every metadata file.
+    embs: list[np.ndarray] = []
+    owners: list[tuple[str, int, list[int]]] = []  # (sha, face_idx, bbox)
+    meta_dir = state.METADATA_DIR
+    if not meta_dir.exists():
+        return {"added": 0, "matched": 0, "total_clusters": 0, "total_faces": 0}
+
+    for p in meta_dir.glob("*.json"):
+        try:
+            meta = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        dets = meta.get("face_detections") or []
+        sha = p.stem
+        for idx, d in enumerate(dets):
+            e = d.get("embedding") if isinstance(d, dict) else d
+            if not e:
+                continue
+            arr = np.asarray(e, dtype=np.float32)
+            if arr.size != EMB_DIM:
+                continue
+            embs.append(arr)
+            owners.append((sha, idx, d.get("bbox") if isinstance(d, dict) else None))
+
+    if not embs:
+        return {"added": 0, "matched": 0, "total_clusters": 0, "total_faces": 0}
+
+    from sklearn.cluster import DBSCAN
+    X = np.stack(embs)
+    db = DBSCAN(eps=eps, min_samples=min_samples, metric="cosine")
+    labels = db.fit_predict(X)
+
+    # Existing named centroids: cluster ids that match one of these go to that name.
+    named = _all()
+
+    # Group by cluster id (skip noise label -1).
+    by_cluster: dict[int, list[int]] = {}
+    for i, cid in enumerate(labels.tolist()):
+        if cid < 0:
+            continue
+        by_cluster.setdefault(cid, []).append(i)
+
+    added = 0
+    matched = 0
+    for cid, member_indices in by_cluster.items():
+        # Centroid = mean of L2-normalised embeddings, re-normalised.
+        cluster_embs = X[member_indices]
+        centroid = cluster_embs.mean(axis=0)
+        centroid = centroid / max(float(np.linalg.norm(centroid)), 1e-8)
+
+        # Does this cluster match any existing named centroid?
+        existing_match = None
+        for name, named_centroid, _ in named:
+            sim = float(centroid @ named_centroid)
+            if sim >= (1.0 - eps):
+                existing_match = name
+                break
+
+        if existing_match is not None:
+            # Merge cluster members into the existing centroid by re-running
+            # assign once with the cluster mean. count++ once is sufficient
+            # signal; we don't multiply-add to avoid over-weighting.
+            try:
+                assign(existing_match, centroid)
+                matched += 1
+            except ValueError:
+                pass
+            continue
+
+        # Auto-create a Person N entry. Pick a representative embedding (the
+        # one closest to the centroid) and try to grab its thumbnail from the
+        # owning frame for the library view.
+        sims = cluster_embs @ centroid
+        best = int(np.argmax(sims))
+        rep_sha, rep_idx, rep_bbox = owners[member_indices[best]]
+        thumb_bytes = _try_crop_thumbnail(rep_sha, rep_bbox)
+        try:
+            new_name = _next_auto_name()
+            assign(new_name, centroid, thumbnail_jpeg=thumb_bytes)
+            # The first assign() puts the centroid; we then bump count to
+            # reflect the cluster size so the library view shows reality.
+            with _conn() as conn:
+                conn.execute(
+                    "UPDATE face_names SET count=? WHERE name=?",
+                    (len(member_indices), new_name),
+                )
+            added += 1
+            named = _all()  # refresh so subsequent clusters can match this one
+        except ValueError:
+            continue
+
+    return {
+        "added": added,
+        "matched": matched,
+        "total_clusters": len(by_cluster),
+        "total_faces": len(embs),
+    }
+
+
+def _try_crop_thumbnail(sha: str, bbox: list[int] | None) -> bytes | None:
+    """Best-effort crop of a face thumbnail from the frame's preview.
+
+    Used by discover_clusters to give each auto-discovered person a
+    representative image in the face library. Returns None on any failure
+    (missing preview, bad bbox, etc.) and the entry just gets the default
+    no-thumbnail look.
+    """
+    if not bbox or len(bbox) != 4:
+        return None
+    try:
+        import cv2
+        from banger import state, library  # noqa: PLC0415
+        from banger.preview import load_preview  # noqa: PLC0415
+        src = library.lookup_path(sha)
+        if src is None:
+            return None
+        img = load_preview(src)
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = bbox
+        pw, ph = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
+        x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
+        x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        crop = cv2.resize(img[y1:y2, x1:x2], (128, 128), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None

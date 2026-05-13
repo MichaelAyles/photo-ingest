@@ -1133,6 +1133,19 @@ def build_app(window_holder: dict | None = None) -> Flask:
     def face_library():
         return jsonify({"names": face_names.all_names()})
 
+    @app.route("/api/face/discover", methods=["POST"])
+    def face_discover():
+        """Cluster every cached face embedding across the library, merging
+        into named centroids where possible and creating 'Person N' entries
+        for new clusters. Synchronous (runs in request thread), typically
+        finishes in seconds even on 10k faces."""
+        try:
+            summary = face_names.discover_clusters()
+        except Exception as e:
+            log.exception("discover failed")
+            return jsonify({"error": str(e)}), 500
+        return jsonify(summary)
+
     @app.route("/api/face/library-thumb/<name>")
     def face_library_thumb(name):
         from flask import Response
@@ -1349,9 +1362,13 @@ def serve(port: int = 8765, open_window: bool = True) -> None:
         log.error("pywebview is not installed; install with `pip install banger[gui]`")
         return
 
+    # Cache-bust the URL each launch. WebView2 (and WebKit on macOS) often
+    # ignore HTTP cache headers for the navigation document, so the only
+    # reliable way to force a fresh HTML+CSS fetch is to change the URL.
+    cache_bust = int(time.time())
     win = webview.create_window(
         title="banger",
-        url=f"http://127.0.0.1:{port}/gui",
+        url=f"http://127.0.0.1:{port}/gui?v={cache_bust}",
         width=1280, height=820, min_size=(900, 600),
         background_color="#0c0c0c",
     )
@@ -1984,10 +2001,14 @@ _SPA_TEMPLATE = r"""<!doctype html>
     <div class="settings-card">
       <h3>Face library</h3>
       <p style="margin:.3rem 0;color:var(--dim);font-size:.75rem">
-        Names persist across runs. Click a name to rename it; the
-        <span style="color:var(--red)">×</span> button forgets the centroid
-        so future faces won't match against it.
+        Names persist across runs. Click a name to rename, × forgets the
+        centroid. <strong>Discover</strong> clusters every detected face
+        in the library and auto-creates 'Person N' entries for everyone
+        not yet named.
       </p>
+      <div style="margin:.4rem 0">
+        <button id="face-discover" style="background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:.35rem .7rem;font-size:.75rem;cursor:pointer">Discover people</button>
+      </div>
       <div class="face-library" id="face-library">
         <p class="empty">loading…</p>
       </div>
@@ -3062,6 +3083,26 @@ async function pollLibraryScan(rootId) {
   } catch (e) { console.error("scan poll:", e); }
   setTimeout(() => pollLibraryScan(rootId), 800);
 }
+
+document.addEventListener("DOMContentLoaded", () => {
+  const btn = document.getElementById("face-discover");
+  if (btn) btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Discovering…";
+    try {
+      const res = await fetch("/api/face/discover", {method: "POST"});
+      if (!res.ok) throw new Error(await res.text());
+      const d = await res.json();
+      toast(`Found ${d.total_clusters} people across ${d.total_faces} faces (${d.added} new, ${d.matched} merged)`, 3000);
+      loadFaceLibrary();
+    } catch (e) {
+      toast("Discover failed: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Discover people";
+    }
+  });
+});
 
 async function loadFaceLibrary() {
   const wrap = $("#face-library");
