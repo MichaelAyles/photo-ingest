@@ -1676,13 +1676,14 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .lib-toolbar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .8rem; font-size: .8rem; }
   .lib-toolbar button:hover { border-color: var(--accent); }
   .lib-toolbar button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
-  .lib-grid { flex: 1 1 auto; overflow-y: auto; padding: .8rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .5rem; align-content: start; }
-  .lib-cell { background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color .12s; position: relative; }
+  /* WebView2 silently ignores both `aspect-ratio` and the padding-bottom
+     trick inside a CSS Grid with auto rows. Pinning the row height in pixels
+     and using flex inside each cell is the only thing that holds. */
+  .lib-grid { flex: 1 1 auto; overflow-y: auto; padding: .8rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); grid-auto-rows: 200px; gap: .5rem; align-content: start; }
+  .lib-cell { background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color .12s; position: relative; height: 200px; display: flex; flex-direction: column; }
   .lib-cell:hover { border-color: var(--accent); }
-  /* padding-bottom 75% gives a guaranteed 4:3 box regardless of aspect-ratio
-     CSS support quirks in WebView2. img is absolutely positioned inside. */
-  .lib-cell .lib-img-wrap { position: relative; width: 100%; padding-bottom: 75%; background: #000; overflow: hidden; }
-  .lib-cell .lib-img-wrap img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+  .lib-cell .lib-img-wrap { flex: 1 1 auto; min-height: 0; background: #000; position: relative; overflow: hidden; }
+  .lib-cell .lib-img-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .lib-cell .lib-label { padding: .3rem .5rem; font-size: .7rem; color: #ccc; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .lib-cell .lib-label .lib-rating { color: #ffd56a; margin-right: .35rem; }
   .lib-cell .lib-badges { position: absolute; top: 4px; left: 4px; display: flex; gap: 3px; }
