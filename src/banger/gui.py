@@ -689,6 +689,49 @@ def serve(port: int = 8765, open_window: bool = True) -> None:
             log.warning("CLIP warm-load failed: %s", e)
 
     threading.Thread(target=_warm_clip, daemon=True).start()
+    threading.Thread(target=_auto_setup, daemon=True).start()
+
+
+def _auto_setup() -> None:
+    """Best-effort background bootstrap. Runs once per GUI launch:
+
+    1. If scene KMeans isn't fit and we have enough cached embeddings,
+       fit it silently. Fast (~5s on 1k embeddings), no network.
+    2. If mediapipe isn't installed, pip-install it. Enables the eye-gate
+       on the next run. Quiet on success, logged on failure. Doesn't block
+       anything if the install fails (the gate has its own fallback path).
+    """
+    import subprocess
+    import sys
+
+    try:
+        if not scene_kmeans.exists():
+            stats = state.cache_stats()
+            n = stats.get("embeddings", {}).get("count", 0)
+            if n >= 5:
+                log.info("auto-setup: fitting scene KMeans (k=5) on %d embeddings", n)
+                scene_kmeans.fit(k=5)
+            else:
+                log.info("auto-setup: skipping scene fit, only %d embeddings cached", n)
+    except Exception as e:
+        log.warning("auto-setup: scene fit failed: %s", e)
+
+    if not eyes_mod.mediapipe_available():
+        log.info("auto-setup: installing mediapipe in the background…")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--quiet", "mediapipe"],
+                capture_output=True, text=True, timeout=180,
+            )
+            if proc.returncode == 0:
+                log.info("auto-setup: mediapipe installed (restart GUI to enable --eye-gate)")
+            else:
+                log.warning(
+                    "auto-setup: mediapipe install failed (rc=%d): %s",
+                    proc.returncode, proc.stderr.strip()[-200:],
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            log.warning("auto-setup: mediapipe install errored: %s", e)
 
     # Wait briefly for the Flask socket so the webview's first nav doesn't
     # race-fail. 200 ms is plenty on a modern machine; on a slow one we
