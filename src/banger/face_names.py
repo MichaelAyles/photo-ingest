@@ -55,6 +55,12 @@ def _conn() -> sqlite3.Connection:
         )
         """
     )
+    # Migration: add thumbnail column if missing. Stored as JPEG bytes so the
+    # library view doesn't have to re-crop from the original frame each time.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(face_names)")]
+    if "thumbnail" not in cols:
+        conn.execute("ALTER TABLE face_names ADD COLUMN thumbnail BLOB")
+        conn.commit()
     return conn
 
 
@@ -93,12 +99,21 @@ def match(embedding: np.ndarray, threshold: float = MATCH_THRESHOLD) -> tuple[st
     return None, best_sim
 
 
-def assign(name: str, embedding: np.ndarray) -> tuple[float, int]:
+def assign(
+    name: str,
+    embedding: np.ndarray,
+    thumbnail_jpeg: bytes | None = None,
+) -> tuple[float, int]:
     """Attach `embedding` to `name`, averaging into the existing centroid if any.
 
     Returns (cosine sim of embedding to the previous centroid before merge,
     new count). The sim is useful for the UI to surface "this looks like
     a strong match" vs "first sample, no comparison" cases.
+
+    `thumbnail_jpeg` (optional) is the cropped face image used by the library
+    view. We only store one per name, set on first assign and refreshed when
+    explicitly passed; the library doesn't try to pick a "best" thumbnail
+    automatically since taste in faces is too subjective.
     """
     name = name.strip()
     if not name:
@@ -110,28 +125,52 @@ def assign(name: str, embedding: np.ndarray) -> tuple[float, int]:
 
     with _conn() as conn:
         row = conn.execute(
-            "SELECT centroid, count FROM face_names WHERE name=?", (name,)
+            "SELECT centroid, count, thumbnail FROM face_names WHERE name=?", (name,)
         ).fetchone()
         if row is None:
             blob = embedding.tobytes()
             conn.execute(
-                "INSERT INTO face_names (name, centroid, count, updated) VALUES (?, ?, 1, ?)",
-                (name, blob, int(time.time())),
+                "INSERT INTO face_names (name, centroid, count, updated, thumbnail) "
+                "VALUES (?, ?, 1, ?, ?)",
+                (name, blob, int(time.time()), thumbnail_jpeg),
             )
             return 0.0, 1
 
-        prev_blob, prev_count = row
+        prev_blob, prev_count, prev_thumb = row
         prev = np.frombuffer(prev_blob, dtype=np.float32).copy()
         sim = float(embedding @ prev / max(float(np.linalg.norm(prev)), 1e-8))
         # Weighted average of unit vectors, renormalised.
         new = prev * prev_count + embedding
         new = new / max(float(np.linalg.norm(new)), 1e-8)
         new_count = int(prev_count) + 1
+        # Replace thumbnail only when explicitly passed AND none stored yet,
+        # or when the caller wants to update it.
+        thumb_to_store = thumbnail_jpeg if thumbnail_jpeg is not None else prev_thumb
         conn.execute(
-            "UPDATE face_names SET centroid=?, count=?, updated=? WHERE name=?",
-            (new.astype(np.float32).tobytes(), new_count, int(time.time()), name),
+            "UPDATE face_names SET centroid=?, count=?, updated=?, thumbnail=? "
+            "WHERE name=?",
+            (new.astype(np.float32).tobytes(), new_count, int(time.time()),
+             thumb_to_store, name),
         )
         return sim, new_count
+
+
+def set_thumbnail(name: str, thumbnail_jpeg: bytes) -> bool:
+    """Replace the stored thumbnail for an existing name."""
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE face_names SET thumbnail=? WHERE name=?",
+            (thumbnail_jpeg, name),
+        )
+        return cur.rowcount > 0
+
+
+def get_thumbnail(name: str) -> bytes | None:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT thumbnail FROM face_names WHERE name=?", (name,)
+        ).fetchone()
+    return bytes(row[0]) if row and row[0] is not None else None
 
 
 def rename(old: str, new: str) -> bool:

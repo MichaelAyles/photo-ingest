@@ -657,7 +657,10 @@ def build_app(window_holder: dict | None = None) -> Flask:
 
     @app.route("/api/face/name", methods=["POST"])
     def face_name():
-        """Assign a name to a specific (sha, face_idx)."""
+        """Assign a name to a specific (sha, face_idx). Also captures a thumbnail
+        if one isn't already stored for this name."""
+        import cv2
+
         data = request.get_json(silent=True) or {}
         sha = (data.get("sha") or "").strip()
         face_idx = data.get("face_idx")
@@ -671,11 +674,67 @@ def build_app(window_holder: dict | None = None) -> Flask:
         emb = np.asarray(detections[face_idx].get("embedding") or [], dtype=np.float32)
         if emb.size != face_names.EMB_DIM:
             return jsonify({"error": "no embedding for that face"}), 400
+
+        # Crop a thumbnail for the library view (only used if this is a new
+        # name; existing names keep whatever thumbnail they already have).
+        thumb_bytes = None
+        bbox = detections[face_idx].get("bbox") or []
+        f = sha_to_frame.get(sha)
+        if len(bbox) == 4 and f is not None:
+            try:
+                preview = load_preview(f.classify_path)
+                h, w = preview.shape[:2]
+                x1, y1, x2, y2 = bbox
+                pw, ph = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
+                x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
+                x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+                if x2 > x1 and y2 > y1:
+                    crop = cv2.resize(preview[y1:y2, x1:x2], (128, 128),
+                                      interpolation=cv2.INTER_AREA)
+                    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ok:
+                        thumb_bytes = buf.tobytes()
+            except Exception as e:
+                log.warning("face thumb capture failed: %s", e)
+
         try:
-            sim, count = face_names.assign(name, emb)
+            sim, count = face_names.assign(name, emb, thumbnail_jpeg=thumb_bytes)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
         return jsonify({"name": name, "merged_with_sim": sim, "count": count})
+
+    @app.route("/api/face/rename", methods=["POST"])
+    def face_rename():
+        data = request.get_json(silent=True) or {}
+        old = (data.get("old") or "").strip()
+        new = (data.get("new") or "").strip()
+        if not old or not new:
+            return jsonify({"error": "old and new required"}), 400
+        if not face_names.rename(old, new):
+            return jsonify({"error": "name not found or new name invalid"}), 404
+        return jsonify({"old": old, "new": new})
+
+    @app.route("/api/face/forget", methods=["POST"])
+    def face_forget():
+        data = request.get_json(silent=True) or {}
+        name = (data.get("name") or "").strip()
+        if not name:
+            return jsonify({"error": "name required"}), 400
+        if not face_names.forget(name):
+            return jsonify({"error": "name not found"}), 404
+        return jsonify({"forgot": name})
+
+    @app.route("/api/face/library")
+    def face_library():
+        return jsonify({"names": face_names.all_names()})
+
+    @app.route("/api/face/library-thumb/<name>")
+    def face_library_thumb(name):
+        from flask import Response
+        thumb = face_names.get_thumbnail(name)
+        if thumb is None:
+            return ("no thumbnail", 404)
+        return Response(thumb, mimetype="image/jpeg")
 
     @app.route("/api/face/names")
     def face_names_list():
@@ -1135,8 +1194,22 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .overlay-panel .face-tile { display: flex; flex-direction: column; align-items: center; gap: .25rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; padding: .35rem; }
   .overlay-panel .face-tile img { width: 64px; height: 64px; object-fit: cover; border-radius: 3px; background: #000; }
   .overlay-panel .face-tile .name { font-size: .7rem; color: #ddd; font-family: ui-monospace, monospace; max-width: 90px; text-align: center; word-break: break-word; }
-  .overlay-panel .face-tile .name.unnamed { color: var(--accent); cursor: pointer; text-decoration: underline dotted; }
+  .overlay-panel .face-tile .name.editable { cursor: pointer; text-decoration: underline dotted; text-decoration-color: rgba(255,170,85,.4); }
+  .overlay-panel .face-tile .name.editable:hover { color: var(--accent); }
+  .overlay-panel .face-tile .name.unnamed { color: var(--accent); }
   .overlay-panel .face-tile input { background: var(--bg3); border: 1px solid var(--accent); color: var(--fg); border-radius: 3px; padding: 1px 4px; font: inherit; font-size: .7rem; width: 90px; }
+
+  /* face library */
+  .face-library { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: .6rem; margin-top: .5rem; }
+  .face-card { background: var(--bg3); border: 1px solid var(--line); border-radius: 6px; padding: .5rem; display: flex; flex-direction: column; align-items: center; gap: .35rem; }
+  .face-card img { width: 96px; height: 96px; object-fit: cover; border-radius: 4px; background: #000; }
+  .face-card .lib-name { font-family: ui-monospace, monospace; font-size: .8rem; color: var(--fg); cursor: pointer; text-decoration: underline dotted; }
+  .face-card .lib-name:hover { color: var(--accent); }
+  .face-card .lib-meta { font-size: .65rem; color: var(--dim); }
+  .face-card .lib-actions { display: flex; gap: .3rem; margin-top: .15rem; }
+  .face-card .lib-actions button { background: transparent; color: var(--dim); border: 1px solid var(--line); border-radius: 3px; padding: 1px 6px; font-size: .65rem; }
+  .face-card .lib-actions button:hover { color: var(--red); border-color: var(--red); }
+  .face-card input { background: var(--bg2); border: 1px solid var(--accent); color: var(--fg); border-radius: 3px; padding: 2px 5px; font: inherit; font-size: .75rem; width: 110px; text-align: center; }
   .overlay .close { position: absolute; top: 1rem; right: 1rem; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); padding: .35rem .8rem; border-radius: 4px; cursor: pointer; z-index: 1; }
   .overlay .hint { position: absolute; bottom: 1rem; left: 50%; transform: translateX(-50%); color: var(--dim); font-size: .7rem; pointer-events: none; }
 
@@ -1234,6 +1307,17 @@ _SPA_TEMPLATE = r"""<!doctype html>
       <label><span class="k">Embeddings cached</span><span id="st-embs"></span></label>
     </div>
     <div class="settings-card">
+      <h3>Face library</h3>
+      <p style="margin:.3rem 0;color:var(--dim);font-size:.75rem">
+        Names persist across runs. Click a name to rename it; the
+        <span style="color:var(--red)">×</span> button forgets the centroid
+        so future faces won't match against it.
+      </p>
+      <div class="face-library" id="face-library">
+        <p class="empty">loading…</p>
+      </div>
+    </div>
+    <div class="settings-card">
       <h3>Actions</h3>
       <p style="margin:.3rem 0;color:var(--dim);font-size:.8rem">
         Labelling, training, and scene fitting live in the existing CLI for now.
@@ -1279,7 +1363,10 @@ function show(view) {
   $$("header nav button").forEach(b => b.classList.toggle("active", b.dataset.view === view));
 }
 
-$$("header nav button").forEach(b => b.addEventListener("click", () => show(b.dataset.view)));
+$$("header nav button").forEach(b => b.addEventListener("click", () => {
+  show(b.dataset.view);
+  if (b.dataset.view === "settings") loadFaceLibrary();
+}));
 
 function toast(msg, ms=1800) {
   const t = $("#toast");
@@ -1435,44 +1522,64 @@ async function openHero(pick) {
 function renderFaceRow(sha, faces) {
   if (!faces.length) return '<p class="empty">no faces detected</p>';
   return '<div class="face-row">' + faces.map(f => {
-    const nameHtml = f.matched_name
-      ? `<span class="name" title="match sim ${f.match_sim}">${escapeHtml(f.matched_name)}</span>`
-      : `<span class="name unnamed" data-face-idx="${f.face_idx}">name…</span>`;
+    // Every face name is clickable; matched ones come pre-filled so the user
+    // can correct misidentifications.
+    const cls = f.matched_name ? "name editable" : "name unnamed editable";
+    const text = f.matched_name || "name…";
+    const title = f.matched_name
+      ? `matched at sim ${f.match_sim} (click to rename / correct)`
+      : "click to name this face";
     return `
       <div class="face-tile" data-face-idx="${f.face_idx}">
         <img src="/api/face-thumb/${sha}/${f.face_idx}" alt="face">
-        ${nameHtml}
+        <span class="${cls}" data-current="${escapeHtml(f.matched_name || '')}" title="${title}">${escapeHtml(text)}</span>
       </div>`;
   }).join("") + '</div>';
 }
 
 function wireFaceTiles(sha) {
-  document.querySelectorAll(`#faces-slot-${sha} .name.unnamed`).forEach(el => {
-    el.addEventListener("click", () => {
-      const tile = el.closest(".face-tile");
-      const faceIdx = parseInt(tile.dataset.faceIdx);
-      el.outerHTML = `<input type="text" placeholder="name" data-face-idx="${faceIdx}" autofocus>`;
-      const input = tile.querySelector("input");
-      input.focus();
-      input.addEventListener("keydown", async (e) => {
-        if (e.key === "Escape") { wireFaceTiles(sha); /* rerender */; return; }
-        if (e.key !== "Enter") return;
-        const name = input.value.trim();
-        if (!name) return;
-        try {
-          const res = await fetch("/api/face/name", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({sha, face_idx: faceIdx, name}),
-          });
-          if (!res.ok) throw new Error(await res.text());
-          input.outerHTML = `<span class="name">${escapeHtml(name)}</span>`;
-          toast(`Named "${name}" (will match across future runs)`, 1800);
-        } catch (e) {
-          toast("name save failed: " + e.message);
-        }
+  document.querySelectorAll(`#faces-slot-${sha} .name.editable`).forEach(el => {
+    el.addEventListener("click", () => beginFaceEdit(sha, el));
+  });
+}
+
+function beginFaceEdit(sha, el) {
+  const tile = el.closest(".face-tile");
+  const faceIdx = parseInt(tile.dataset.faceIdx);
+  const current = el.dataset.current || "";
+  el.outerHTML = `<input type="text" placeholder="name" value="${escapeHtml(current)}" data-face-idx="${faceIdx}">`;
+  const input = tile.querySelector("input");
+  input.focus();
+  input.select();
+  const cancel = () => {
+    input.outerHTML = current
+      ? `<span class="name editable" data-current="${escapeHtml(current)}">${escapeHtml(current)}</span>`
+      : `<span class="name unnamed editable" data-current="">name…</span>`;
+    wireFaceTiles(sha);
+  };
+  input.addEventListener("blur", cancel);
+  input.addEventListener("keydown", async (e) => {
+    if (e.key === "Escape") { input.removeEventListener("blur", cancel); cancel(); return; }
+    if (e.key !== "Enter") return;
+    const name = input.value.trim();
+    if (!name) { input.removeEventListener("blur", cancel); cancel(); return; }
+    input.removeEventListener("blur", cancel);
+    try {
+      const res = await fetch("/api/face/name", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({sha, face_idx: faceIdx, name}),
       });
-    });
+      if (!res.ok) throw new Error(await res.text());
+      input.outerHTML = `<span class="name editable" data-current="${escapeHtml(name)}">${escapeHtml(name)}</span>`;
+      wireFaceTiles(sha);
+      const msg = current && current !== name
+        ? `Re-tagged "${current}" → "${name}"`
+        : `Named "${name}"`;
+      toast(msg, 1800);
+    } catch (e) {
+      toast("name save failed: " + e.message);
+    }
   });
 }
 
@@ -1678,6 +1785,84 @@ async function loadRecent() {
   if (!data.folders.length) { ul.innerHTML = '<li style="color:var(--dim);cursor:default">no recent folders yet</li>'; return; }
   ul.innerHTML = data.folders.map(f => `<li data-path="${escapeHtml(f)}"><span>${escapeHtml(f)}</span><span class="go">↵ run</span></li>`).join("");
   ul.querySelectorAll("li[data-path]").forEach(li => li.addEventListener("click", () => startRun(li.dataset.path)));
+}
+
+async function loadFaceLibrary() {
+  const wrap = $("#face-library");
+  try {
+    const res = await fetch("/api/face/library");
+    const d = await res.json();
+    if (!d.names || !d.names.length) {
+      wrap.innerHTML = '<p class="empty">No named faces yet. Open a photo with a detected face and click its name chip to start.</p>';
+      return;
+    }
+    wrap.innerHTML = d.names.map(n => `
+      <div class="face-card" data-name="${escapeHtml(n.name)}">
+        <img src="/api/face/library-thumb/${encodeURIComponent(n.name)}?ts=${Date.now()}" alt="${escapeHtml(n.name)}" onerror="this.style.display='none'">
+        <span class="lib-name">${escapeHtml(n.name)}</span>
+        <span class="lib-meta">${n.count} sample${n.count === 1 ? '' : 's'}</span>
+        <div class="lib-actions">
+          <button class="forget" title="Forget this person (delete centroid)">×</button>
+        </div>
+      </div>
+    `).join("");
+    wireLibraryCards();
+  } catch (e) {
+    wrap.innerHTML = `<p class="empty">load failed: ${escapeHtml(e.message)}</p>`;
+  }
+}
+
+function wireLibraryCards() {
+  $$('#face-library .face-card').forEach(card => {
+    const name = card.dataset.name;
+    const nameEl = card.querySelector(".lib-name");
+    nameEl.addEventListener("click", () => beginLibraryRename(card, name));
+    card.querySelector(".forget").addEventListener("click", async () => {
+      if (!confirm(`Forget "${name}"? Future faces won't match against this centroid.`)) return;
+      try {
+        const res = await fetch("/api/face/forget", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({name}),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        loadFaceLibrary();
+        toast(`Forgot "${name}"`);
+      } catch (e) {
+        toast("forget failed: " + e.message);
+      }
+    });
+  });
+}
+
+function beginLibraryRename(card, oldName) {
+  const nameEl = card.querySelector(".lib-name");
+  nameEl.outerHTML = `<input type="text" value="${escapeHtml(oldName)}">`;
+  const input = card.querySelector("input");
+  input.focus();
+  input.select();
+  const cancel = () => loadFaceLibrary();
+  input.addEventListener("blur", cancel);
+  input.addEventListener("keydown", async (e) => {
+    if (e.key === "Escape") { input.removeEventListener("blur", cancel); cancel(); return; }
+    if (e.key !== "Enter") return;
+    const newName = input.value.trim();
+    if (!newName || newName === oldName) { input.removeEventListener("blur", cancel); cancel(); return; }
+    input.removeEventListener("blur", cancel);
+    try {
+      const res = await fetch("/api/face/rename", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({old: oldName, new: newName}),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      toast(`Renamed "${oldName}" → "${newName}"`);
+      loadFaceLibrary();
+    } catch (e) {
+      toast("rename failed: " + e.message);
+      loadFaceLibrary();
+    }
+  });
 }
 
 async function loadState() {
