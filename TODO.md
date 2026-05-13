@@ -1,34 +1,45 @@
-# TODO — when you're back
+# TODO
 
-The /ralph-loop autopilot worked through the v0 plan + selected v1 items. Snapshot at commit `071d3b0`:
+Forward-looking only. Done work lives in `git log`. Old planning docs are gone.
 
-## What got done in this run
+## Open, ranked by what would actually change my use of the tool
 
-Iteration started: 49 tests, v0 algorithmic stages just finished. Iteration ended:
-- **89 tests passing** in ~6 s, including a CLI integration test that exercises `cmd_run` end-to-end with mocked CLIP.
-- **Burst dedup** (step 12) — pHash + EXIF time, found 55 bursts (60 dupes) in test_photos.
-- **Scene matching** (step 5) — 7-prompt CLIP zero-shot, threshold tuned 0.25 → 0.20.
-- **Per-prompt thresholds** (step 19) — plumbing in `scenes.PER_PROMPT_THRESHOLDS`; empty until tuning evidence accumulates.
-- **Top-N output + manifest** (steps 6, 7, 9) — `--output DIR --top-n N` writes ranked JPEGs + manifest.json. Default output dir from `BANGER_OUTPUT_DIR` env, with auto-appended date subdir.
-- **Develop fallback** — copies camera JPEG when darktable-cli isn't on PATH; calls darktable-cli when present.
-- **Metadata cache** — sha-keyed JSON files in `~/.local/share/banger-pipeline/metadata/`. Warm runs are 7× faster (test_photos: 188 s → 27 s).
-- **Face-aware sharpness gate** (step 18) — `--face-gate` flag, OpenCV Haar cascade, face data cached alongside other metadata.
-- **CSV labels export/import** — `banger labels list / export PATH / import PATH` for moving labels between machines.
+### 1. Better captions / tags
+Tag vocabulary is hand-curated (~180 entries) and CLIP zero-shot tops out around 0.27 cosine on real photos. Two paths if the chips start to feel limiting:
+- Expand vocabulary toward domain-specific terms (climbing gear, dog breeds, food types, etc).
+- Swap CLIP zero-shot for a captioning model (BLIP-2 or Florence-2) and post-process into chips. Worth ~1.5 GB of model weights on disk; build pulls down on first use.
 
-Git log between `1a5ad8b` (start of this run) and `071d3b0` is the full breadcrumb trail; each commit is a self-contained change with its own diff and reasoning.
+### 2. Folder-stratified selection
+Even with `faces` strategy the well-lit folder still dominates picks that don't contain faces. Easy lever: enforce "at most K per subdir" on top of any selection strategy. Wire as a `--max-per-folder` knob on cmd_run + a checkbox in the GUI welcome screen.
 
-## Things still genuinely open
+### 3. Face library improvements
+The library shows thumbnails + sample count + rename/forget. Missing:
+- Showing other frames the centroid matches against, so the user can see whether a centroid has drifted.
+- Merging two names (Alice + Alice-bad-spelling) into one centroid average.
+- "Forget this sample" surgery: remove a single frame's contribution from a name without nuking the whole centroid.
 
-1. **Open `reports/final.html`** — the latest full diagnostic grid (1033 frames, dedup-aware, scene-classified). Top-10 ranked JPEGs are at `reports/final_top10/` with `manifest.json` next to them. If the rank-1 frames look like keepers, the loop is closing. If they look wrong, label another batch via the UI and retrain.
-2. **Tune scene prompts.** ~60% of frames classified as `documentary_flat` — that prompt is too generic. Real fix needs your taste, not mine; current prompts are a v0 placeholder.
-3. **Build real `presets/*.xmp`** in darktable when on Linux. Until then the develop stage just copies the camera JPEG and notes the would-have-been preset in the manifest.
-4. **Linux story** — gphoto2 ingest (step 10), udev/systemd (step 13), notify-send (step 14). All blocked on the dual-boot.
+### 4. Linux story (still blocked on dual-boot)
+- `banger ingest` via gphoto2 (skeleton was sketched in v0.5 plan).
+- udev rule + systemd user unit so plugging the a6600 in triggers a run.
+- `notify-send` summary at end of run.
+- Real darktable `.xmp` presets per scene cluster (manual authoring step, needs darktable GUI).
 
-## Architecture left undone
+### 5. Packaging
+GUI is `python -m banger gui`. For a non-technical user, the install dance (python, venv, pip install) is too much. Two paths considered earlier:
+- PyInstaller bundle (~3 GB with torch + CLIP, but no install).
+- Tauri shell + PyInstaller sidecar (smaller installer, native window).
+Both deferred until the algorithm and UI feel stable enough to be worth installing.
 
-- **CLI is ~530 lines.** `cli.py:cmd_run` is the heaviest function (~180 lines). Worth a refactor when the next feature lands. Held back here because the loop wanted features over refactors.
-- **Develop is sequential.** Designed to be ProcessPoolExecutor-parallel; not material until darktable is in the loop and copy stops being instant.
-- **Per-prompt thresholds aren't populated.** The dict is empty by design — needs logged real-use data to know which prompts deserve which cut-off.
-- **No `aesthetic.encode_image` test.** It calls real CLIP. Indirectly exercised through the integration test (which mocks it out).
+## Known rough edges
 
-## Once this looks right, delete this file.
+- **mediapipe install on Python 3.12 + Windows** can fail in pip due to cv2.pyd file lock if the GUI is already running. Auto-setup uses `--no-deps` to work around it, but on a truly fresh env it may need a manual `pip install mediapipe` once.
+- **Insightface CPU extraction** is ~1s per face-bearing frame. First `--strategy faces` run on a thousand-frame folder takes ~15 min. Subsequent runs hit the cache. GPU path is wired but disabled (insightface fights CLIP for the 4 GB GPU).
+- **Caminito skew on the test set** when the taste head has heavy caminito labelling. Either label more non-caminito frames via the UI's `order: uncertain` toggle, or use `faces` strategy to break the visual-cluster tie. See item 2 above for a third lever.
+
+## Things I've decided not to do
+
+- A general-purpose photo browser. This tool is a culler / triage helper, not a library manager.
+- Cloud upload / sync. Files-only is the value proposition.
+- Replacing Lightroom for real edits. Develop step is "apply one preset" tops.
+- Multi-camera support. A6600 vendor/product ID is hard-coded.
+- Backwards-compat shims for the older `face_embeddings` cache format beyond what's already in `face_id.decode_from_cache`.

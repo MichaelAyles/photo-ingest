@@ -39,7 +39,7 @@ import imagehash
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from banger import aesthetic, caption as caption_mod, dedup, eyes as eyes_mod, face, face_id as face_id_mod, face_names, tags as tags_mod
+from banger import aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod, face_names, tags as tags_mod
 from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
 from banger import xmp as xmp_mod
@@ -763,31 +763,6 @@ def build_app(window_holder: dict | None = None) -> Flask:
         serial = [[t, round(s, 4)] for t, s in pairs]
         state.update_frame_metadata(sha, tags=serial)
         return jsonify({"tags": serial, "cached": False})
-
-    @app.route("/api/caption/<sha>")
-    def caption_for(sha):
-        """Return a cached BLIP caption, or generate one now.
-
-        Lazy by design: the model load + first generate cost ~10-15s, only
-        paid the first time the user clicks any photo. The result lands in
-        metadata/<sha>.json so subsequent opens of the same photo are instant.
-        """
-        meta = state.load_frame_metadata(sha) or {}
-        if "caption" in meta:
-            return jsonify({"caption": meta["caption"], "cached": True})
-
-        f = sha_to_frame.get(sha)
-        if f is None:
-            return jsonify({"error": "unknown sha"}), 404
-        try:
-            preview = load_preview(f.classify_path)
-        except Exception as e:
-            return jsonify({"caption": "", "error": str(e)}), 200
-
-        text = caption_mod.caption(preview)
-        if text:
-            state.update_frame_metadata(sha, caption=text)
-        return jsonify({"caption": text, "cached": False})
 
     @app.route("/api/details/<sha>")
     def details(sha):
