@@ -9,7 +9,7 @@ from pathlib import Path
 import imagehash
 import numpy as np
 
-from banger import aesthetic, dedup, eyes as eyes_mod, face, metrics as metrics_mod, scenes, select, server, state, taste_head
+from banger import aesthetic, dedup, eyes as eyes_mod, face, metrics as metrics_mod, scene_kmeans, scenes, select, server, state, taste_head
 from banger import develop as develop_mod
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
@@ -151,6 +151,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "train",
         help="Train a Ridge taste head on labelled CLIP embeddings.",
     )
+
+    scenes_cmd = sub.add_parser("scenes", help="Manage the KMeans scene clusters.")
+    scenes_sub = scenes_cmd.add_subparsers(dest="scenes_action", required=True)
+    fit_p = scenes_sub.add_parser("fit", help="Cluster cached CLIP embeddings.")
+    fit_p.add_argument("-k", type=int, default=5, help="Number of clusters (default 5).")
+    scenes_sub.add_parser("show", help="Print the current cluster summary.")
 
     sub.add_parser(
         "version",
@@ -442,19 +448,35 @@ def cmd_run(
                 suppressed_count += 1
 
     # Scene classification: only for frames that survive both gates.
+    # If a KMeans model is on disk, route via cluster id; otherwise fall back
+    # to the prompt-based router so behaviour is preserved pre-fit.
+    scene_clusters = scene_kmeans.load()
+    if scene_clusters is not None:
+        log.info(
+            "scene routing: KMeans(k=%d) cluster ids → cluster_NN preset slots",
+            scene_clusters.k,
+        )
     scene_done = 0
+    scene_cluster_ids: dict[str, int] = {}
     for row, _ci, emb in dedup_inputs:
         if not row.cluster_best:
             continue
         try:
-            match = scenes.classify(emb)
+            if scene_clusters is not None:
+                info = scene_clusters.classify_embedding(emb)
+                row.scene_preset = info.preset
+                row.scene_score = float(np.dot(emb, info.centroid))
+                row.scene_fell_back = False
+                scene_cluster_ids[row.frame.display_name] = info.cluster_id
+            else:
+                match = scenes.classify(emb)
+                row.scene_preset = match.preset
+                row.scene_score = match.score
+                row.scene_fell_back = match.fell_back
+            scene_done += 1
         except Exception as e:
             log.warning("scene classify skip %s: %s", row.frame.display_name, e)
             continue
-        row.scene_preset = match.preset
-        row.scene_score = match.score
-        row.scene_fell_back = match.fell_back
-        scene_done += 1
 
     elapsed = time.monotonic() - t0
     sharps = [r.sharpness for r in rows]
@@ -518,7 +540,7 @@ def cmd_run(
     if write_xmp and rows:
         from banger import xmp as xmp_mod
 
-        n = xmp_mod.write_for_rows(rows)
+        n = xmp_mod.write_for_rows(rows, cluster_ids=scene_cluster_ids or None)
         log.info("wrote %d XMP sidecars (rating from rank, label from scene)", n)
 
     if output_dir is not None:
@@ -882,6 +904,11 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_label(args.input_dir, args.recursive, args.score, args.stems)
     if args.command == "train":
         return cmd_train()
+    if args.command == "scenes":
+        if args.scenes_action == "fit":
+            return 0 if scene_kmeans.fit(k=args.k) is not None else 2
+        if args.scenes_action == "show":
+            return scene_kmeans.print_summary()
     if args.command == "ui":
         return cmd_ui(args.input_dir, args.port)
     if args.command == "labels":
