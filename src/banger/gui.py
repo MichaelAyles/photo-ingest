@@ -39,7 +39,10 @@ import imagehash
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
-from banger import aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod, face_names, tags as tags_mod
+from banger import (
+    aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
+    face_names, library, tags as tags_mod,
+)
 from banger import metrics as metrics_mod
 from banger import scene_kmeans, scenes, select, state, taste_head
 from banger import xmp as xmp_mod
@@ -94,6 +97,11 @@ _jobs: dict[str, JobState] = {}
 _jobs_lock = threading.Lock()
 _recent_folders: list[str] = []
 _label_subprocesses: dict[str, dict] = {}  # input_dir -> {"port": int, "proc": subprocess.Popen}
+
+# Library-side state. _scan_progress holds the most recent ScanProgress object
+# for each root being indexed; the API surfaces it for the progress bar.
+_scan_progress: dict[int, library.ScanProgress] = {}
+_scan_lock = threading.Lock()
 
 # Auto-setup status, polled by the SPA splash. Updated by _auto_setup as it
 # walks through scene fit / mediapipe install. The splash overlay polls
@@ -472,10 +480,162 @@ def build_app(window_holder: dict | None = None) -> Flask:
     app = Flask(__name__)
     sha_to_frame: dict[str, Any] = {}
 
+    def _resolve_path(sha: str) -> Path | None:
+        """Find the source path for a sha. Prefers the in-memory map (frames
+        from the current scoring job); falls back to the library index, which
+        knows about every photo in every watched root. This is why a thumbnail
+        click in the Library tab can reach a file the scoring pipeline has
+        never touched."""
+        f = sha_to_frame.get(sha)
+        if f is not None:
+            return f.classify_path
+        return library.lookup_path(sha)
+
+    def _resolve_frame(sha: str):
+        """Like _resolve_path but returns a Frame-shaped object so the existing
+        sha_to_frame consumers (which expect .classify_path) keep working
+        regardless of which side the sha came from."""
+        if sha in sha_to_frame:
+            return sha_to_frame[sha]
+        path = library.lookup_path(sha)
+        if path is None:
+            return None
+        # Lazily synthesise a minimal frame-like object. We don't have a
+        # banger.frames.Frame in the library row (no separate jpeg/raw pair),
+        # but classify_path is all most consumers actually use.
+        from banger.frames import Frame
+        from banger.preview import JPEG_SUFFIXES
+        is_jpeg = path.suffix in JPEG_SUFFIXES
+        return Frame(
+            stem=path.stem, subdir="",
+            jpeg=path if is_jpeg else None,
+            raw=None if is_jpeg else path,
+        )
+
     @app.route("/")
     @app.route("/gui")
     def root():
         return render_template_string(_SPA_TEMPLATE)
+
+    @app.route("/api/library/roots", methods=["GET"])
+    def library_roots():
+        return jsonify({
+            "roots": [
+                {**r.__dict__, "frame_count": library.count_frames(r.id)}
+                for r in library.all_roots()
+            ],
+        })
+
+    @app.route("/api/library/roots", methods=["POST"])
+    def library_add_root():
+        data = request.get_json(silent=True) or {}
+        path = (data.get("path") or "").strip()
+        label = (data.get("label") or "").strip() or None
+        if not path:
+            return jsonify({"error": "path required"}), 400
+        try:
+            root = library.add_root(Path(path), label=label)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+        return jsonify(root.__dict__)
+
+    @app.route("/api/library/roots/<int:root_id>", methods=["DELETE"])
+    def library_remove_root(root_id):
+        if library.remove_root(root_id):
+            return jsonify({"removed": root_id})
+        return jsonify({"error": "unknown root"}), 404
+
+    @app.route("/api/library/scan/<int:root_id>", methods=["POST"])
+    def library_scan(root_id):
+        root = library.get_root(root_id)
+        if root is None:
+            return jsonify({"error": "unknown root"}), 404
+        with _scan_lock:
+            existing = _scan_progress.get(root_id)
+            if existing is not None and existing.phase not in ("done", "error"):
+                return jsonify({"status": "already scanning", **existing.to_view()}), 200
+            progress = library.ScanProgress(
+                root_id=root_id, root_path=root.path, started_at=time.monotonic()
+            )
+            _scan_progress[root_id] = progress
+
+        def _go():
+            try:
+                library.scan_root(root_id, progress=progress)
+            except Exception as e:
+                log.exception("scan failed: %s", e)
+        threading.Thread(target=_go, daemon=True).start()
+        return jsonify({"status": "started", **progress.to_view()})
+
+    @app.route("/api/library/scan-status/<int:root_id>")
+    def library_scan_status(root_id):
+        with _scan_lock:
+            progress = _scan_progress.get(root_id)
+        if progress is None:
+            return jsonify({"phase": "idle"})
+        return jsonify(progress.to_view())
+
+    @app.route("/api/library/cameras")
+    def library_cameras():
+        return jsonify({
+            "cameras": [{"model": m, "count": c} for m, c in library.cameras()],
+        })
+
+    @app.route("/api/library/folders/<int:root_id>")
+    def library_folders(root_id):
+        return jsonify({
+            "folders": [{"name": n or "(root)", "count": c}
+                        for n, c in library.folder_tree(root_id)],
+        })
+
+    @app.route("/api/library/frames")
+    def library_frames():
+        # All filters are optional; missing = no filter.
+        root_id = request.args.get("root_id", type=int)
+        subdir = request.args.get("subdir") or None
+        camera = request.args.get("camera") or None
+        after = request.args.get("after", type=int)
+        before = request.args.get("before", type=int)
+        limit = request.args.get("limit", type=int, default=500)
+        offset = request.args.get("offset", type=int, default=0)
+        face_name = request.args.get("face") or None
+        min_score = request.args.get("min_score", type=int)
+
+        rows = library.query_frames(
+            root_id=root_id, subdir=subdir, camera=camera,
+            after=after, before=before, limit=limit, offset=offset,
+        )
+        # Enrich each frame with whatever the existing metadata cache + label DB
+        # carry. We're crossing a boundary here: library has fast SQL filters
+        # for root/camera/date, label/metadata filters happen in Python over
+        # the returned page. That's fine while pages stay <1k frames.
+        labels_map = state.labels_dict() if min_score is not None else None
+        out = []
+        for r in rows:
+            meta = state.load_frame_metadata(r.sha) or {}
+            label = labels_map.get(r.sha) if labels_map is not None else state.get_label(r.sha)
+            # Face-name post-filter: any of the matched names equals `face_name`.
+            if face_name is not None:
+                detections = meta.get("face_detections") or []
+                matched_names = set()
+                for d in detections:
+                    emb = np.asarray(d.get("embedding") or [], dtype=np.float32)
+                    if emb.size == face_names.EMB_DIM:
+                        n, _sim = face_names.match(emb)
+                        if n:
+                            matched_names.add(n)
+                if face_name not in matched_names:
+                    continue
+            if min_score is not None and (label is None or label < min_score):
+                continue
+            out.append({
+                **r.to_view(),
+                "label": label,
+                "tags": meta.get("tags"),
+                "has_face_data": bool(meta.get("face_detections")),
+                "scored": "metrics" in meta,
+            })
+        return jsonify({"frames": out, "total": len(out)})
 
     @app.route("/api/recent-folders")
     def recent_folders():
@@ -528,13 +688,13 @@ def build_app(window_holder: dict | None = None) -> Flask:
         path = state.thumbnail_path(sha)
         if path.exists():
             return send_file(path, mimetype="image/jpeg")
-        f = sha_to_frame.get(sha)
-        if f is None:
+        src = _resolve_path(sha)
+        if src is None:
             return ("not found", 404)
         try:
-            preview = load_preview(f.classify_path)
+            preview = load_preview(src)
         except Exception as e:
-            log.warning("thumb fail %s: %s", f.display_name, e)
+            log.warning("thumb fail %s: %s", src, e)
             return ("preview failed", 500)
         state.cache_thumbnail(sha, encode_thumbnail_bytes(preview))
         return send_file(path, mimetype="image/jpeg")
@@ -544,13 +704,13 @@ def build_app(window_holder: dict | None = None) -> Flask:
         path = state.preview_jpeg_path(sha)
         if path.exists():
             return send_file(path, mimetype="image/jpeg")
-        f = sha_to_frame.get(sha)
-        if f is None:
+        src = _resolve_path(sha)
+        if src is None:
             return ("not found", 404)
         try:
-            preview_arr = load_preview(f.classify_path)
+            preview_arr = load_preview(src)
         except Exception as e:
-            log.warning("preview fail %s: %s", f.display_name, e)
+            log.warning("preview fail %s: %s", src, e)
             return ("preview failed", 500)
         state.cache_preview_jpeg(sha, _encode_preview_jpeg(preview_arr))
         return send_file(path, mimetype="image/jpeg")
@@ -585,7 +745,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
             # Older metadata only has face_embeddings (no bboxes). If we have
             # those, fall back to inferring positions by re-extracting; that
             # requires reloading the preview though.
-            f = sha_to_frame.get(sha)
+            f = _resolve_frame(sha)
             if f is None:
                 return jsonify({"faces": [], "error": "unknown sha"}), 404
             try:
@@ -632,7 +792,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
         if len(bbox) != 4:
             return ("no bbox", 404)
 
-        f = sha_to_frame.get(sha)
+        f = _resolve_frame(sha)
         if f is None:
             return ("unknown sha", 404)
         try:
@@ -679,7 +839,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
         # name; existing names keep whatever thumbnail they already have).
         thumb_bytes = None
         bbox = detections[face_idx].get("bbox") or []
-        f = sha_to_frame.get(sha)
+        f = _resolve_frame(sha)
         if len(bbox) == 4 and f is not None:
             try:
                 preview = load_preview(f.classify_path)
@@ -773,7 +933,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
         JPEG with PIL. RAW EXIF would need rawpy + a separate parser, deferred
         until a real ARW shoot lands in test_photos.
         """
-        f = sha_to_frame.get(sha)
+        f = _resolve_frame(sha)
         if f is None:
             return jsonify({"error": "unknown sha"}), 404
         meta = state.load_frame_metadata(sha) or {}
@@ -1188,6 +1348,42 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .overlay .close { position: absolute; top: 1rem; right: 1rem; background: var(--bg3); color: var(--fg); border: 1px solid var(--line); padding: .35rem .8rem; border-radius: 4px; cursor: pointer; z-index: 1; }
   .overlay .hint { position: absolute; bottom: 1rem; left: 50%; transform: translateX(-50%); color: var(--dim); font-size: .7rem; pointer-events: none; }
 
+  /* library */
+  .lib-shell { display: flex; height: 100%; min-height: 0; }
+  .lib-sidebar { flex: 0 0 240px; background: #0a0a0a; border-right: 1px solid var(--line); overflow-y: auto; padding: 1rem .8rem; }
+  .lib-sidebar h3 { margin: 0 0 .5rem; font-size: .68rem; color: var(--dim); font-weight: 500; text-transform: uppercase; letter-spacing: .1em; }
+  .lib-section { margin-bottom: 1.5rem; }
+  .lib-roots, .lib-folders { list-style: none; margin: 0; padding: 0; }
+  .lib-roots li, .lib-folders li { padding: .35rem .55rem; border-radius: 4px; cursor: pointer; font-size: .8rem; color: #ccc; display: flex; justify-content: space-between; align-items: center; gap: .4rem; font-family: ui-monospace, monospace; }
+  .lib-roots li:hover, .lib-folders li:hover { background: var(--bg2); }
+  .lib-roots li.active, .lib-folders li.active { background: var(--bg3); color: var(--accent); }
+  .lib-roots li .count, .lib-folders li .count { color: var(--dim); font-size: .7rem; }
+  .lib-roots li .remove { color: var(--dim); font-size: .8rem; cursor: pointer; opacity: 0; transition: opacity .15s; padding: 0 .25rem; }
+  .lib-roots li:hover .remove { opacity: 1; }
+  .lib-roots li .remove:hover { color: var(--red); }
+  .lib-add button { background: transparent; color: var(--dim); border: 1px dashed var(--line); border-radius: 4px; padding: .35rem .6rem; width: 100%; font: inherit; font-size: .75rem; cursor: pointer; margin-top: .35rem; }
+  .lib-add button:hover { color: var(--accent); border-color: var(--accent); }
+  .lib-filter-row { display: flex; justify-content: space-between; align-items: center; gap: .4rem; font-size: .75rem; color: var(--dim); margin: .25rem 0; }
+  .lib-filter-row select { background: var(--bg2); border: 1px solid var(--line); color: var(--fg); border-radius: 3px; padding: 2px 5px; font: inherit; font-size: .75rem; flex: 1 1 auto; max-width: 140px; }
+  .lib-main { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+  .lib-toolbar { flex: 0 0 auto; padding: .8rem 1rem; border-bottom: 1px solid var(--line); display: flex; align-items: center; gap: .8rem; background: #0f0f0f; }
+  .lib-toolbar h2 { margin: 0; font-weight: 500; font-size: 1rem; }
+  .lib-toolbar .lib-meta { color: var(--dim); font-size: .75rem; font-variant-numeric: tabular-nums; }
+  .lib-toolbar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .8rem; font-size: .8rem; }
+  .lib-toolbar button:hover { border-color: var(--accent); }
+  .lib-toolbar button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
+  .lib-grid { flex: 1 1 auto; overflow-y: auto; padding: .8rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: .5rem; align-content: start; }
+  .lib-cell { background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color .12s; position: relative; }
+  .lib-cell:hover { border-color: var(--accent); }
+  .lib-cell .lib-img-wrap { aspect-ratio: 3/2; background: #000; }
+  .lib-cell .lib-img-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .lib-cell .lib-label { padding: .3rem .5rem; font-size: .7rem; color: #ccc; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .lib-cell .lib-label .lib-rating { color: #ffd56a; margin-right: .35rem; }
+  .lib-cell .lib-badges { position: absolute; top: 4px; left: 4px; display: flex; gap: 3px; }
+  .lib-cell .lib-badge { background: rgba(0,0,0,.7); color: #ddd; font-size: .6rem; padding: 1px 5px; border-radius: 2px; font-family: ui-monospace, monospace; }
+  .lib-cell .lib-badge.scored { color: var(--green); }
+  .lib-cell .lib-badge.face { color: #c9d; }
+
   /* setup splash (full-screen blocker during auto-setup) */
   .splash { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 100; flex-direction: column; gap: 1.2rem; }
   .splash.show { display: flex; }
@@ -1205,6 +1401,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
   <h1>banger</h1>
   <nav>
     <button data-view="welcome" class="active">Welcome</button>
+    <button data-view="library">Library</button>
     <button data-view="running" id="nav-running" style="display:none">Running</button>
     <button data-view="results" id="nav-results" style="display:none">Results</button>
     <button data-view="label" id="nav-label" style="display:none">Label</button>
@@ -1263,6 +1460,53 @@ _SPA_TEMPLATE = r"""<!doctype html>
     <button id="btn-rerun">Run again</button>
   </div>
   <div class="grid" id="results-grid"></div>
+</section>
+
+<section class="view hidden" id="view-library" style="padding:0;display:none">
+  <div class="lib-shell">
+    <aside class="lib-sidebar">
+      <div class="lib-section">
+        <h3>Watched folders</h3>
+        <ul class="lib-roots" id="lib-roots"></ul>
+        <div class="lib-add">
+          <button id="lib-add-root">+ add folder</button>
+        </div>
+      </div>
+      <div class="lib-section" id="lib-folder-section" style="display:none">
+        <h3>Subfolders</h3>
+        <ul class="lib-folders" id="lib-folders"></ul>
+      </div>
+      <div class="lib-section">
+        <h3>Filter</h3>
+        <label class="lib-filter-row">camera
+          <select id="lib-filter-camera"><option value="">any</option></select>
+        </label>
+        <label class="lib-filter-row">face
+          <select id="lib-filter-face"><option value="">any</option></select>
+        </label>
+        <label class="lib-filter-row">min star
+          <select id="lib-filter-star">
+            <option value="">any</option>
+            <option value="-5">-5+</option><option value="-3">-3+</option><option value="0">0+</option>
+            <option value="1">+1+</option><option value="3">+3+</option><option value="5">+5</option>
+          </select>
+        </label>
+      </div>
+    </aside>
+    <div class="lib-main">
+      <div class="lib-toolbar">
+        <h2 id="lib-title">Library</h2>
+        <span class="lib-meta" id="lib-meta"></span>
+        <button id="lib-scan" style="margin-left:auto">Rescan</button>
+        <button id="lib-score" class="primary">Score this view</button>
+      </div>
+      <div class="lib-grid" id="lib-grid">
+        <p class="empty" style="grid-column:1/-1;color:var(--dim);text-align:center;padding:3rem">
+          Add a watched folder on the left to get started.
+        </p>
+      </div>
+    </div>
+  </div>
 </section>
 
 <section class="view hidden" id="view-label" style="padding:0">
@@ -1341,6 +1585,7 @@ function show(view) {
 $$("header nav button").forEach(b => b.addEventListener("click", () => {
   show(b.dataset.view);
   if (b.dataset.view === "settings") loadFaceLibrary();
+  if (b.dataset.view === "library") loadLibrary();
 }));
 
 function toast(msg, ms=1800) {
@@ -1760,6 +2005,247 @@ async function loadRecent() {
   if (!data.folders.length) { ul.innerHTML = '<li style="color:var(--dim);cursor:default">no recent folders yet</li>'; return; }
   ul.innerHTML = data.folders.map(f => `<li data-path="${escapeHtml(f)}"><span>${escapeHtml(f)}</span><span class="go">↵ run</span></li>`).join("");
   ul.querySelectorAll("li[data-path]").forEach(li => li.addEventListener("click", () => startRun(li.dataset.path)));
+}
+
+// ===== Library tab =====
+let libState = {
+  activeRootId: null,
+  activeSubdir: null,
+  cameraFilter: "",
+  faceFilter: "",
+  starFilter: "",
+};
+
+async function loadLibrary() {
+  await refreshLibraryRoots();
+  await refreshLibraryFaces();
+  await refreshLibraryCameras();
+  await refreshLibraryGrid();
+}
+
+async function refreshLibraryRoots() {
+  try {
+    const res = await fetch("/api/library/roots");
+    const d = await res.json();
+    const ul = $("#lib-roots");
+    if (!d.roots.length) {
+      ul.innerHTML = '<li style="color:var(--dim);cursor:default;font-style:italic">no folders yet</li>';
+      libState.activeRootId = null;
+    } else {
+      ul.innerHTML = d.roots.map(r => `
+        <li data-root-id="${r.id}" class="${libState.activeRootId === r.id ? 'active' : ''}" title="${escapeHtml(r.path)}">
+          <span>${escapeHtml(r.label)}</span>
+          <span class="count">${r.frame_count}<span class="remove" data-root-id="${r.id}" title="remove">×</span></span>
+        </li>
+      `).join("");
+      ul.querySelectorAll("li[data-root-id]").forEach(li => {
+        li.addEventListener("click", e => {
+          if (e.target.classList.contains("remove")) return;
+          libState.activeRootId = parseInt(li.dataset.rootId);
+          libState.activeSubdir = null;
+          refreshLibraryRoots();
+          refreshLibraryFolders();
+          refreshLibraryGrid();
+        });
+        li.querySelector(".remove").addEventListener("click", async e => {
+          e.stopPropagation();
+          const id = parseInt(e.target.dataset.rootId);
+          if (!confirm("Stop watching this folder? (files stay on disk)")) return;
+          await fetch(`/api/library/roots/${id}`, {method: "DELETE"});
+          if (libState.activeRootId === id) libState.activeRootId = null;
+          loadLibrary();
+        });
+      });
+      if (libState.activeRootId === null) {
+        libState.activeRootId = d.roots[0].id;
+        refreshLibraryFolders();
+      }
+    }
+  } catch (e) { console.error("roots:", e); }
+}
+
+async function refreshLibraryFolders() {
+  const section = $("#lib-folder-section");
+  if (libState.activeRootId === null) { section.style.display = "none"; return; }
+  try {
+    const res = await fetch("/api/library/folders/" + libState.activeRootId);
+    const d = await res.json();
+    if (!d.folders.length) { section.style.display = "none"; return; }
+    section.style.display = "";
+    const ul = $("#lib-folders");
+    ul.innerHTML = '<li data-subdir="" class="' + (libState.activeSubdir === null ? 'active' : '') + '"><span>(all)</span></li>' +
+      d.folders.filter(f => f.name !== "(root)").map(f => `
+        <li data-subdir="${escapeHtml(f.name)}" class="${libState.activeSubdir === f.name ? 'active' : ''}">
+          <span>${escapeHtml(f.name)}</span><span class="count">${f.count}</span>
+        </li>
+      `).join("");
+    ul.querySelectorAll("li[data-subdir]").forEach(li => {
+      li.addEventListener("click", () => {
+        libState.activeSubdir = li.dataset.subdir || null;
+        refreshLibraryFolders();
+        refreshLibraryGrid();
+      });
+    });
+  } catch (e) { console.error("folders:", e); }
+}
+
+async function refreshLibraryCameras() {
+  try {
+    const res = await fetch("/api/library/cameras");
+    const d = await res.json();
+    const sel = $("#lib-filter-camera");
+    sel.innerHTML = '<option value="">any</option>' + d.cameras.map(c =>
+      `<option value="${escapeHtml(c.model)}">${escapeHtml(c.model)} (${c.count})</option>`
+    ).join("");
+    sel.value = libState.cameraFilter;
+  } catch (e) { console.error("cameras:", e); }
+}
+
+async function refreshLibraryFaces() {
+  try {
+    const res = await fetch("/api/face/library");
+    const d = await res.json();
+    const sel = $("#lib-filter-face");
+    sel.innerHTML = '<option value="">any</option>' + (d.names || []).map(n =>
+      `<option value="${escapeHtml(n.name)}">${escapeHtml(n.name)}</option>`
+    ).join("");
+    sel.value = libState.faceFilter;
+  } catch (e) { console.error("faces:", e); }
+}
+
+async function refreshLibraryGrid() {
+  const grid = $("#lib-grid");
+  const meta = $("#lib-meta");
+  if (libState.activeRootId === null) {
+    grid.innerHTML = '<p class="empty" style="grid-column:1/-1;color:var(--dim);text-align:center;padding:3rem">Add a watched folder on the left to get started.</p>';
+    meta.textContent = "";
+    return;
+  }
+  const params = new URLSearchParams();
+  params.set("root_id", libState.activeRootId);
+  if (libState.activeSubdir) params.set("subdir", libState.activeSubdir);
+  if (libState.cameraFilter) params.set("camera", libState.cameraFilter);
+  if (libState.faceFilter) params.set("face", libState.faceFilter);
+  if (libState.starFilter !== "") params.set("min_score", libState.starFilter);
+  params.set("limit", "500");
+
+  meta.textContent = "loading…";
+  try {
+    const res = await fetch("/api/library/frames?" + params);
+    const d = await res.json();
+    meta.textContent = `${d.total} frame${d.total === 1 ? '' : 's'}`;
+    if (!d.frames.length) {
+      grid.innerHTML = '<p class="empty" style="grid-column:1/-1;color:var(--dim);text-align:center;padding:3rem">No frames match (try clearing filters or rescanning).</p>';
+      return;
+    }
+    grid.innerHTML = d.frames.map(f => {
+      const ratingChip = (f.label !== null && f.label !== undefined)
+        ? `<span class="lib-rating">${f.label >= 0 ? '+' : ''}${f.label}</span>` : "";
+      const badges = [];
+      if (f.scored) badges.push('<span class="lib-badge scored">S</span>');
+      if (f.has_face_data) badges.push('<span class="lib-badge face">F</span>');
+      return `
+        <div class="lib-cell" data-sha="${f.sha}" data-display="${escapeHtml(f.rel_path)}">
+          <div class="lib-img-wrap">
+            <img loading="lazy" src="/api/thumb/${f.sha}" alt="${escapeHtml(f.rel_path)}">
+            ${badges.length ? `<div class="lib-badges">${badges.join("")}</div>` : ""}
+          </div>
+          <div class="lib-label">${ratingChip}${escapeHtml(f.stem)}</div>
+        </div>`;
+    }).join("");
+    grid.querySelectorAll(".lib-cell").forEach(cell => {
+      const sha = cell.dataset.sha;
+      const display = cell.dataset.display;
+      cell.addEventListener("click", () => {
+        // Synthesise a pick-shaped object so the existing openHero / detail
+        // overlay code works unchanged.
+        const pick = {
+          sha, rank: 0, stem: display.split("/").pop().replace(/\.[^.]+$/, ""),
+          subdir: display.includes("/") ? display.substring(0, display.lastIndexOf("/")) : "",
+          display, kind: "jpeg", sharpness: 0, aesthetic: null, aesthetic_source: null,
+          scene_preset: null,
+        };
+        openHero(pick);
+      });
+    });
+  } catch (e) {
+    console.error("grid:", e);
+    meta.textContent = "load failed";
+    grid.innerHTML = `<p class="empty" style="grid-column:1/-1;color:var(--red);text-align:center;padding:3rem">${escapeHtml(e.message)}</p>`;
+  }
+}
+
+$("#lib-add-root").addEventListener("click", async () => {
+  const res = await fetch("/api/folder-pick", {method: "POST"});
+  const d = await res.json();
+  if (!d.path) {
+    if (d.reason && d.reason !== "cancelled") toast("Folder pick: " + d.reason);
+    return;
+  }
+  const r = await fetch("/api/library/roots", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({path: d.path}),
+  });
+  if (!r.ok) { toast("add failed: " + await r.text()); return; }
+  const added = await r.json();
+  libState.activeRootId = added.id;
+  await refreshLibraryRoots();
+  await refreshLibraryFolders();
+  // Kick a scan immediately so the user sees frames appear.
+  startLibraryScan(added.id);
+});
+
+$("#lib-filter-camera").addEventListener("change", e => {
+  libState.cameraFilter = e.target.value;
+  refreshLibraryGrid();
+});
+$("#lib-filter-face").addEventListener("change", e => {
+  libState.faceFilter = e.target.value;
+  refreshLibraryGrid();
+});
+$("#lib-filter-star").addEventListener("change", e => {
+  libState.starFilter = e.target.value;
+  refreshLibraryGrid();
+});
+$("#lib-scan").addEventListener("click", () => {
+  if (libState.activeRootId === null) return;
+  startLibraryScan(libState.activeRootId);
+});
+$("#lib-score").addEventListener("click", async () => {
+  if (libState.activeRootId === null) return;
+  // Resolve the folder path: root.path + (subdir if selected).
+  const rootsRes = await fetch("/api/library/roots");
+  const rd = await rootsRes.json();
+  const root = rd.roots.find(r => r.id === libState.activeRootId);
+  if (!root) return;
+  const path = libState.activeSubdir ? `${root.path}/${libState.activeSubdir}` : root.path;
+  startRun(path);
+});
+
+async function startLibraryScan(rootId) {
+  toast("Scanning…", 1500);
+  try {
+    await fetch("/api/library/scan/" + rootId, {method: "POST"});
+    pollLibraryScan(rootId);
+  } catch (e) { toast("scan failed: " + e.message); }
+}
+
+async function pollLibraryScan(rootId) {
+  try {
+    const res = await fetch("/api/library/scan-status/" + rootId);
+    const d = await res.json();
+    $("#lib-meta").textContent = `${d.phase} · ${d.indexed_new} new, ${d.indexed_updated} updated, ${d.removed} removed`;
+    if (d.phase === "done" || d.phase === "error") {
+      await refreshLibraryRoots();
+      await refreshLibraryFolders();
+      await refreshLibraryCameras();
+      await refreshLibraryGrid();
+      toast(d.phase === "done" ? "Scan complete" : "Scan errored: " + (d.error || ""));
+      return;
+    }
+  } catch (e) { console.error("scan poll:", e); }
+  setTimeout(() => pollLibraryScan(rootId), 800);
 }
 
 async function loadFaceLibrary() {
