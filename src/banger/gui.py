@@ -40,17 +40,17 @@ import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from banger import (
-    aesthetic, dedup, editor as editor_mod, eyes as eyes_mod, face,
+    aesthetic, dedup, eyes as eyes_mod, face,
     face_id as face_id_mod, face_names, library, tagger as tagger_mod,
     tags as tags_mod,
 )
 from banger import metrics as metrics_mod
-from banger import scene_kmeans, scenes, select, state, taste_head
+from banger import scene_kmeans, scenes, select, settings as settings_mod, state, taste_head
 from banger import xmp as xmp_mod
 from banger.frames import discover_frames
 from banger.preview import load_preview
 from banger.report import Row, encode_thumbnail_bytes
-from banger.sharpness import CONFIG as SHARP_CFG, sharpness_from_preview
+from banger.sharpness import sharpness_from_preview
 
 log = logging.getLogger("banger.gui")
 
@@ -96,6 +96,9 @@ class JobState:
 
 _jobs: dict[str, JobState] = {}
 _jobs_lock = threading.Lock()
+# In-flight scoring jobs keyed by absolute input_dir path. A second /api/run
+# for the same path returns the running job_id instead of spawning a duplicate.
+_active_runs: dict[str, str] = {}  # path -> job_id
 _recent_folders: list[str] = []
 _label_subprocesses: dict[str, dict] = {}  # input_dir -> {"port": int, "proc": subprocess.Popen}
 
@@ -132,12 +135,13 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
 
     try:
         opts = job.options
+        cfg = settings_mod.load()
         recursive = bool(opts.get("recursive", True))
-        top_n = int(opts.get("top_n", 10))
-        strategy = str(opts.get("strategy", "kmeans"))
-        diversity = float(opts.get("diversity", 0.5))
-        face_gate = bool(opts.get("face_gate", False))
-        eye_gate = bool(opts.get("eye_gate", False))
+        top_n = int(opts.get("top_n", cfg["top_n"]))
+        strategy = str(opts.get("strategy", cfg["strategy"]))
+        diversity = float(opts.get("diversity", cfg["mmr_diversity"]))
+        face_gate = bool(opts.get("face_gate", cfg["face_gate"]))
+        eye_gate = bool(opts.get("eye_gate", cfg["eye_gate"]))
         write_xmp = bool(opts.get("write_xmp", False))
 
         job.stage = "discovering"
@@ -149,7 +153,8 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
             return
         log_line(f"discovered {len(frames)} frames")
 
-        threshold = SHARP_CFG["threshold"]
+        threshold = float(cfg["sharpness_threshold"])
+        face_sharp_threshold = float(cfg["face_sharpness_threshold"])
         head = taste_head.load()
         sc_clusters = scene_kmeans.load()
         if eye_gate and not eyes_mod.mediapipe_available():
@@ -234,7 +239,7 @@ def _run_job(job: JobState, sha_to_frame: dict[str, Any]) -> None:
                     continue
                 cold += 1
 
-            if face_gate and face_count > 0 and face_sharp < face.FACE_SHARPNESS_THRESHOLD:
+            if face_gate and face_count > 0 and face_sharp < face_sharp_threshold:
                 face_gated += 1
                 continue
             if (
@@ -399,6 +404,95 @@ def _format_exposure(secs: float | None) -> str | None:
 _METERING_MODES = {0: "unknown", 1: "average", 2: "centre-weighted", 3: "spot",
                    4: "multi-spot", 5: "matrix", 6: "partial"}
 _FLASH_FIRED = lambda v: "fired" if (isinstance(v, int) and v & 1) else "no flash"
+
+
+def _render_gallery_html(title: str, items: list[dict]) -> str:
+    """Self-contained HTML gallery — thumbnails embedded as base64 so the
+    file is portable / shareable on its own."""
+    import html as _html
+
+    def esc(s) -> str:
+        return _html.escape(str(s)) if s is not None else ""
+
+    def fmt_exif(exif: dict) -> str:
+        if not exif:
+            return ""
+        bits = []
+        cam = " ".join(filter(None, [exif.get("camera_make"), exif.get("camera_model")])).strip()
+        if cam: bits.append(esc(cam))
+        if exif.get("lens_model"): bits.append(esc(exif["lens_model"]))
+        details = []
+        if exif.get("focal_length"): details.append(f"{exif['focal_length']:.0f}mm")
+        if exif.get("f_number"): details.append(f"f/{exif['f_number']:.1f}")
+        if exif.get("shutter"): details.append(exif["shutter"])
+        if exif.get("iso"): details.append(f"ISO {exif['iso']}")
+        if details: bits.append(esc(" · ".join(details)))
+        if exif.get("date_taken"): bits.append(esc(exif["date_taken"]))
+        return "<br>".join(bits)
+
+    cards = []
+    for m in items:
+        tags_html = " ".join(f"<span class='tag'>{esc(t)}</span>" for t in m.get("tags") or [])
+        faces = m.get("faces") or []
+        face_chips = "".join(f"<span class='face'>{esc(n)}</span>" for n in faces)
+        face_note = ""
+        if m.get("face_count") and not faces:
+            face_note = f"<span class='face muted'>{m['face_count']} unnamed face{'s' if m['face_count'] > 1 else ''}</span>"
+        aesthetic = m.get("aesthetic")
+        aest_str = f"{aesthetic:+.2f}" if aesthetic is not None else "—"
+        cards.append(f"""
+<article class='card'>
+  <div class='thumb'><img src='data:image/jpeg;base64,{m.get("thumb_b64", "")}' alt='{esc(m["source"])}'></div>
+  <div class='body'>
+    <header>
+      <span class='rank'>#{m["rank"]:02d}</span>
+      <span class='name'>{esc(m["source"])}</span>
+    </header>
+    <div class='stats'>
+      <span title='Laplacian variance'>sharp <b>{m.get("sharpness", 0):.0f}</b></span>
+      <span title='Aesthetic score ({esc(m.get("aesthetic_source") or "n/a")})'>aesthetic <b>{aest_str}</b></span>
+    </div>
+    <div class='tags'>{tags_html}</div>
+    <div class='faces'>{face_chips}{face_note}</div>
+    <div class='exif'>{fmt_exif(m.get("exif") or {})}</div>
+  </div>
+</article>
+""")
+
+    return f"""<!doctype html>
+<html lang='en'><head><meta charset='utf-8'>
+<title>{esc(title)} — banger gallery</title>
+<style>
+  :root {{ color-scheme: dark; --bg:#0c0c0c; --bg2:#161616; --bg3:#1f1f1f; --fg:#e6e6e6; --dim:#888; --line:#2a2a2a; --accent:#9be37b; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); padding: 1.5rem 2rem 3rem; }}
+  h1 {{ font-weight: 400; font-size: 1.3rem; margin: 0 0 .3rem; }}
+  .meta {{ color: var(--dim); font-size: .8rem; margin-bottom: 1.4rem; }}
+  .grid {{ display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); }}
+  .card {{ background: var(--bg2); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; display: flex; flex-direction: column; }}
+  .thumb {{ background: #000; aspect-ratio: 4 / 3; overflow: hidden; }}
+  .thumb img {{ width: 100%; height: 100%; object-fit: cover; display: block; }}
+  .body {{ padding: .7rem .9rem 1rem; display: flex; flex-direction: column; gap: .5rem; min-height: 0; }}
+  header {{ display: flex; gap: .6rem; align-items: baseline; }}
+  .rank {{ font-variant-numeric: tabular-nums; color: var(--accent); font-weight: 600; }}
+  .name {{ font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .82rem; color: var(--fg); }}
+  .stats {{ display: flex; gap: 1rem; font-size: .78rem; color: var(--dim); }}
+  .stats b {{ color: var(--fg); font-weight: 600; font-variant-numeric: tabular-nums; }}
+  .tags {{ display: flex; flex-wrap: wrap; gap: .25rem; }}
+  .tag {{ background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 10px; padding: .1rem .55rem; font-size: .7rem; }}
+  .faces {{ display: flex; flex-wrap: wrap; gap: .25rem; }}
+  .face {{ background: rgba(155, 227, 123, .12); color: var(--accent); border: 1px solid rgba(155, 227, 123, .3); border-radius: 10px; padding: .1rem .55rem; font-size: .7rem; }}
+  .face.muted {{ background: var(--bg3); color: var(--dim); border-color: var(--line); }}
+  .exif {{ color: var(--dim); font-size: .73rem; line-height: 1.5; }}
+</style></head>
+<body>
+<h1>{esc(title)}</h1>
+<div class='meta'>{len(items)} frames · originals are in this same folder · generated by banger</div>
+<div class='grid'>
+{"".join(cards)}
+</div>
+</body></html>
+"""
 
 
 def _extract_exif(path: Path) -> dict:
@@ -571,83 +665,130 @@ def build_app(window_holder: dict | None = None) -> Flask:
         resp.headers["Expires"] = "0"
         return resp
 
-    @app.route("/api/develop/<sha>", methods=["GET"])
-    def develop_get(sha):
-        p = editor_mod.load_params(sha)
+    @app.route("/api/settings", methods=["GET"])
+    def settings_get():
         return jsonify({
-            "params": editor_mod.to_dict(p),
-            "has_edits": editor_mod.has_edits(sha),
+            "values": settings_mod.load(),
+            "defaults": settings_mod.DEFAULTS,
+            "fields": settings_mod.FIELD_META,
         })
 
-    @app.route("/api/develop/<sha>", methods=["POST"])
-    def develop_save(sha):
+    @app.route("/api/settings", methods=["POST"])
+    def settings_save():
         data = request.get_json(silent=True) or {}
-        p = editor_mod.from_dict(data.get("params") or {})
-        editor_mod.save_params(sha, p)
-        return jsonify({"saved": True, "params": editor_mod.to_dict(p)})
+        if data.get("reset"):
+            return jsonify({"values": settings_mod.reset()})
+        return jsonify({"values": settings_mod.save(data.get("updates") or {})})
 
-    @app.route("/api/develop/<sha>/render")
-    def develop_render(sha):
-        """Render the preview-size image with the given params, return JPEG.
+    @app.route("/api/cull", methods=["POST"])
+    def cull():
+        """Run selection from cached metadata only — no preview reads, no
+        re-tagging. Returns picks for a given list of SHAs.
 
-        Params come via query string so the SPA can fire a fast GET on each
-        slider move. We always render from the 1024px preview cache; the
-        full-size export endpoint is separate.
+        Body: {shas: [...], top_n, strategy, diversity, bias_tags: [...],
+               bias_strength: 0.0..1.0}
+
+        If any sha lacks a cached embedding, returns
+        {needs_indexing: true, missing: N} so the caller can fall back to
+        /api/run for a full pass. Bias is applied additively to the
+        normalised aesthetic score: matching tags push a frame upward but
+        don't filter out anything.
         """
-        from flask import Response
-        import cv2
+        from banger.report import Row as _Row
 
-        params_dict = {}
-        for k in editor_mod.DevelopParams.__dataclass_fields__:
-            v = request.args.get(k)
-            if v is None:
+        data = request.get_json(silent=True) or {}
+        shas = data.get("shas") or []
+        if not shas:
+            return jsonify({"error": "shas list required"}), 400
+        cfg = settings_mod.load()
+        top_n = int(data.get("top_n", cfg["top_n"]))
+        strategy = str(data.get("strategy", cfg["strategy"]))
+        diversity = float(data.get("diversity", cfg["mmr_diversity"]))
+        bias_tags = [str(t).lower() for t in (data.get("bias_tags") or [])]
+        bias_strength = float(data.get("bias_strength", 0.3))
+        threshold = float(cfg["sharpness_threshold"])
+
+        head = taste_head.load()
+        candidates: list[tuple[Row, float, np.ndarray]] = []
+        missing = 0
+        face_embs_for_strategy: list[list[np.ndarray]] = []
+        for sha in shas:
+            emb = state.load_embedding(sha)
+            meta = state.load_frame_metadata(sha)
+            if emb is None or meta is None or "sharpness" not in meta:
+                missing += 1
                 continue
-            if k == "crop":
-                # crop comes as "x,y,w,h" normalised.
+            sharp = float(meta["sharpness"])
+            if sharp < threshold:
+                continue
+            frame = _resolve_frame(sha)
+            if frame is None:
+                continue
+            if head is not None:
                 try:
-                    parts = [float(x) for x in v.split(",")]
-                    if len(parts) == 4:
-                        params_dict["crop"] = {"x": parts[0], "y": parts[1],
-                                              "w": parts[2], "h": parts[3]}
-                except ValueError:
-                    pass
+                    score = float(head.predict(emb.reshape(1, -1))[0])
+                    source = "taste"
+                except Exception:
+                    score, _ = aesthetic.score_from_embedding(emb)
+                    source = "aesthetic"
             else:
-                try:
-                    params_dict[k] = float(v)
-                except ValueError:
-                    pass
+                score, _ = aesthetic.score_from_embedding(emb)
+                source = "aesthetic"
 
-        params = editor_mod.from_dict(params_dict)
-        # Reuse cached preview if present; else load + cache.
-        preview_path = state.preview_jpeg_path(sha)
-        if preview_path.exists():
-            img = cv2.imread(str(preview_path), cv2.IMREAD_COLOR)
+            if bias_tags:
+                tags = [t.lower() for t, _ in (meta.get("tags") or [])]
+                if any(bt in tags for bt in bias_tags):
+                    score = score + bias_strength
+
+            row = _Row(
+                frame=frame, sharpness=sharp, aesthetic=score,
+                aesthetic_breakdown=None, aesthetic_source=source,
+                thumb_b64="", scene_preset=None,
+                metrics=meta.get("metrics"), eyes=meta.get("eyes"),
+            )
+            candidates.append((row, score, emb))
+            if strategy == "faces":
+                payload = meta.get("face_detections") or meta.get("face_embeddings")
+                face_embs_for_strategy.append(face_id_mod.decode_from_cache(payload))
+
+        if missing and missing > len(shas) * 0.05:
+            return jsonify({"needs_indexing": True, "missing": missing, "total": len(shas)})
+
+        if not candidates:
+            return jsonify({"picks": [], "considered": len(shas), "missing": missing})
+
+        if strategy == "topk":
+            chosen = select.select_top_k(candidates, n=top_n)
+        elif strategy == "mmr":
+            chosen = select.select_diverse_top_n(candidates, n=top_n, diversity_lambda=diversity)
+        elif strategy == "faces":
+            chosen = select.select_faces_top_n(
+                candidates, face_embs_per_item=face_embs_for_strategy, n=top_n,
+            )
         else:
-            src = _resolve_path(sha)
-            if src is None:
-                return ("unknown sha", 404)
-            img = load_preview(src)
-            state.cache_preview_jpeg(sha, _encode_preview_jpeg(img))
-        out = editor_mod.apply_develop(img, params)
-        ok, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if not ok:
-            return ("encode failed", 500)
-        return Response(buf.tobytes(), mimetype="image/jpeg")
+            chosen = select.select_kmeans_top_n(candidates, n=top_n)
+
+        picks = []
+        for rank, (row, _s, _e) in enumerate(chosen, start=1):
+            sha = state.sha256_of(row.frame.classify_path)
+            picks.append({
+                "rank": rank, "sha": sha,
+                "stem": row.frame.stem,
+                "sharpness": round(row.sharpness, 1),
+                "aesthetic": round(row.aesthetic, 3),
+                "aesthetic_source": row.aesthetic_source,
+            })
+        return jsonify({"picks": picks, "considered": len(candidates), "missing": missing})
 
     @app.route("/api/export-bangers", methods=["POST"])
     def export_bangers():
-        """The cull + auto-edit + ship workflow in one call.
+        """Copy the given SHAs' originals into ~/Pictures/bangers/<ts>[_label]/.
 
-        Body: {shas: [sha, sha, ...], output_root: str | None,
-               auto_edit: bool = True, label: str | None}
-        Creates ~/Pictures/bangers/<ts>/raw and /edits, copies sources to
-        /raw, and renders auto-edited JPEGs to /edits. Returns the folder
-        path so the UI can offer 'reveal in explorer'.
-
-        Synchronous because the typical export is N<=50 files and we want a
-        single response with the final path. A background-job version with
-        progress is the obvious next step if users start exporting in bulk.
+        Body: {shas: [...], output_root: str | None, label: str | None}
+        Also writes a manifest.json and a self-contained gallery.html
+        (thumbnails embedded as base64) so the folder is shareable as-is.
         """
+        import base64
         import datetime as _dt
         import shutil
 
@@ -655,7 +796,6 @@ def build_app(window_holder: dict | None = None) -> Flask:
         shas = data.get("shas") or []
         if not shas:
             return jsonify({"error": "shas list required"}), 400
-        auto_edit = data.get("auto_edit", True)
         label_hint = (data.get("label") or "").strip()
 
         root_raw = (data.get("output_root") or "").strip()
@@ -667,98 +807,118 @@ def build_app(window_holder: dict | None = None) -> Flask:
         if label_hint:
             ts = f"{ts}_{label_hint}"
         folder = root / ts
-        raw_dir = folder / "raw"
-        edits_dir = folder / "edits"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        edits_dir.mkdir(parents=True, exist_ok=True)
+        folder.mkdir(parents=True, exist_ok=True)
 
         copied = 0
-        edited = 0
         errors: list[str] = []
         manifest: list[dict] = []
+        head = taste_head.load()
 
         for rank, sha in enumerate(shas, start=1):
             src = _resolve_path(sha)
             if src is None:
                 errors.append(f"unknown sha: {sha}")
                 continue
-
-            # Copy original to /raw. Preserve filename + extension so subsequent
-            # darktable / Lightroom workflows can match by name.
-            raw_dst = raw_dir / src.name
-            if not raw_dst.exists():
-                try:
-                    shutil.copy2(src, raw_dst)
-                    copied += 1
-                except OSError as e:
-                    errors.append(f"copy {src.name}: {e}")
+            siblings = [src]
+            for suffix in (".ARW", ".CR2", ".CR3", ".NEF", ".RAF", ".DNG",
+                           ".RW2", ".ORF", ".PEF", ".JPG", ".JPEG"):
+                sib = src.with_suffix(suffix)
+                if sib != src and sib.exists() and sib not in siblings:
+                    siblings.append(sib)
+            copied_names = []
+            for s in siblings:
+                dst = folder / s.name
+                if dst.exists():
+                    copied_names.append(s.name)
                     continue
-            else:
-                copied += 1
+                try:
+                    shutil.copy2(s, dst)
+                    copied += 1
+                    copied_names.append(s.name)
+                except OSError as e:
+                    errors.append(f"copy {s.name}: {e}")
 
-            # Auto-develop. Pull cached develop params if the user has already
-            # edited this frame; otherwise derive from metrics.
+            # Gather stats for the gallery.
             meta = state.load_frame_metadata(sha) or {}
-            params = editor_mod.from_dict(meta.get("develop") or {})
-            is_default = params == editor_mod.DevelopParams()
-            if auto_edit and is_default:
-                params = editor_mod.auto_params(meta.get("metrics"))
-            edit_name = f"{rank:02d}_{src.stem}.jpg"
-            edit_dst = edits_dir / edit_name
-            try:
-                editor_mod.export_jpeg(src, params, edit_dst)
-                edited += 1
-                manifest.append({
-                    "rank": rank, "sha": sha,
-                    "source": src.name, "edit": edit_name,
-                    "params": editor_mod.to_dict(params),
-                    "auto_edited": auto_edit and is_default,
-                })
-            except Exception as e:
-                errors.append(f"edit {src.name}: {e}")
+            emb = state.load_embedding(sha)
+            aesthetic_score = None
+            aesthetic_source = None
+            if emb is not None:
+                try:
+                    if head is not None:
+                        aesthetic_score = float(head.predict(emb.reshape(1, -1))[0])
+                        aesthetic_source = "taste"
+                    else:
+                        aesthetic_score, _ = aesthetic.score_from_embedding(emb)
+                        aesthetic_source = "aesthetic"
+                except Exception:
+                    pass
 
-        # Drop a manifest so the user can see what was applied.
+            exif = _extract_exif(src)
+            tags = [t for t, _s in (meta.get("tags") or [])][:8]
+            face_count = int(meta.get("face_count") or 0)
+            face_names_list: list[str] = []
+            for det in (meta.get("face_detections") or []):
+                emb_arr = np.asarray(det.get("embedding") or [], dtype=np.float32)
+                if emb_arr.size == face_names.EMB_DIM:
+                    nm, _sim = face_names.match(emb_arr)
+                    if nm:
+                        face_names_list.append(nm)
+
+            thumb_b64 = ""
+            tpath = state.thumbnail_path(sha)
+            if tpath.exists():
+                try:
+                    thumb_b64 = base64.b64encode(tpath.read_bytes()).decode("ascii")
+                except OSError:
+                    pass
+            if not thumb_b64:
+                try:
+                    preview = load_preview(src)
+                    thumb_b64 = base64.b64encode(encode_thumbnail_bytes(preview)).decode("ascii")
+                except Exception as e:
+                    log.warning("gallery thumb fail %s: %s", src.name, e)
+
+            manifest.append({
+                "rank": rank, "sha": sha, "source": src.name,
+                "files": copied_names,
+                "sharpness": round(float(meta.get("sharpness") or 0.0), 1),
+                "aesthetic": round(aesthetic_score, 3) if aesthetic_score is not None else None,
+                "aesthetic_source": aesthetic_source,
+                "tags": tags,
+                "face_count": face_count,
+                "faces": sorted(set(face_names_list)),
+                "exif": exif,
+                "thumb_b64": thumb_b64,
+            })
+
         try:
             import json as _json
+            # The manifest on disk doesn't need the giant thumb_b64 blobs.
+            slim = [{k: v for k, v in m.items() if k != "thumb_b64"} for m in manifest]
             (folder / "manifest.json").write_text(
                 _json.dumps({
                     "exported_at": int(time.time()),
                     "count": len(manifest),
-                    "auto_edit": auto_edit,
-                    "items": manifest,
+                    "items": slim,
                 }, indent=2),
                 encoding="utf-8",
             )
         except OSError:
             pass
 
+        # Render the gallery.
+        try:
+            html_path = folder / "gallery.html"
+            html_path.write_text(_render_gallery_html(folder.name, manifest), encoding="utf-8")
+        except OSError as e:
+            errors.append(f"gallery write: {e}")
+
         return jsonify({
             "folder": str(folder),
-            "raw_dir": str(raw_dir),
-            "edits_dir": str(edits_dir),
             "copied": copied,
-            "edited": edited,
-            "errors": errors[:10],  # truncate for response sanity
+            "errors": errors[:10],
         })
-
-    @app.route("/api/develop/<sha>/export", methods=["POST"])
-    def develop_export(sha):
-        """Render full-res and write a JPEG next to the source (or at `path`)."""
-        data = request.get_json(silent=True) or {}
-        src = _resolve_path(sha)
-        if src is None:
-            return jsonify({"error": "unknown sha"}), 404
-        params = editor_mod.from_dict(data.get("params") or {})
-        # Persist the params so reopening shows the same edits.
-        editor_mod.save_params(sha, params)
-        dst_raw = (data.get("path") or "").strip()
-        dst = Path(dst_raw).expanduser() if dst_raw else editor_mod.default_export_path(src)
-        try:
-            out = editor_mod.export_jpeg(src, params, dst)
-        except Exception as e:
-            log.exception("export failed")
-            return jsonify({"error": str(e)}), 500
-        return jsonify({"path": str(out)})
 
     @app.route("/api/import", methods=["POST"])
     def import_files():
@@ -1020,11 +1180,26 @@ def build_app(window_holder: dict | None = None) -> Flask:
             return jsonify({"error": f"Not a folder: {input_dir}"}), 400
         _record_folder(input_dir)
 
-        job = JobState(job_id=str(uuid.uuid4()), input_dir=input_dir, options=data)
+        key = str(input_dir.resolve())
         with _jobs_lock:
+            existing_id = _active_runs.get(key)
+            if existing_id is not None:
+                existing = _jobs.get(existing_id)
+                if existing is not None and existing.status in ("running", "queued"):
+                    return jsonify({"job_id": existing_id, "reused": True})
+            job = JobState(job_id=str(uuid.uuid4()), input_dir=input_dir, options=data)
             _jobs[job.job_id] = job
-        t = threading.Thread(target=_run_job, args=(job, sha_to_frame), daemon=True)
-        t.start()
+            _active_runs[key] = job.job_id
+
+        def _runner():
+            try:
+                _run_job(job, sha_to_frame)
+            finally:
+                with _jobs_lock:
+                    if _active_runs.get(key) == job.job_id:
+                        del _active_runs[key]
+
+        threading.Thread(target=_runner, daemon=True).start()
         return jsonify({"job_id": job.job_id})
 
     @app.route("/api/jobs/<job_id>")
@@ -1280,7 +1455,7 @@ def build_app(window_holder: dict | None = None) -> Flask:
         if emb is None:
             return jsonify({"tags": [], "error": "no cached embedding for this sha"}), 200
         try:
-            pairs = tags_mod.tag_from_embedding(emb)
+            pairs = tags_mod.tag_from_embedding(emb, min_sim=float(settings_mod.get("tag_min_sim")))
         except Exception as e:
             log.warning("tag compute failed for %s: %s", sha, e)
             return jsonify({"tags": [], "error": str(e)}), 200
@@ -1692,6 +1867,13 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .settings-card h3 { margin: 0 0 .6rem; font-size: .85rem; color: var(--dim); font-weight: 400; text-transform: uppercase; letter-spacing: .08em; }
   .settings-card label { display: flex; align-items: center; gap: .6rem; margin: .35rem 0; font-size: .85rem; }
   .settings-card label span.k { color: var(--dim); width: 130px; flex-shrink: 0; }
+  .lever-row { display: grid; grid-template-columns: 180px 1fr 70px; align-items: center; gap: .6rem; margin: .5rem 0; font-size: .82rem; }
+  .lever-row .lever-name { display: flex; align-items: center; gap: .35rem; color: var(--fg); }
+  .lever-row .lever-info { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border-radius: 50%; background: var(--bg3); color: var(--dim); font-size: .65rem; font-style: italic; cursor: help; user-select: none; border: 1px solid var(--line); }
+  .lever-row .lever-info:hover { background: var(--accent); color: #000; border-color: var(--accent); }
+  .lever-row input[type=range] { width: 100%; }
+  .lever-row input[type=number], .lever-row select { background: var(--bg3); color: var(--fg); border: 1px solid var(--line); border-radius: 3px; padding: .25rem .4rem; font-size: .8rem; width: 100%; }
+  .lever-row .lever-val { color: var(--dim); font-variant-numeric: tabular-nums; text-align: right; font-size: .78rem; }
   /* Bottom background-work strip. Subtle, hides when idle. Click expand to
      jump to the full Running view. */
   .bg-strip { position: fixed; left: 0; right: 0; bottom: 0; height: 28px; background: rgba(15,15,15,.94); border-top: 1px solid var(--line); display: flex; align-items: center; gap: .75rem; padding: 0 .8rem; z-index: 40; font-size: .72rem; color: #bbb; backdrop-filter: blur(4px); }
@@ -1844,6 +2026,9 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .modal-actions button.primary { background: var(--accent); color: #111; border-color: var(--accent); }
   .modal-actions button.muted { color: var(--dim); }
   .modal-status { color: var(--dim); font-size: .75rem; margin: .6rem 0 0; min-height: 1em; }
+  .look-chip { display: inline-flex; align-items: center; gap: .25rem; background: var(--bg3); color: #ccc; border: 1px solid var(--line); border-radius: 3px; padding: 2px 7px; font-size: .7rem; font-family: ui-monospace, monospace; cursor: pointer; }
+  .look-chip input { accent-color: var(--accent); margin: 0; }
+  .look-chip:has(input:checked) { color: var(--accent); border-color: var(--accent); background: rgba(255,170,85,.05); }
 
   /* setup splash (full-screen blocker during auto-setup) */
   .splash { position: fixed; inset: 0; background: var(--bg); display: none; align-items: center; justify-content: center; z-index: 100; flex-direction: column; gap: 1.2rem; }
@@ -1863,7 +2048,6 @@ _SPA_TEMPLATE = r"""<!doctype html>
   <nav>
     <button data-view="library" class="active">Library</button>
     <button data-view="welcome">Quick run</button>
-    <button data-view="editor" id="nav-editor" style="display:none">Editor</button>
     <button data-view="running" id="nav-running" style="display:none">Running</button>
     <button data-view="results" id="nav-results" style="display:none">Results</button>
     <button data-view="label" id="nav-label" style="display:none">Label</button>
@@ -1972,7 +2156,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
         <button id="lib-scan">Rescan</button>
         <button id="lib-index" title="Pre-compute tags, faces, scenes, scores for everything in the library so culling later is instant">Index all</button>
         <button id="lib-score">Score this view</button>
-        <button id="lib-export" class="primary" title="Cull current view + export top N to ~/Pictures/bangers/&lt;timestamp&gt;/{raw,edits}">Export bangers ↗</button>
+        <button id="lib-export" class="primary" title="Cull current view + copy top N originals to ~/Pictures/bangers/&lt;timestamp&gt;/">Export bangers ↗</button>
       </div>
       <div class="lib-grid" id="lib-grid">
         <div class="lib-onboarding" id="lib-onboarding">
@@ -1988,75 +2172,47 @@ _SPA_TEMPLATE = r"""<!doctype html>
   </div>
 </section>
 
-<section class="view hidden" id="view-editor" style="padding:0;overflow:hidden">
-  <div class="ed-shell">
-    <div class="ed-canvas">
-      <img id="ed-img" alt="">
-      <div class="ed-info" id="ed-info"></div>
+<div class="modal-backdrop" id="export-modal" style="display:none">
+  <div class="modal">
+    <h2>Export bangers</h2>
+    <p class="modal-hint">
+      Culls the current scope and copies the top-N originals (RAW + JPEG) into
+      <code>~/Pictures/bangers/&lt;timestamp&gt;[_label]/</code>. No editing,
+      no re-encoding — files are copied verbatim.
+    </p>
+    <div class="modal-row">
+      <label>Folder name</label>
+      <div class="modal-input">
+        <input type="text" id="exp-name" placeholder="(timestamp)">
+      </div>
     </div>
-    <aside class="ed-sidebar">
-      <div class="ed-toolbar">
-        <button id="ed-back" title="Back to library">← Library</button>
-        <button id="ed-before-after" title="Hold to see original">Before/After</button>
-        <button id="ed-reset" class="muted">Reset</button>
-        <button id="ed-export" class="primary">Export…</button>
+    <div class="modal-row">
+      <label>How many</label>
+      <div class="modal-input">
+        <input type="number" id="exp-count" value="10" min="1" max="500" style="width:100px;flex:0 0 100px">
       </div>
-      <div class="ed-section">
-        <h3>Light</h3>
-        <div class="slider-row" data-key="exposure">
-          <label>Exposure</label><span class="val">0</span>
-          <input type="range" min="-2" max="2" step="0.05" value="0">
-        </div>
-        <div class="slider-row" data-key="contrast">
-          <label>Contrast</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="highlights">
-          <label>Highlights</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="shadows">
-          <label>Shadows</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="whites">
-          <label>Whites</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="blacks">
-          <label>Blacks</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
+    </div>
+    <div class="modal-row">
+      <label>Preset</label>
+      <div class="modal-input">
+        <select id="exp-preset" style="flex:1">
+          <option value="diverse">Diverse — one per visual cluster (default)</option>
+          <option value="best">Best — pure aesthetic ranking</option>
+          <option value="mixed">Mixed — balanced score/diversity (MMR λ=0.5)</option>
+          <option value="people">People — one good shot per face</option>
+          <option value="landscapes">Landscapes — bias toward outdoor / scenery</option>
+          <option value="pets">Pets / wildlife — bias toward animals</option>
+          <option value="food">Food — bias toward food / drink shots</option>
+        </select>
       </div>
-      <div class="ed-section">
-        <h3>Colour</h3>
-        <div class="slider-row" data-key="saturation">
-          <label>Saturation</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="vibrance">
-          <label>Vibrance</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="temp">
-          <label>Temperature</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-        <div class="slider-row" data-key="tint">
-          <label>Tint</label><span class="val">0</span>
-          <input type="range" min="-100" max="100" step="1" value="0">
-        </div>
-      </div>
-      <div class="ed-section">
-        <h3>Geometry</h3>
-        <div class="slider-row" data-key="rotation">
-          <label>Rotation</label><span class="val">0°</span>
-          <input type="range" min="-15" max="15" step="0.1" value="0">
-        </div>
-      </div>
-    </aside>
+    </div>
+    <div class="modal-actions">
+      <button id="exp-cancel" class="muted">Cancel</button>
+      <button id="exp-go" class="primary">Export</button>
+    </div>
+    <p class="modal-status" id="exp-status"></p>
   </div>
-</section>
+</div>
 
 <div class="modal-backdrop" id="import-modal" style="display:none">
   <div class="modal">
@@ -2098,7 +2254,21 @@ _SPA_TEMPLATE = r"""<!doctype html>
 
 <section class="view hidden" id="view-settings">
   <div class="settings-pane">
-    <h2>Status</h2>
+    <h2>Pipeline levers</h2>
+    <div class="settings-card">
+      <h3>Cull tuning</h3>
+      <p style="margin:.3rem 0 .8rem;color:var(--dim);font-size:.75rem">
+        Hover the (i) next to each name for what it does. Changes take effect
+        on the next scan / score / export.
+      </p>
+      <div id="settings-levers"><p class="empty" style="color:var(--dim);font-size:.8rem">loading…</p></div>
+      <div style="margin-top:.8rem;display:flex;gap:.5rem;align-items:center">
+        <button id="settings-save" class="primary" style="background:var(--accent);color:#000;border:0;border-radius:4px;padding:.4rem .9rem;font-size:.8rem;cursor:pointer">Save</button>
+        <button id="settings-reset" style="background:var(--bg3);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:.4rem .9rem;font-size:.8rem;cursor:pointer">Reset to defaults</button>
+        <span id="settings-status" style="color:var(--dim);font-size:.75rem"></span>
+      </div>
+    </div>
+    <h2 style="margin-top:1.5rem">Status</h2>
     <div class="settings-card">
       <h3>Pipeline state</h3>
       <label><span class="k">Taste head</span><span id="st-head" class="badge">…</span></label>
@@ -2152,7 +2322,6 @@ _SPA_TEMPLATE = r"""<!doctype html>
 
 <div class="overlay" id="overlay">
   <button class="close" id="overlay-close">close</button>
-  <button class="close" id="overlay-edit" style="right: 5.5rem">Edit ✎</button>
   <div class="overlay-inner" id="overlay-inner">
     <div class="overlay-image"><img id="overlay-img"></div>
     <aside class="overlay-panel" id="overlay-panel"></aside>
@@ -2178,9 +2347,98 @@ function show(view) {
 
 $$("header nav button").forEach(b => b.addEventListener("click", () => {
   show(b.dataset.view);
-  if (b.dataset.view === "settings") loadFaceLibrary();
+  if (b.dataset.view === "settings") { loadFaceLibrary(); loadSettings(); }
   if (b.dataset.view === "library") loadLibrary();
 }));
+
+// ===== Settings (pipeline levers) =====
+let _settingsFields = {};
+async function loadSettings() {
+  try {
+    const res = await fetch("/api/settings");
+    const d = await res.json();
+    _settingsFields = d.fields || {};
+    renderSettings(d.values || {}, d.fields || {});
+  } catch (e) {
+    $("#settings-levers").innerHTML = `<p style="color:var(--red)">load failed: ${escapeHtml(e.message)}</p>`;
+  }
+}
+function renderSettings(values, fields) {
+  const order = ["sharpness_threshold","face_sharpness_threshold","top_n",
+                 "strategy","mmr_diversity","tag_min_sim","face_gate","eye_gate"];
+  const host = $("#settings-levers");
+  host.innerHTML = order.map(key => {
+    const meta = fields[key]; if (!meta) return "";
+    const v = values[key];
+    const info = `<span class="lever-info" title="${escapeHtml(meta.info || '')}">i</span>`;
+    const name = `<span class="lever-name">${escapeHtml(meta.label || key)} ${info}</span>`;
+    if (meta.type === "bool") {
+      return `<div class="lever-row" data-key="${key}">${name}
+        <label style="display:flex;align-items:center;gap:.4rem;font-size:.78rem"><input type="checkbox" ${v ? "checked" : ""}> on</label>
+        <span class="lever-val"></span></div>`;
+    }
+    if (meta.type === "choice") {
+      const opts = (meta.choices || []).map(c => `<option value="${escapeHtml(c)}" ${c === v ? "selected" : ""}>${escapeHtml(c)}</option>`).join("");
+      return `<div class="lever-row" data-key="${key}">${name}
+        <select>${opts}</select><span class="lever-val"></span></div>`;
+    }
+    const step = meta.step ?? 1;
+    const isSlider = (meta.max - meta.min) <= 500;
+    if (isSlider) {
+      return `<div class="lever-row" data-key="${key}">${name}
+        <input type="range" min="${meta.min}" max="${meta.max}" step="${step}" value="${v}">
+        <span class="lever-val">${v}</span></div>`;
+    }
+    return `<div class="lever-row" data-key="${key}">${name}
+      <input type="number" min="${meta.min}" max="${meta.max}" step="${step}" value="${v}">
+      <span class="lever-val"></span></div>`;
+  }).join("");
+  host.querySelectorAll(".lever-row input[type=range]").forEach(inp => {
+    const val = inp.parentElement.querySelector(".lever-val");
+    inp.addEventListener("input", () => { val.textContent = inp.value; });
+  });
+}
+function readSettings() {
+  const out = {};
+  $$(".lever-row").forEach(row => {
+    const key = row.dataset.key;
+    const meta = _settingsFields[key] || {};
+    if (meta.type === "bool") out[key] = row.querySelector("input[type=checkbox]").checked;
+    else if (meta.type === "choice") out[key] = row.querySelector("select").value;
+    else out[key] = parseFloat(row.querySelector("input").value);
+  });
+  return out;
+}
+document.addEventListener("click", async (e) => {
+  if (e.target && e.target.id === "settings-save") {
+    e.target.disabled = true;
+    $("#settings-status").textContent = "saving…";
+    try {
+      const res = await fetch("/api/settings", {
+        method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({updates: readSettings()}),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      $("#settings-status").textContent = "saved";
+      setTimeout(() => $("#settings-status").textContent = "", 1800);
+    } catch (err) {
+      $("#settings-status").textContent = "save failed: " + err.message;
+    } finally {
+      e.target.disabled = false;
+    }
+  }
+  if (e.target && e.target.id === "settings-reset") {
+    if (!confirm("Reset all pipeline levers to defaults?")) return;
+    const res = await fetch("/api/settings", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({reset: true}),
+    });
+    const d = await res.json();
+    renderSettings(d.values || {}, _settingsFields);
+    $("#settings-status").textContent = "reset to defaults";
+    setTimeout(() => $("#settings-status").textContent = "", 1800);
+  }
+});
 
 function toast(msg, ms=1800) {
   const t = $("#toast");
@@ -2227,9 +2485,7 @@ async function pollJob() {
         lastResults = j;
         $("#nav-results").style.display = "";
         renderResults(j);
-        // If the user kicked this via "Export bangers" in the library, run
-        // the export now instead of switching them to Results.
-        if (_pendingExportLabel !== null) {
+        if (_pendingExportOpts !== null) {
           _maybeAutoExport(j);
         } else if (currentView === "library") {
           show("results");
@@ -2551,17 +2807,6 @@ function renderPanel(pick, d) {
 function closeOverlay() { $("#overlay").classList.remove("show"); }
 
 $("#overlay-close").addEventListener("click", closeOverlay);
-$("#overlay-edit").addEventListener("click", () => {
-  const img = $("#overlay-img");
-  // Pull the sha from the preview URL we set when opening the overlay.
-  const m = img.src.match(/\/api\/preview\/([0-9a-f]+)/);
-  if (!m) return;
-  const sha = m[1];
-  const info = $("#overlay-info");
-  const display = info ? info.textContent : sha.slice(0, 12);
-  closeOverlay();
-  openEditor(sha, display);
-});
 // Click on the overlay backdrop closes; clicks inside .overlay-inner don't.
 $("#overlay").addEventListener("click", e => {
   if (e.target === $("#overlay")) closeOverlay();
@@ -2571,40 +2816,9 @@ document.addEventListener("keydown", e => {
 });
 
 $("#btn-rerun").addEventListener("click", () => show("welcome"));
-$("#btn-export-bangers").addEventListener("click", async () => {
-  if (!lastResults || !lastResults.picks.length) {
-    toast("Nothing to export yet"); return;
-  }
-  const shas = lastResults.picks.map(p => p.sha);
-  const label = prompt(
-    `Export ${shas.length} bangers to ~/Pictures/bangers/<timestamp>/raw + /edits.\n\n` +
-    `Originals get copied, edits get rendered with auto-tone derived from each photo's metrics. ` +
-    `Optional label appended to the folder name (e.g. 'caminito-trip'):`,
-    ""
-  );
-  if (label === null) return;  // cancel
-  const btn = $("#btn-export-bangers");
-  btn.disabled = true;
-  btn.textContent = "Exporting…";
-  try {
-    const res = await fetch("/api/export-bangers", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({shas, label, auto_edit: true}),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const d = await res.json();
-    toast(`Exported ${d.edited} edits + ${d.copied} originals to ${d.folder}`, 4000);
-    // Open the folder in OS file explorer.
-    await fetch("/api/open-folder", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({path: d.folder}),
-    });
-  } catch (e) {
-    toast("Export failed: " + e.message, 4000);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Export bangers ↗";
-  }
+$("#btn-export-bangers").addEventListener("click", () => {
+  if (!lastResults || !lastResults.picks.length) { toast("Nothing to export yet"); return; }
+  openExportModal({source: "results"});
 });
 $("#btn-label").addEventListener("click", async () => {
   if (!lastResults) return;
@@ -2664,172 +2878,6 @@ async function loadRecent() {
   ul.innerHTML = data.folders.map(f => `<li data-path="${escapeHtml(f)}"><span>${escapeHtml(f)}</span><span class="go">↵ run</span></li>`).join("");
   ul.querySelectorAll("li[data-path]").forEach(li => li.addEventListener("click", () => startRun(li.dataset.path)));
 }
-
-// ===== Editor =====
-let edState = {
-  sha: null,
-  display: null,
-  params: null,
-  rendering: false,
-  pendingParams: null,  // last params asked for while a render was in-flight
-  renderTimer: null,
-};
-
-const ED_KEYS = ["exposure","contrast","highlights","shadows","whites","blacks",
-                 "saturation","vibrance","temp","tint","rotation"];
-
-function edDefaults() {
-  const p = {};
-  ED_KEYS.forEach(k => p[k] = 0);
-  p.crop = null;
-  return p;
-}
-
-async function openEditor(sha, display) {
-  edState.sha = sha;
-  edState.display = display;
-  $("#nav-editor").style.display = "";
-  $("#ed-info").textContent = display;
-  $("#ed-img").src = "/api/preview/" + sha;  // baseline shown while we fetch params
-  try {
-    const res = await fetch("/api/develop/" + sha);
-    const d = await res.json();
-    edState.params = {...edDefaults(), ...(d.params || {})};
-  } catch (e) {
-    edState.params = edDefaults();
-  }
-  applyParamsToSliders();
-  show("editor");
-  scheduleRender();
-}
-
-function applyParamsToSliders() {
-  document.querySelectorAll("#view-editor .slider-row").forEach(row => {
-    const key = row.dataset.key;
-    const input = row.querySelector("input[type=range]");
-    const val = row.querySelector(".val");
-    const v = edState.params[key] ?? 0;
-    input.value = v;
-    val.textContent = key === "rotation" ? `${v.toFixed(1)}°`
-                    : key === "exposure" ? v.toFixed(2)
-                    : v.toFixed(0);
-  });
-}
-
-function readSliders() {
-  const p = {};
-  document.querySelectorAll("#view-editor .slider-row").forEach(row => {
-    const key = row.dataset.key;
-    const input = row.querySelector("input[type=range]");
-    p[key] = parseFloat(input.value);
-  });
-  return p;
-}
-
-function paramsToQuery(p) {
-  const parts = [];
-  for (const k of ED_KEYS) {
-    if (p[k] !== undefined && p[k] !== 0) parts.push(`${k}=${p[k]}`);
-  }
-  if (p.crop) parts.push(`crop=${p.crop.x},${p.crop.y},${p.crop.w},${p.crop.h}`);
-  return parts.join("&");
-}
-
-function scheduleRender() {
-  if (!edState.sha) return;
-  if (edState.renderTimer) clearTimeout(edState.renderTimer);
-  edState.renderTimer = setTimeout(doRender, 80);
-}
-
-async function doRender() {
-  if (!edState.sha) return;
-  if (edState.rendering) {
-    edState.pendingParams = readSliders();
-    return;
-  }
-  edState.rendering = true;
-  try {
-    const p = readSliders();
-    edState.params = {...(edState.params || {}), ...p};
-    const q = paramsToQuery(p);
-    const url = `/api/develop/${edState.sha}/render${q ? '?' + q : ''}`;
-    // Preload into a temp image so we don't see a flash; swap on load.
-    await new Promise((resolve) => {
-      const im = new Image();
-      im.onload = () => { $("#ed-img").src = im.src; resolve(); };
-      im.onerror = () => resolve();
-      im.src = url;
-    });
-  } finally {
-    edState.rendering = false;
-    if (edState.pendingParams) {
-      edState.pendingParams = null;
-      scheduleRender();
-    }
-  }
-}
-
-document.querySelectorAll("#view-editor .slider-row input[type=range]").forEach(input => {
-  const row = input.closest(".slider-row");
-  const val = row.querySelector(".val");
-  const key = row.dataset.key;
-  input.addEventListener("input", () => {
-    const v = parseFloat(input.value);
-    val.textContent = key === "rotation" ? `${v.toFixed(1)}°`
-                    : key === "exposure" ? v.toFixed(2)
-                    : v.toFixed(0);
-    scheduleRender();
-  });
-});
-
-$("#ed-reset").addEventListener("click", () => {
-  edState.params = edDefaults();
-  applyParamsToSliders();
-  scheduleRender();
-});
-
-$("#ed-back").addEventListener("click", async () => {
-  // Auto-save the current params before leaving.
-  if (edState.sha && edState.params) {
-    try {
-      await fetch("/api/develop/" + edState.sha, {
-        method: "POST", headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({params: edState.params}),
-      });
-    } catch (e) { /* ignore, edits stay in memory */ }
-  }
-  edState.sha = null;
-  $("#nav-editor").style.display = "none";
-  show("library");
-});
-
-$("#ed-export").addEventListener("click", async () => {
-  if (!edState.sha) return;
-  $("#ed-export").disabled = true;
-  $("#ed-export").textContent = "Exporting…";
-  try {
-    const res = await fetch(`/api/develop/${edState.sha}/export`, {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({params: edState.params}),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const d = await res.json();
-    toast(`Exported to ${d.path}`, 3000);
-  } catch (e) {
-    toast("Export failed: " + e.message, 3000);
-  } finally {
-    $("#ed-export").disabled = false;
-    $("#ed-export").textContent = "Export…";
-  }
-});
-
-// Hold to see the original; release to see edited.
-const beforeAfterBtn = $("#ed-before-after");
-beforeAfterBtn.addEventListener("mousedown", () => {
-  if (edState.sha) $("#ed-img").src = "/api/preview/" + edState.sha;
-});
-beforeAfterBtn.addEventListener("mouseup", () => doRender());
-beforeAfterBtn.addEventListener("mouseleave", () => doRender());
 
 // ===== Library tab =====
 let libState = {
@@ -3084,8 +3132,6 @@ async function refreshLibraryGrid() {
         };
         openHero(pick);
       });
-      // Double-click jumps straight to the editor, skipping the previewer.
-      cell.addEventListener("dblclick", () => openEditor(sha, display));
     });
   } catch (e) {
     console.error("grid:", e);
@@ -3208,46 +3254,31 @@ $("#lib-score").addEventListener("click", async () => {
   startRun(path);
 });
 
-$("#lib-export").addEventListener("click", async () => {
-  // Cull-and-export: run the scoring pipeline on the current scope, then
-  // export the top N as bangers. Reuses startRun's job mechanism; the
-  // pollJob done handler will trigger export when results land.
+$("#lib-export").addEventListener("click", () => {
   if (libState.activeRootId === null) { toast("Select a folder first"); return; }
-  const n = parseInt(prompt("How many bangers?", "10")) || 10;
-  const label = prompt(
-    `Optional label for the output folder (e.g. 'caminito-trip', appended to timestamp):`,
-    libState.activeSubdir || ""
-  );
-  if (label === null) return;
-  const rootsRes = await fetch("/api/library/roots");
-  const rd = await rootsRes.json();
-  const root = rd.roots.find(r => r.id === libState.activeRootId);
-  if (!root) return;
-  const path = libState.activeSubdir ? `${root.path}/${libState.activeSubdir}` : root.path;
-  // Queue the export to fire when this run finishes.
-  _pendingExportLabel = label;
-  _pendingExportN = n;
-  toast(`Culling ${path.split(/[\\/]/).pop()} then exporting top ${n}…`, 2500);
-  startRun(path);
+  openExportModal({source: "library", defaultName: libState.activeSubdir || ""});
 });
 
 let _pendingExportLabel = null;
 let _pendingExportN = null;
+let _pendingExportOpts = null;
 
 async function _maybeAutoExport(job) {
-  if (_pendingExportLabel === null || !job.picks || !job.picks.length) return;
-  const shas = job.picks.slice(0, _pendingExportN || job.picks.length).map(p => p.sha);
-  const label = _pendingExportLabel;
+  if (_pendingExportOpts === null || !job.picks || !job.picks.length) return;
+  const n = _pendingExportN || job.picks.length;
+  const shas = job.picks.slice(0, n).map(p => p.sha);
+  const opts = _pendingExportOpts;
   _pendingExportLabel = null;
   _pendingExportN = null;
+  _pendingExportOpts = null;
   try {
     const res = await fetch("/api/export-bangers", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({shas, label, auto_edit: true}),
+      body: JSON.stringify({shas, ...opts}),
     });
     if (!res.ok) throw new Error(await res.text());
     const d = await res.json();
-    toast(`Exported ${d.edited} bangers to ${d.folder}`, 4000);
+    toast(`Copied ${d.copied} files to ${d.folder}`, 4000);
     await fetch("/api/open-folder", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({path: d.folder}),
@@ -3255,6 +3286,123 @@ async function _maybeAutoExport(job) {
   } catch (e) {
     toast("Auto-export failed: " + e.message);
   }
+}
+
+// ===== Export modal =====
+let _exportContext = null;  // {source: 'results' | 'library', defaultName?}
+
+async function openExportModal({source, defaultName} = {}) {
+  _exportContext = {source: source || "results"};
+  $("#exp-name").value = "";
+  $("#exp-name").placeholder = "(timestamp)" + (defaultName ? ` — e.g. ${defaultName}` : "");
+  if (defaultName) $("#exp-name").value = defaultName;
+  $("#exp-count").value = (source === "results" && lastResults) ? lastResults.picks.length : 10;
+  $("#exp-status").textContent = "";
+  $("#exp-go").disabled = false;
+  $("#exp-go").textContent = "Export";
+  $("#export-modal").style.display = "flex";
+}
+
+$("#exp-cancel").addEventListener("click", () => $("#export-modal").style.display = "none");
+
+const EXP_PRESETS = {
+  best:       {strategy: "topk",   bias_tags: []},
+  diverse:    {strategy: "kmeans", bias_tags: []},
+  mixed:      {strategy: "mmr",    bias_tags: [], diversity: 0.5},
+  people:     {strategy: "faces",  bias_tags: []},
+  landscapes: {strategy: "kmeans", bias_tags: [
+    "mountain","hill","valley","forest","woods","meadow","beach","ocean","lake",
+    "river","waterfall","desert","cave","wide-angle landscape","aerial view","drone shot",
+  ]},
+  pets:       {strategy: "kmeans", bias_tags: [
+    "dog","cat","horse","bird","fish","lion","tiger","elephant","monkey",
+    "giraffe","zebra","wolf","bear","deer","cow","sheep",
+  ]},
+  food:       {strategy: "kmeans", bias_tags: [
+    "food","drink","coffee","wine","cake","pizza","restaurant","cafe","kitchen","eating","cooking",
+  ]},
+};
+
+$("#exp-go").addEventListener("click", async () => {
+  const label = $("#exp-name").value.trim();
+  const n = parseInt($("#exp-count").value) || 10;
+  const presetKey = $("#exp-preset").value || "diverse";
+  const preset = EXP_PRESETS[presetKey] || EXP_PRESETS.diverse;
+  const cullOpts = {top_n: n, ...preset};
+
+  // Gather candidate SHAs depending on source.
+  let shas = [];
+  if (_exportContext && _exportContext.source === "library") {
+    try { shas = await fetchLibraryShas(); }
+    catch (e) { $("#exp-status").textContent = "Couldn't read library: " + e.message; return; }
+  } else if (lastResults && lastResults.picks.length) {
+    shas = lastResults.picks.map(p => p.sha);
+  }
+  if (!shas.length) { $("#exp-status").textContent = "Nothing in scope"; return; }
+
+  $("#exp-go").disabled = true;
+  $("#exp-go").textContent = "Culling…";
+  $("#exp-status").textContent = `Picking ${n} from ${shas.length} via "${presetKey}"…`;
+
+  try {
+    const cullRes = await fetch("/api/cull", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({shas, ...cullOpts}),
+    });
+    if (!cullRes.ok) throw new Error(await cullRes.text());
+    const cd = await cullRes.json();
+    if (cd.needs_indexing) {
+      $("#exp-status").textContent = `${cd.missing}/${cd.total} frames not indexed yet — run "Index all" first.`;
+      $("#exp-go").disabled = false;
+      $("#exp-go").textContent = "Export";
+      return;
+    }
+    if (!cd.picks || !cd.picks.length) {
+      $("#exp-status").textContent = "No frames survived the sharpness gate.";
+      $("#exp-go").disabled = false;
+      $("#exp-go").textContent = "Export";
+      return;
+    }
+    const pickShas = cd.picks.map(p => p.sha);
+    $("#exp-go").textContent = "Copying…";
+    $("#exp-status").textContent = `Copying ${pickShas.length} originals…`;
+
+    const res = await fetch("/api/export-bangers", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({shas: pickShas, label}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    $("#exp-status").textContent = `Done. Copied ${d.copied} files.`;
+    await fetch("/api/open-folder", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({path: d.folder}),
+    });
+    setTimeout(() => $("#export-modal").style.display = "none", 1500);
+  } catch (e) {
+    $("#exp-status").textContent = "Failed: " + e.message;
+  } finally {
+    $("#exp-go").disabled = false;
+    $("#exp-go").textContent = "Export";
+  }
+});
+
+async function fetchLibraryShas() {
+  // Pull every sha currently in the active library scope by walking the
+  // existing /api/library/frames endpoint with a generous page size.
+  const params = new URLSearchParams();
+  if (libState.activeRootId) params.set("root_id", libState.activeRootId);
+  if (libState.activeSubdir) params.set("subdir", libState.activeSubdir);
+  if (libState.searchQ) params.set("q", libState.searchQ);
+  if (libState.filterCamera) params.set("camera", libState.filterCamera);
+  if (libState.filterFace) params.set("face", libState.filterFace);
+  if (libState.filterPlace) params.set("place", libState.filterPlace);
+  if (libState.filterMinStar) params.set("min_score", libState.filterMinStar);
+  params.set("limit", "5000");
+  const res = await fetch("/api/library/frames?" + params.toString());
+  if (!res.ok) throw new Error(await res.text());
+  const d = await res.json();
+  return (d.frames || []).map(f => f.sha);
 }
 
 async function startLibraryScan(rootId) {

@@ -6,10 +6,25 @@ Windows too (just creates the dir under the user's home).
 
 import hashlib
 import sqlite3
+import threading
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+
+# Per-sha lock for the metadata sidecar read-modify-write cycle. Two
+# pipeline threads can otherwise interleave: A reads, B reads, A writes, B
+# writes -> A's fields are silently dropped. SQLite is already serialized
+# by SQLite itself; this lock is only for the JSON sidecars and the .npy
+# embedding files.
+_sha_locks_guard = threading.Lock()
+_sha_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+
+
+def _sha_lock(sha: str) -> threading.Lock:
+    with _sha_locks_guard:
+        return _sha_locks[sha]
 
 STATE_DIR = Path.home() / ".local" / "share" / "banger-pipeline"
 EMBEDDINGS_DIR = STATE_DIR / "embeddings"
@@ -82,7 +97,8 @@ def sha256_of(path: Path) -> str:
 
 def cache_embedding(sha: str, emb: np.ndarray) -> None:
     _ensure_dirs()
-    np.save(EMBEDDINGS_DIR / f"{sha}.npy", emb.astype(np.float32))
+    with _sha_lock(sha):
+        np.save(EMBEDDINGS_DIR / f"{sha}.npy", emb.astype(np.float32))
 
 
 def load_embedding(sha: str) -> np.ndarray | None:
@@ -150,7 +166,8 @@ def cache_frame_metadata(
         payload["face_embeddings"] = face_embeddings
     if face_detections:
         payload["face_detections"] = face_detections
-    (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
+    with _sha_lock(sha):
+        (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
 
 
 def update_frame_metadata(sha: str, **fields) -> None:
@@ -160,14 +177,15 @@ def update_frame_metadata(sha: str, **fields) -> None:
     import json
 
     p = METADATA_DIR / f"{sha}.json"
-    if not p.exists():
-        return
-    try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    payload.update(fields)
-    p.write_text(json.dumps(payload), encoding="utf-8")
+    with _sha_lock(sha):
+        if not p.exists():
+            return
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        payload.update(fields)
+        p.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def load_frame_metadata(sha: str) -> dict | None:

@@ -11,9 +11,9 @@ import numpy as np
 
 from banger import (
     aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
-    metrics as metrics_mod, scene_kmeans, scenes, select, server, state, taste_head,
+    metrics as metrics_mod, scene_kmeans, scenes, select, server,
+    settings as settings_mod, state, taste_head,
 )
-from banger import develop as develop_mod
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
 from banger.frames import discover_frames
@@ -23,7 +23,6 @@ from banger.sharpness import CONFIG as SHARPNESS_CONFIG
 from banger.sharpness import sharpness_from_preview
 
 DEFAULT_TOP_N = int(os.environ.get("BANGER_TOP_N", "10"))
-PRESETS_DIR = Path(__file__).resolve().parent.parent.parent / "presets"
 
 
 def _default_output_dir() -> Path | None:
@@ -81,8 +80,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "--face-gate",
         action="store_true",
         help=(
-            "Also reject frames whose detected faces are softer than "
-            f"face.FACE_SHARPNESS_THRESHOLD (={face.FACE_SHARPNESS_THRESHOLD}). "
+            "Also reject frames whose detected faces are softer than the "
+            "configured face-sharpness threshold (tunable via the Settings tab). "
             "Frames without a detected face still go through the global gate only."
         ),
     )
@@ -248,7 +247,9 @@ def cmd_run(
         log.warning("no supported images in %s", input_dir)
         return 0
 
-    threshold = SHARPNESS_CONFIG["threshold"]
+    cfg = settings_mod.load()
+    threshold = float(cfg["sharpness_threshold"])
+    face_sharp_threshold = float(cfg["face_sharpness_threshold"])
     head = taste_head.load()
 
     if eye_gate and not eyes_mod.mediapipe_available():
@@ -416,7 +417,7 @@ def cmd_run(
             face_gate
             and a_score is not None
             and face_count > 0
-            and face_sharp < face.FACE_SHARPNESS_THRESHOLD
+            and face_sharp < face_sharp_threshold
         ):
             face_gated += 1
             # Pretend the frame failed the global gate so it lands in REJECT.
@@ -428,7 +429,7 @@ def cmd_run(
             phash = None
             log.info(
                 "REJECT (face soft, %.1f < %.1f) %s",
-                face_sharp, face.FACE_SHARPNESS_THRESHOLD, f.display_name,
+                face_sharp, face_sharp_threshold, f.display_name,
             )
 
         # Eye-aware gate: same shape as face-gate but on EAR via mediapipe.
@@ -637,79 +638,49 @@ def cmd_run(
                 )
                 chosen = select.select_kmeans_top_n(candidates, n=top_n)
             top_rows = [row for row, _s, _e in chosen]
-            _write_output(output_dir, top_rows, presets_dir=PRESETS_DIR)
+            _write_output(output_dir, top_rows)
     return 0
 
 
-def _write_output(output_dir: Path, top_rows: list[Row], presets_dir: Path) -> None:
+def _write_output(output_dir: Path, top_rows: list[Row]) -> None:
+    """Copy the top-N originals (RAW + JPEG sidecars) into output_dir, flat."""
+    import json as _json
+    import shutil
+
     log = logging.getLogger("banger")
     output_dir.mkdir(parents=True, exist_ok=True)
-    dt_cli = develop_mod.find_darktable()
-    if dt_cli is None:
-        log.info(
-            "darktable-cli not found — copy fallback for top %d to %s",
-            len(top_rows),
-            output_dir,
-        )
-    else:
-        log.info(
-            "developing top %d to %s (darktable-cli: %s, presets: %s)",
-            len(top_rows),
-            output_dir,
-            dt_cli,
-            presets_dir if presets_dir.is_dir() else "(none)",
-        )
+    log.info("copying top %d originals to %s", len(top_rows), output_dir)
 
-    used_counts: dict[str, int] = {}
     manifest_entries: list[dict] = []
+    copied = 0
     for rank, r in enumerate(top_rows, start=1):
-        src = r.frame.develop_path
-        # Output filename: NN_subdir_stem.jpg so the directory listing is sorted
-        # by rank and obviously identifies the source.
-        name_parts = []
-        if r.frame.subdir:
-            name_parts.append(r.frame.subdir.replace("/", "_"))
-        name_parts.append(r.frame.stem)
-        out_name = f"{rank:02d}_{'__'.join(name_parts)}.jpg"
-        dst = output_dir / out_name
-
-        result = develop_mod.develop_to_jpeg(
-            src=src,
-            dst=dst,
-            preset_name=r.scene_preset,
-            presets_dir=presets_dir,
-            darktable_cli=dt_cli,
-        )
-        used_counts[result.used] = used_counts.get(result.used, 0) + 1
-        manifest_entries.append(
-            {
-                "rank": rank,
-                "stem": r.frame.stem,
-                "subdir": r.frame.subdir,
-                "src_path": str(src),
-                "output_path": str(dst.relative_to(output_dir)),
-                "kind": r.frame.kind,
-                "sharpness": round(r.sharpness, 1),
-                "aesthetic": round(r.aesthetic, 3) if r.aesthetic is not None else None,
-                "aesthetic_source": r.aesthetic_source,
-                "scene_preset": r.scene_preset,
-                "scene_score": round(r.scene_score, 4) if r.scene_score is not None else None,
-                "scene_fell_back": r.scene_fell_back,
-                "cluster_size": r.cluster_size,
-                "developed_with": result.used,
-                "develop_note": result.note,
-            }
-        )
+        sources = [p for p in (r.frame.raw, r.frame.jpeg) if p is not None]
+        copied_names: list[str] = []
+        for src in sources:
+            dst = output_dir / src.name
+            if dst.exists():
+                copied_names.append(src.name)
+                continue
+            try:
+                shutil.copy2(src, dst)
+                copied += 1
+                copied_names.append(src.name)
+            except OSError as e:
+                log.warning("copy %s -> %s failed: %s", src, dst, e)
+        manifest_entries.append({
+            "rank": rank,
+            "stem": r.frame.stem,
+            "subdir": r.frame.subdir,
+            "kind": r.frame.kind,
+            "files": copied_names,
+            "sharpness": round(r.sharpness, 1),
+            "aesthetic": round(r.aesthetic, 3) if r.aesthetic is not None else None,
+            "aesthetic_source": r.aesthetic_source,
+        })
 
     manifest_path = output_dir / "manifest.json"
-    develop_mod.write_manifest(manifest_path, manifest_entries)
-    log.info(
-        "wrote %d frames to %s (%s); manifest at %s",
-        len(top_rows),
-        output_dir,
-        ", ".join(f"{k}={v}" for k, v in used_counts.items()),
-        manifest_path,
-    )
+    manifest_path.write_text(_json.dumps(manifest_entries, indent=2), encoding="utf-8")
+    log.info("copied %d files to %s; manifest at %s", copied, output_dir, manifest_path)
 
 
 def cmd_explain(input_dir: Path, recursive: bool, stems: list[str]) -> int:
@@ -921,9 +892,6 @@ def cmd_version() -> int:
             print("cuda: (not available)")
     except ImportError:
         pass
-
-    dt = develop_mod.find_darktable()
-    print(f"darktable-cli: {dt or '(not found)'}")
 
     head = taste_head.exists()
     labels = state.labels_dict()

@@ -13,6 +13,7 @@ For every photo in every folder you watch:
 - **Faces**: insightface (ArcFace) embeddings, cross-frame clustering, persistent names. Name a face once, the system finds them everywhere.
 - **Scores** with a personal taste head trained on your -5..+5 labels.
 - **Edits**: numpy + OpenCV develop pipeline (exposure / contrast / highlights / shadows / whites / blacks / saturation / vibrance / temp / tint / rotation / crop), real-time slider preview, full-res JPEG export.
+- **Exports gallery-ready bangers**: one click → top-N picked, smart-edited per frame with eight named looks (auto-tone / B&W moody / B&W classic / vivid / warm / cool / golden / cinematic), copies to `/raw`, renders to `/edits`, drops a manifest, opens the folder.
 
 Everything is searchable, filterable, and lives on your disk.
 
@@ -45,6 +46,7 @@ Toolbar:
 - **Rescan** re-walks the selected root for new / changed / removed files.
 - **Index all** runs the heavy pre-compute on every frame in every root: CLIP embedding, tags, insightface face detections, scene cluster assignment, taste head scoring. After this, culling and filtering are instant SQL/JSON reads.
 - **Score this view** kicks the cull pipeline (sharpness gate, dedup, selection by strategy) for the current scope. Runs in the background; bottom strip shows progress.
+- **Export bangers ↗** culls the current scope and exports the top N as a gallery of finished JPEGs. See the Export section below.
 
 Empty state shows big "Open folder" and "Import from device" buttons.
 
@@ -64,6 +66,45 @@ Edit button jumps to the editor with this frame loaded.
 ### Editor
 
 Full-screen. Hero canvas left, sliders right (Light / Colour / Geometry groups). Drag any slider for a real-time render (~180 ms server-side). Hold **Before/After** to peek the original. **Reset** zeroes everything. **Export…** writes a full-res JPEG (`<stem>_edit.jpg`) next to the source. **← Library** auto-saves edits to the develop sidecar and goes back.
+
+### Export bangers (closing the loop)
+
+The "I want to share these" workflow in one click. Available from both Results and Library toolbars.
+
+Modal asks for:
+- **Folder name** — empty defaults to a timestamp, type to append (e.g. `caminito-trip` → `2026-05-13_1718_caminito-trip/`)
+- **How many bangers**
+- **Variety** checkbox + look chips — when on, each frame gets the look that fits it best, with diversity bias so the gallery isn't ten identical auto-tones
+
+Output structure:
+
+```
+~/Pictures/bangers/<YYYY-MM-DD_HHMM>[_label]/
+  raw/                    originals copied verbatim
+    DSC00012.JPG
+    DSC00013.JPG
+    ...
+  edits/                  rendered JPEGs with the chosen look
+    01_DSC00012_golden.jpg
+    02_DSC00013_bw_moody.jpg
+    ...
+  manifest.json           what was applied per frame + look_counts summary
+```
+
+When done, the folder opens in OS Explorer. Filenames carry the look suffix so sorting groups treatments. Frames you've manually edited in the editor keep your saved params (look=null in the manifest).
+
+The eight looks:
+
+- **auto** — neutral bump (+contrast, +vibrance). Fallback when nothing else fits strongly.
+- **bw_moody** — high-contrast B&W. Loves silhouettes + monochrome content.
+- **bw_classic** — lighter B&W. Suits portraits and low-colour frames.
+- **vivid** — colour-rich subjects (vibrance-only, not deep-fried).
+- **warm** — gentle yellow nudge for sunny / warm cast frames.
+- **cool** — water / winter / overcast / fog.
+- **golden** — sunset / sunrise / golden hour. Lifts shadows.
+- **cinematic** — portraits, low-light, raised blacks for the teal-and-orange feel.
+
+Each look has a fit-score function that reads the frame's quality metrics (mean luminance, contrast, monochrome, silhouette, clipping) and CLIP tags. Greedy assignment with diversity bias picks one look per frame, prioritising best-fit but penalising looks already used heavily so the gallery comes out varied.
 
 ### Settings
 
@@ -148,8 +189,9 @@ Python 3.11+, PyTorch + CUDA, transformers (CLIP ViT-B/32), insightface (ArcFace
 ## Limitations / scope
 
 - The Linux camera daemon (gphoto2 + udev + systemd) is sketched but deferred until the user is on a Linux box.
-- Video files (.mp4 etc.) aren't indexed yet — only photo formats.
+- Video files (.mp4 etc.) aren't indexed — only photo formats. Pixel and DJI bodies mix videos with photo folders; for now they're invisible to the library.
 - No cloud sync, by design. Files-only is the value proposition.
+- Crop is wired in the develop pipeline but the editor has no draggable rectangle UI yet — set crop in the manifest by hand or via API for now.
 - Multi-monitor edge cases in pywebview occasionally render slowly on first paint; reopen the window if you see it.
 
 See `TODO.md` for the active open list.

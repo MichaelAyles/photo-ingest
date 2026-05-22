@@ -1,8 +1,53 @@
-# Screenshots / scratch images accidentally dropped in repo root.
-# Scoped to root only so test_photos/* and presets/* still get checked in.
-/*.png
-/*.jpg
-/*.jpeg
+# Photo libraries / test fixtures — never check in pixel data.
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.png
+*.PNG
+*.arw
+*.ARW
+*.cr2
+*.CR2
+*.cr3
+*.CR3
+*.nef
+*.NEF
+*.nrw
+*.NRW
+*.raf
+*.RAF
+*.pef
+*.PEF
+*.orf
+*.ORF
+*.rw2
+*.RW2
+*.dng
+*.DNG
+*.srw
+*.SRW
+*.x3f
+*.X3F
+*.3fr
+*.3FR
+*.iiq
+*.IIQ
+*.rwl
+*.RWL
+*.gpr
+*.GPR
+*.heic
+*.HEIC
+*.heif
+*.HEIF
+test_photos/
+test-photos/
+
+# Anything Claude.
+.claude/
+CLAUDE.md
+.claude*/
 
 # Python
 __pycache__/
@@ -13,3 +58,5 @@ __pycache__/
 # Test / build artefacts
 .pytest_cache/
 benchmarks/
+reports/
+*.log

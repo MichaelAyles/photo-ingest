@@ -79,10 +79,11 @@ def test_cmd_run_writes_report_and_output(cli_env, tmp_path):
     manifest = json.loads((output_dir / "manifest.json").read_text())
     assert len(manifest) == 2
     assert manifest[0]["rank"] == 1
-    assert manifest[0]["scene_preset"] == scenes.DEFAULT_PRESET
-    # Each top entry should have a JPEG written.
+    # Culler-only mode: originals copied verbatim, listed in "files".
     for entry in manifest:
-        assert (output_dir / entry["output_path"]).exists()
+        assert entry["files"]
+        for name in entry["files"]:
+            assert (output_dir / name).exists()
 
 
 def test_cmd_run_no_report_uses_cache_path(cli_env, isolated_state):

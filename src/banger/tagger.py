@@ -125,7 +125,8 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
 
     if not have_tags:
         try:
-            pairs = tags_mod.tag_from_embedding(emb)
+            from banger import settings as settings_mod
+            pairs = tags_mod.tag_from_embedding(emb, min_sim=float(settings_mod.get("tag_min_sim")))
             serial = [[t, round(s, 4)] for t, s in pairs]
             state.update_frame_metadata(sha, tags=serial)
             out["tagged"] = True
