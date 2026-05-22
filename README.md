@@ -1,6 +1,6 @@
 # banger
 
-A local photo culler. Point it at the folders you already keep your photos in, hit Index all, then Export bangers — you get a folder of the keepers, copied byte-for-byte, with a self-contained HTML gallery showing why each one made the cut. No cloud, no upload, no account.
+A local photo culler. Point it at the folders you already keep your photos in, hit Index all, then Export bangers, you get a folder of the keepers, copied byte-for-byte, with a self-contained HTML gallery showing why each one made the cut. No cloud, no upload, no account.
 
 ## The problem
 
