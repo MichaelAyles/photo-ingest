@@ -4,7 +4,7 @@ A local photo culler. Point it at the folders you already keep your photos in, h
 
 ## The problem
 
-I treat photography as a tool, not an art. To me it's documenting things I've seen, but quite often I feel like the photos I take don't reflect what I'm seeing. Until recently my tool of choice has been my Google Pixel. I picked up a Sony a6600 to 1. see if it takes better photos, and 2. see if it makes me take better photos.
+I treat photography as a tool, not an art. To me it's documenting things I've seen, but quite often I feel like the photos I take don't reflect what I'm seeing. Until recently my tool of choice has been my Pixel. I picked up a 'real camera' to: 1. see if it takes better photos, and 2. see if it makes me take better photos.
 
 Culling the resulting photos absolutely sucks though, which is what led me to build this. Most are near-duplicates anyway. Out-of-focus shots and anything that fails the aesthetic gate get culled automatically, and from there I can either ask for 10ish keepers out of a day of 100 to 200 frames, or cut that pile in half and manually cull the rest.
 
