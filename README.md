@@ -1,21 +1,23 @@
 # banger
 
-A local photo library, culler, and editor. Open it, point it at your photo folders, and it indexes everything, tags it via CLIP, geotags it, finds the faces, scores each frame against your trained taste, and lets you edit and export. No cloud, no upload, no phone in the loop.
+A local photo culler. Point it at the folders you already keep your photos in, hit Index all, then Export bangers — you get a folder of the keepers, copied verbatim, with a self-contained HTML gallery showing why each one made the cut. No cloud, no upload, no phone in the loop.
 
-Started as a triage script for a Sony a6600. Now a full Lightroom-shaped workbench that runs entirely on your machine.
+Started as a triage script for a Sony a6600. Now a culler-shaped workbench that runs entirely on your machine.
 
 ## What it does
 
-For every photo in every folder you watch:
+For every photo in every folder you watch, banger indexes:
 
-- **Indexes** filename, EXIF (camera, lens, aperture, shutter, ISO, focal length, date), GPS coords reverse-geocoded to city / region / country, sharpness, pHash.
-- **Tags** with ~180 CLIP zero-shot labels across subjects, scenes, activities, lighting, aesthetic, weather. "hiking, couple, valley, smiling, drone shot" type results.
-- **Faces**: insightface (ArcFace) embeddings, cross-frame clustering, persistent names. Name a face once, the system finds them everywhere.
-- **Scores** with a personal taste head trained on your -5..+5 labels.
-- **Edits**: numpy + OpenCV develop pipeline (exposure / contrast / highlights / shadows / whites / blacks / saturation / vibrance / temp / tint / rotation / crop), real-time slider preview, full-res JPEG export.
-- **Exports gallery-ready bangers**: one click → top-N picked, smart-edited per frame with eight named looks (auto-tone / B&W moody / B&W classic / vivid / warm / cool / golden / cinematic), copies to `/raw`, renders to `/edits`, drops a manifest, opens the folder.
+- **Filename, sha256, path, mtime, EXIF** (camera body, lens, aperture, shutter, ISO, focal length + 35 mm equivalent, exposure comp, date taken, metering mode, flash).
+- **GPS** parsed from EXIF, then **reverse-geocoded offline** to city / region / country (so "swansea" or "keswick" works as a search term).
+- **CLIP embedding** (ViT-B/32), used as the universal feature vector for tags, scenes, and similarity.
+- **5–10 tags** from a curated ~180-entry vocabulary across subjects, scenes, activities, lighting, aesthetic, weather. "hiking, couple, valley, smiling, drone shot" type results.
+- **Quality metrics**: sharpness via Laplacian variance, exposure with shadow/highlight clipping + silhouette detection, contrast, colour harmony entropy, composition score via rule-of-thirds detection, leading lines via Hough, noise via Immerkaer, dynamic range in stops.
+- **Faces**: insightface ArcFace embeddings + bounding boxes. Cross-frame DBSCAN clustering. Persistent name DB — name Beth once, every Beth photo in every folder gets tagged Beth forever.
+- **Scene cluster** (KMeans on CLIP embeddings — your library's actual visual categories rather than guessed prompts).
+- **Taste score** from a Ridge regressor trained on your -5..+5 hand-labels.
 
-Everything is searchable, filterable, and lives on your disk.
+All of it lives in `~/.local/share/banger-pipeline/` — SQLite indices plus a per-frame JSON sidecar.
 
 ## Quickstart
 
@@ -33,84 +35,86 @@ First launch auto-loads CLIP, fits scene clusters on any cached embeddings, back
 
 ## The GUI
 
-Six views, all native, no Chromium bundled:
+Five views, all native, no Chromium bundled:
 
 ### Library (home)
 
 Sidebar: watched root folders with frame counts, subfolder tree, text search across tags / names / cameras / places, dropdown filters for camera / face / place / minimum star rating.
 
-Grid: 4:3 thumbnails of every photo in the selected scope. Lazy-loaded. Click for the detail overlay, double-click straight to the editor.
+Grid: 4:3 thumbnails of every photo in the selected scope. Lazy-loaded. Click for the detail overlay.
 
 Toolbar:
 - **Import…** copies from any folder (SD card, camera mount point) into a destination, organised by date / camera / flat, with RAW+JPEG pairs kept together. Auto-adds destination to watched roots and scans.
 - **Rescan** re-walks the selected root for new / changed / removed files.
 - **Index all** runs the heavy pre-compute on every frame in every root: CLIP embedding, tags, insightface face detections, scene cluster assignment, taste head scoring. After this, culling and filtering are instant SQL/JSON reads.
-- **Score this view** kicks the cull pipeline (sharpness gate, dedup, selection by strategy) for the current scope. Runs in the background; bottom strip shows progress.
-- **Export bangers ↗** culls the current scope and exports the top N as a gallery of finished JPEGs. See the Export section below.
+- **Score this view** runs the cull pipeline (sharpness gate, dedup, selection by strategy) for the current scope. Runs in the background; bottom strip shows progress.
+- **Export bangers ↗** culls the current scope and copies the top N originals to a dated folder. See below.
 
 Empty state shows big "Open folder" and "Import from device" buttons.
 
 ### Detail overlay (click a photo)
 
 Two-column. Hero image on the left, scrollable stats panel on the right showing:
-- **Tags**: 5-10 CLIP zero-shot chips ("hiking", "couple", "wide-angle landscape")
-- **Why it was picked**: aesthetic score + source, sharpness, scene preset, file kind
-- **Quality dims**: bars for exposure, contrast, colour harmony, composition, leading lines. Flags for clipped shadows/highlights, silhouette, monochrome
-- **Numbers**: noise σ, dynamic range in stops, mean luminance
-- **Faces**: thumbnails with click-to-name. Names persist via a centroid DB; the same person across folders auto-matches once named
-- **EXIF**: camera, lens, aperture, shutter, ISO, focal length (+ 35mm equiv), exposure comp, date, metering, flash, dimensions, **location** (reverse-geocoded city / region / country plus GPS coords)
-- **Source**: path + sha prefix
-
-Edit button jumps to the editor with this frame loaded.
-
-### Editor
-
-Full-screen. Hero canvas left, sliders right (Light / Colour / Geometry groups). Drag any slider for a real-time render (~180 ms server-side). Hold **Before/After** to peek the original. **Reset** zeroes everything. **Export…** writes a full-res JPEG (`<stem>_edit.jpg`) next to the source. **← Library** auto-saves edits to the develop sidecar and goes back.
+- **Tags**: 5–10 CLIP zero-shot chips ("hiking", "couple", "wide-angle landscape").
+- **Why it was picked**: aesthetic score + source, sharpness, scene preset, file kind.
+- **Quality dims**: bars for exposure, contrast, colour harmony, composition, leading lines. Flags for clipped shadows/highlights, silhouette, monochrome.
+- **Numbers**: noise σ, dynamic range in stops, mean luminance.
+- **Faces**: thumbnails with click-to-name. Names persist via a centroid DB; the same person across folders auto-matches once named.
+- **EXIF**: camera, lens, aperture, shutter, ISO, focal length (+ 35 mm equiv), exposure comp, date, metering, flash, dimensions, **location** (reverse-geocoded city / region / country plus GPS coords).
+- **Source**: path + sha prefix.
 
 ### Export bangers (closing the loop)
 
 The "I want to share these" workflow in one click. Available from both Results and Library toolbars.
 
 Modal asks for:
-- **Folder name** — empty defaults to a timestamp, type to append (e.g. `caminito-trip` → `2026-05-13_1718_caminito-trip/`)
-- **How many bangers**
-- **Variety** checkbox + look chips — when on, each frame gets the look that fits it best, with diversity bias so the gallery isn't ten identical auto-tones
+- **Folder name** — empty defaults to a timestamp, type to append (e.g. `caminito-trip` → `2026-05-13_1718_caminito-trip/`).
+- **How many bangers**.
+- **Preset**, picking how the selection runs:
+  - **Diverse** (default) — kmeans clustering on CLIP embeddings; one best frame per visual cluster. Portfolio variety.
+  - **Best** — pure aesthetic top-N. No diversity penalty.
+  - **Mixed** — MMR at λ=0.5; balances aesthetic with visual diversity.
+  - **People** — clusters by face identity, picks one good shot per person across the batch.
+  - **Landscapes** — kmeans + a gentle aesthetic-score bonus for frames whose tags include `mountain / valley / forest / beach / ocean / lake / wide-angle landscape / drone shot / ...`.
+  - **Pets / wildlife** — same shape, biased toward `dog / cat / horse / bird / lion / tiger / deer / wolf / ...`.
+  - **Food** — biased toward `food / drink / coffee / wine / cake / pizza / restaurant / cafe / kitchen / cooking`.
 
-Output structure:
+The subject presets nudge rather than filter: a +0.3 score boost lifts matching frames in the ranking, but everything else is still eligible.
+
+Output:
 
 ```
 ~/Pictures/bangers/<YYYY-MM-DD_HHMM>[_label]/
-  raw/                    originals copied verbatim
-    DSC00012.JPG
-    DSC00013.JPG
-    ...
-  edits/                  rendered JPEGs with the chosen look
-    01_DSC00012_golden.jpg
-    02_DSC00013_bw_moody.jpg
-    ...
-  manifest.json           what was applied per frame + look_counts summary
+  DSC00012.JPG                       originals copied verbatim
+  DSC00012.ARW                       (RAW siblings come along automatically)
+  DSC00013.JPG
+  ...
+  manifest.json                      per-pick stats (rank, sha, sharpness, aesthetic,
+                                     tags, faces, EXIF) — no thumbnails
+  gallery.html                       self-contained dark-themed HTML gallery,
+                                     thumbnails embedded as base64, ready to share
 ```
 
-When done, the folder opens in OS Explorer. Filenames carry the look suffix so sorting groups treatments. Frames you've manually edited in the editor keep your saved params (look=null in the manifest).
-
-The eight looks:
-
-- **auto** — neutral bump (+contrast, +vibrance). Fallback when nothing else fits strongly.
-- **bw_moody** — high-contrast B&W. Loves silhouettes + monochrome content.
-- **bw_classic** — lighter B&W. Suits portraits and low-colour frames.
-- **vivid** — colour-rich subjects (vibrance-only, not deep-fried).
-- **warm** — gentle yellow nudge for sunny / warm cast frames.
-- **cool** — water / winter / overcast / fog.
-- **golden** — sunset / sunrise / golden hour. Lifts shadows.
-- **cinematic** — portraits, low-light, raised blacks for the teal-and-orange feel.
-
-Each look has a fit-score function that reads the frame's quality metrics (mean luminance, contrast, monochrome, silhouette, clipping) and CLIP tags. Greedy assignment with diversity bias picks one look per frame, prioritising best-fit but penalising looks already used heavily so the gallery comes out varied.
+When done, the folder opens in OS Explorer.
 
 ### Settings
 
-Pipeline state badges (CLIP / scene clusters / mediapipe / insightface readiness, label count, cache counts).
+**Pipeline levers** card with sliders / number inputs / dropdown / toggles for every cull knob, each with an `(i)` hover tooltip explaining what it does:
 
-**Face library** lists every named or auto-discovered person with a thumbnail and sample count. Click name to rename, × to forget. "Discover people" button DBSCANs every face embedding in the library and auto-creates `Person 1`, `Person 2`, ... entries for unnamed clusters — rename them and the system propagates the new name to every matching frame.
+- **Sharpness threshold** — Laplacian-variance gate. Frames below this are dropped before scoring.
+- **Face sharpness threshold** — per-face Laplacian variance for the face-aware gate.
+- **Top N** — default export count.
+- **Default strategy** — `kmeans` / `topk` / `mmr` / `faces`.
+- **MMR diversity λ** — only used by the `mmr` strategy.
+- **Tag min cosine** — CLIP cosine threshold for a tag to be applied to a frame.
+- **Face gate** — also reject frames whose detected face is softer than the face-sharpness threshold.
+- **Eye gate** — reject frames where someone's eyes appear closed (needs mediapipe).
+
+Save / Reset to defaults. Persisted to `~/.local/share/banger-pipeline/settings.json`.
+
+**Pipeline state**: badges for taste-head / scene-clusters / mediapipe / insightface readiness, label count, cache counts.
+
+**Face library**: every named or auto-discovered person with a thumbnail and sample count. Rename, forget, or hit **Discover people** to DBSCAN every face embedding in the library and auto-create `Person 1`, `Person 2`, … entries for unnamed clusters.
 
 ### Quick run (formerly Welcome)
 
@@ -118,11 +122,20 @@ The original one-shot path: pick a folder, configure top-N + strategy + gates, r
 
 ### Running
 
-Detailed live progress for an active scoring job. Optional view — accessible via the bottom strip's "expand ↗" button. Most users just watch the bottom strip instead.
+Detailed live progress for an active scoring job. Optional view — accessible via the bottom strip's "expand ↗" button.
 
 ## Background work
 
 A thin progress strip at the bottom of the screen shows tagger + scoring-job progress when either is running. Click "expand ↗" to jump to the Running view for the active job. After a library scan, banger auto-kicks the tagger so new folders get embeddings + tags without a click. The "Index all" button does the heavier full pass.
+
+The scoring runner has an in-flight job guard — clicking Export while a scoring job is already running for the same folder won't spawn a duplicate thread. The metadata sidecars and embedding `.npy` files are also locked per-sha against concurrent writes.
+
+## Selection strategies (Score this view + CLI --strategy)
+
+- **kmeans** (default) — visual clusters via KMeans on CLIP embeddings, one best per cluster. Portfolio variety.
+- **faces** — cluster by face identity, one good shot per person, fill with kmeans for face-less frames. Best for groups / events.
+- **mmr** — continuous diversity knob via `--diversity` (0 = max diversity, 1 = pure score).
+- **topk** — pure aesthetic ranking, no diversity.
 
 ## Camera support
 
@@ -158,12 +171,7 @@ python -m banger version                            # state + deps summary
 python -m banger ui <folder>                        # labelling UI only (used by Label view internally)
 ```
 
-## Selection strategies (Score this view + CLI --strategy)
-
-- **kmeans** (default): visual clusters via KMeans on CLIP embeddings, one best per cluster. Portfolio variety.
-- **faces**: cluster by face identity, one good shot per person, fill with kmeans for face-less frames. The Aftershoot trick. Best for groups / events.
-- **mmr**: continuous diversity knob via `--diversity` (0 = max diversity, 1 = pure score).
-- **topk**: pure aesthetic ranking, no diversity.
+`banger run --output <dir>` copies the top-N originals (RAW + sibling JPEG) into the output folder, flat, alongside a `manifest.json`. No JPEG re-encoding, no edits applied.
 
 ## State
 
@@ -174,24 +182,30 @@ Everything banger learns lives under `~/.local/share/banger-pipeline/` (yes, on 
 - `faces.db` — named-face centroid DB with thumbnails.
 - `taste_head.joblib` — Ridge regressor.
 - `scene_kmeans.joblib` + `scene_kmeans.json` — scene cluster model.
+- `settings.json` — pipeline lever values from the Settings tab.
 - `embeddings/<sha>.npy` — CLIP image embeddings (the expensive cache).
-- `metadata/<sha>.json` — sharpness, phash, EXIF timestamp, quality metrics, face detections, tags, develop params, scene cluster, taste score.
+- `metadata/<sha>.json` — sharpness, phash, EXIF timestamp, quality metrics, face detections, tags, scene cluster, taste score.
 - `thumbs/<sha>.jpg`, `previews/<sha>.jpg` — UI assets.
 
 Warm runs (everything cached) are ~7× faster than cold. `banger cache clear --kind embeddings` (or `--all`) to reset.
 
 ## Stack
 
-Python 3.11+, PyTorch + CUDA, transformers (CLIP ViT-B/32), insightface (ArcFace), mediapipe (FaceMesh / EAR), rawpy, imagehash, scikit-learn, reverse_geocoder, Flask, pywebview. Optional: pillow-heif, darktable-cli (not required since the built-in editor replaced it), gphoto2 (Linux).
+Python 3.11+, PyTorch + CUDA, transformers (CLIP ViT-B/32), insightface (ArcFace), mediapipe (FaceMesh / EAR), rawpy, imagehash, scikit-learn, reverse_geocoder, Flask, pywebview. Optional: pillow-heif, gphoto2 (Linux).
 
-138 tests, ~10 s.
+128 tests, ~10 s.
+
+## What banger deliberately doesn't do
+
+- **No editor, no develop pipeline, no per-photo retouching.** Banger picks keepers; another tool develops them. Originals come out of Export bangers byte-identical to what went in.
+- **No cloud sync, no web service, no phone app.** Files-only is the value proposition.
+- **No video.** Library currently skips .mp4 etc.
+- **Not multi-tenant.** Single-user app running on a single laptop.
 
 ## Limitations / scope
 
 - The Linux camera daemon (gphoto2 + udev + systemd) is sketched but deferred until the user is on a Linux box.
 - Video files (.mp4 etc.) aren't indexed — only photo formats. Pixel and DJI bodies mix videos with photo folders; for now they're invisible to the library.
-- No cloud sync, by design. Files-only is the value proposition.
-- Crop is wired in the develop pipeline but the editor has no draggable rectangle UI yet — set crop in the manifest by hand or via API for now.
 - Multi-monitor edge cases in pywebview occasionally render slowly on first paint; reopen the window if you see it.
 
 See `TODO.md` for the active open list.
