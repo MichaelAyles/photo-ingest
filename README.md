@@ -1,8 +1,16 @@
 # banger
 
-A local photo culler. Point it at the folders you already keep your photos in, hit Index all, then Export bangers — you get a folder of the keepers, copied verbatim, with a self-contained HTML gallery showing why each one made the cut. No cloud, no upload, no phone in the loop.
+A local photo culler. Point it at the folders you already keep your photos in, hit Index all, then Export bangers — you get a folder of the keepers, copied byte-for-byte, with a self-contained HTML gallery showing why each one made the cut. No cloud, no upload, no account.
 
-Started as a triage script for a Sony a6600. Now a culler-shaped workbench that runs entirely on your machine.
+## The problem
+
+I treat photography as a tool, not an art. To me it's documenting things I've seen, but quite often I feel like the photos I take don't reflect what I'm seeing. Until recently my tool of choice has been my Google Pixel. I picked up a Sony a6600 to 1. see if it takes better photos, and 2. see if it makes me take better photos.
+
+Culling the resulting photos absolutely sucks though, which is what led me to build this. Most are near-duplicates anyway. Out-of-focus shots and anything that fails the aesthetic gate get culled automatically, and from there I can either ask for 10ish keepers out of a day of 100 to 200 frames, or cut that pile in half and manually cull the rest.
+
+Aftershoot, Narrative Select, and Optyx all solve this commercially and they solve it well, but they're cloud-backed subscriptions that want your library uploaded, and at least one of them wants a phone in the loop. I don't want any of that. The photos already live in folders on my laptop. The keepers should come out as files in another folder.
+
+So I built one. Banger is a local photo culler. Point it at the folders you already keep your photos in, hit Index all, then Export bangers. You get a folder of the keepers, copied byte-for-byte, with a self-contained HTML gallery showing why each one made the cut.
 
 ## Screenshots
 
@@ -18,7 +26,11 @@ Started as a triage script for a Sony a6600. Now a culler-shaped workbench that 
 
 ![Settings tab](public/settings.png)
 
-**Example export** — a real banger output folder lives at [`public/example-export/`](public/example-export/): 10 JPEG keepers picked by the `kmeans` strategy from 195 indexed frames, plus the auto-generated [`gallery.html`](public/example-export/gallery.html) (thumbnails embedded as base64, stats / tags / EXIF on every card) and [`manifest.json`](public/example-export/manifest.json).
+**Example output** — what the auto-generated `gallery.html` looks like: every keeper as a card with thumbnail, rank, filename, sharpness, aesthetic score, top tags, named faces, and EXIF.
+
+![Example output gallery](public/example-output.png)
+
+A real banger output folder lives at [`public/example-export/`](public/example-export/): 10 JPEG keepers picked by the `kmeans` strategy from 195 indexed frames, plus the auto-generated [`gallery.html`](public/example-export/gallery.html) and [`manifest.json`](public/example-export/manifest.json).
 
 ## What it does
 
