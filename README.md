@@ -18,6 +18,8 @@ Started as a triage script for a Sony a6600. Now a culler-shaped workbench that 
 
 ![Settings tab](public/settings.png)
 
+**Example export** — a real banger output folder lives at [`public/example-export/`](public/example-export/): 10 JPEG keepers picked by the `kmeans` strategy from 195 indexed frames, plus the auto-generated [`gallery.html`](public/example-export/gallery.html) (thumbnails embedded as base64, stats / tags / EXIF on every card) and [`manifest.json`](public/example-export/manifest.json).
+
 ## What it does
 
 For every photo in every folder you watch, banger indexes:
