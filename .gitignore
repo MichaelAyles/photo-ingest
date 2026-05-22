@@ -44,6 +44,10 @@
 test_photos/
 test-photos/
 
+# Allow committing curated screenshots / docs assets under /public/.
+!/public/
+!/public/**
+
 # Anything Claude.
 .claude/
 CLAUDE.md
@@ -57,6 +61,7 @@ __pycache__/
 
 # Test / build artefacts
 .pytest_cache/
+.playwright-mcp/
 benchmarks/
 reports/
 *.log

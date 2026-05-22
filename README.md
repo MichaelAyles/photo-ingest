@@ -4,6 +4,20 @@ A local photo culler. Point it at the folders you already keep your photos in, h
 
 Started as a triage script for a Sony a6600. Now a culler-shaped workbench that runs entirely on your machine.
 
+## Screenshots
+
+**Library** — watched folders, search, filters, grid of indexed frames with `-5..+5` taste labels in the corner.
+
+![Library tab](public/library-screenshot.png)
+
+**Export bangers** — one modal, seven presets (Best / Diverse / Mixed / People / Landscapes / Pets / Food), one click to copy keepers out.
+
+![Export bangers modal](public/export-dialog.png)
+
+**Settings** — every pipeline lever as a slider with hover `(i)` tooltips. Save / Reset to defaults. Persists to `settings.json` in the state dir.
+
+![Settings tab](public/settings.png)
+
 ## What it does
 
 For every photo in every folder you watch, banger indexes:
