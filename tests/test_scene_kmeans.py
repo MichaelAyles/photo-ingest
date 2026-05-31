@@ -7,7 +7,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _state_dir(tmp_path, monkeypatch):
     """Point banger.state at a temp dir so we never touch the user's real state."""
-    from banger import state, scene_kmeans
+    from banger import scene_kmeans, state
 
     monkeypatch.setattr(state, "STATE_DIR", tmp_path)
     monkeypatch.setattr(state, "EMBEDDINGS_DIR", tmp_path / "embeddings")
@@ -29,7 +29,7 @@ def _fake_emb(rng, dim=512):
 
 
 def test_fit_refuses_below_k():
-    from banger import state, scene_kmeans
+    from banger import scene_kmeans, state
 
     rng = np.random.default_rng(0)
     for i in range(3):
@@ -38,10 +38,10 @@ def test_fit_refuses_below_k():
 
 
 def test_fit_produces_summary_and_persists(monkeypatch):
-    from banger import state, scene_kmeans
-
     # Stub out the CLIP text-embedding call so tests don't load the model.
     import torch
+
+    from banger import scene_kmeans, state
 
     fake_text = torch.tensor(
         np.eye(7, 512).astype(np.float32),
@@ -69,8 +69,9 @@ def test_load_returns_none_when_no_model():
 
 
 def test_classify_embedding_returns_valid_cluster(monkeypatch):
-    from banger import state, scene_kmeans
     import torch
+
+    from banger import scene_kmeans, state
 
     monkeypatch.setattr(
         "banger.scenes._encoded_prompts",

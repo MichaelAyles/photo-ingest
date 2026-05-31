@@ -51,8 +51,8 @@ def _read_heic(path: Path) -> np.ndarray:
     user hasn't installed it we surface a clear error rather than crashing
     on cv2.imread (which doesn't support HEIC)."""
     try:
-        from pillow_heif import register_heif_opener
         from PIL import Image
+        from pillow_heif import register_heif_opener
     except ImportError as e:
         raise ValueError(
             f"HEIC file {path} requires pillow-heif (pip install pillow-heif)"

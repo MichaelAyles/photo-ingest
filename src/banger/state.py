@@ -5,6 +5,7 @@ Windows too (just creates the dir under the user's home).
 """
 
 import hashlib
+import os
 import sqlite3
 import threading
 import time
@@ -43,48 +44,119 @@ def _ensure_dirs() -> None:
     THUMBS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _conn() -> sqlite3.Connection:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(LABELS_DB)
+# labels.db is the only non-reconstructible user data, and Flask serves with
+# threaded=True — so connections come from many threads. We open one
+# connection per caller (sqlite3 handles are not thread-safe to share) but run
+# the schema setup / v1->v2 migration EXACTLY ONCE, behind a module-level lock,
+# mirroring the _init_lock/_inited pattern in library.py. Steady-state opens
+# then skip the PRAGMA table_info probe and the migration entirely.
+#
+# We key the "inited" flag on the DB path (not a bare bool) so that tests which
+# monkeypatch LABELS_DB to a fresh tmp_path each get their schema built; the
+# real app only ever sees one path so this stays a single init in production.
+_init_lock = threading.Lock()
+_inited_db: str | None = None
+
+
+def _migrate_and_init(conn: sqlite3.Connection) -> None:
+    """Create the labels table (and run the v1->v2 score migration) once.
+
+    Wrapped in an explicit transaction so the rename/insert/drop dance is
+    all-or-nothing — a crash mid-migration can't leave a half-converted DB.
+    """
     cols = [r[1] for r in conn.execute("PRAGMA table_info(labels)")]
-    if cols and "score" not in cols:
-        # v1 schema (label TEXT 'up'/'down') → v2 (score INTEGER -5..+5).
-        conn.execute("ALTER TABLE labels RENAME TO labels_v1")
-        conn.execute(
-            """
-            CREATE TABLE labels (
-                sha256 TEXT PRIMARY KEY,
-                score INTEGER NOT NULL,
-                stem TEXT NOT NULL,
-                src_path TEXT NOT NULL,
-                ts INTEGER NOT NULL
+    conn.execute("BEGIN")
+    try:
+        if cols and "score" not in cols:
+            # v1 schema (label TEXT 'up'/'down') → v2 (score INTEGER -5..+5).
+            conn.execute("ALTER TABLE labels RENAME TO labels_v1")
+            conn.execute(
+                """
+                CREATE TABLE labels (
+                    sha256 TEXT PRIMARY KEY,
+                    score INTEGER NOT NULL,
+                    stem TEXT NOT NULL,
+                    src_path TEXT NOT NULL,
+                    ts INTEGER NOT NULL
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            INSERT INTO labels (sha256, score, stem, src_path, ts)
-            SELECT sha256,
-                   CASE WHEN label='up' THEN 5 ELSE -5 END,
-                   stem, src_path, ts
-            FROM labels_v1
-            """
-        )
-        conn.execute("DROP TABLE labels_v1")
+            conn.execute(
+                """
+                INSERT INTO labels (sha256, score, stem, src_path, ts)
+                SELECT sha256,
+                       CASE WHEN label='up' THEN 5 ELSE -5 END,
+                       stem, src_path, ts
+                FROM labels_v1
+                """
+            )
+            conn.execute("DROP TABLE labels_v1")
+        elif not cols:
+            conn.execute(
+                """
+                CREATE TABLE labels (
+                    sha256 TEXT PRIMARY KEY,
+                    score INTEGER NOT NULL,
+                    stem TEXT NOT NULL,
+                    src_path TEXT NOT NULL,
+                    ts INTEGER NOT NULL
+                )
+                """
+            )
         conn.commit()
-    elif not cols:
-        conn.execute(
-            """
-            CREATE TABLE labels (
-                sha256 TEXT PRIMARY KEY,
-                score INTEGER NOT NULL,
-                stem TEXT NOT NULL,
-                src_path TEXT NOT NULL,
-                ts INTEGER NOT NULL
-            )
-            """
-        )
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _conn() -> sqlite3.Connection:
+    """Open a labels.db connection configured for concurrent, durable use.
+
+    WAL lets one writer coexist with many readers (Flask is threaded);
+    synchronous=NORMAL is the safe+fast pairing for WAL; busy_timeout makes a
+    contended write wait rather than instantly raising "database is locked".
+    check_same_thread=False is required because the caller's `with` block may
+    run on a different thread than the one that opened it.
+    """
+    global _inited_db
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(LABELS_DB, check_same_thread=False)
+    # Cheap per-connection PRAGMAs (journal_mode is persisted in the DB header,
+    # but setting it is idempotent and harmless to repeat).
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+
+    db_key = str(LABELS_DB)
+    if _inited_db != db_key:
+        with _init_lock:
+            if _inited_db != db_key:
+                _migrate_and_init(conn)
+                _inited_db = db_key
     return conn
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write `data` to `path` atomically: temp sibling + fsync + os.replace.
+
+    A crash or a concurrent writer can never leave a truncated sidecar at the
+    real name — readers see either the old file or the fully-written new one.
+    The temp sibling lives in the same directory so os.replace is atomic.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with open(tmp, "wb") as fp:
+            fp.write(data)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def sha256_of(path: Path) -> str:
@@ -97,8 +169,20 @@ def sha256_of(path: Path) -> str:
 
 def cache_embedding(sha: str, emb: np.ndarray) -> None:
     _ensure_dirs()
+    import io
+
+    # Serialize via np.save into a buffer, then publish atomically so a crash /
+    # concurrent writer never leaves a truncated .npy at the real name.
+    buf = io.BytesIO()
+    np.save(buf, emb.astype(np.float32))
     with _sha_lock(sha):
-        np.save(EMBEDDINGS_DIR / f"{sha}.npy", emb.astype(np.float32))
+        _atomic_write_bytes(EMBEDDINGS_DIR / f"{sha}.npy", buf.getvalue())
+
+
+# Public alias for the shared contract: save_embedding == cache_embedding.
+# Other wave-2 code refers to save_embedding; keep cache_embedding too.
+def save_embedding(sha: str, emb: np.ndarray) -> None:
+    cache_embedding(sha, emb)
 
 
 def load_embedding(sha: str) -> np.ndarray | None:
@@ -167,7 +251,7 @@ def cache_frame_metadata(
     if face_detections:
         payload["face_detections"] = face_detections
     with _sha_lock(sha):
-        (METADATA_DIR / f"{sha}.json").write_text(json.dumps(payload), encoding="utf-8")
+        _atomic_write_bytes(METADATA_DIR / f"{sha}.json", json.dumps(payload).encode("utf-8"))
 
 
 def update_frame_metadata(sha: str, **fields) -> None:
@@ -185,7 +269,7 @@ def update_frame_metadata(sha: str, **fields) -> None:
         except (OSError, json.JSONDecodeError):
             return
         payload.update(fields)
-        p.write_text(json.dumps(payload), encoding="utf-8")
+        _atomic_write_bytes(p, json.dumps(payload).encode("utf-8"))
 
 
 def load_frame_metadata(sha: str) -> dict | None:
@@ -229,6 +313,64 @@ def all_labels() -> list[tuple[str, int, str, str, int]]:
 
 def labels_dict() -> dict[str, int]:
     return {sha: score for sha, score, _, _, _ in all_labels()}
+
+
+# Public alias: the canonical name has long been add_label, but `set_label`
+# reads better at call sites and is referenced by the shared contract. Same
+# signature/behavior (INSERT OR REPLACE), so it's a true synonym.
+def set_label(sha: str, score: int, stem: str, src_path: str) -> None:
+    add_label(sha, score, stem, src_path)
+
+
+def integrity_check() -> bool:
+    """Run SQLite's PRAGMA integrity_check on labels.db (and library.db if it
+    exists). Returns True iff every DB reports "ok". Cheap to call; useful as a
+    health probe before a backup or after a hard crash. Never raises on a
+    missing/locked DB — it just reports False for that DB.
+    """
+    ok = True
+    dbs = [LABELS_DB]
+    # library.db lives in the same STATE_DIR and is the other persistent store.
+    library_db = STATE_DIR / "library.db"
+    if library_db.exists():
+        dbs.append(library_db)
+    for db in dbs:
+        if not Path(db).exists():
+            continue
+        try:
+            conn = sqlite3.connect(db, check_same_thread=False)
+            try:
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            ok = False
+            continue
+        if not (len(rows) == 1 and rows[0][0] == "ok"):
+            ok = False
+    return ok
+
+
+def backup_labels(dest: Path | None = None) -> Path:
+    """Dump labels.db to a timestamped CSV and return its path.
+
+    labels.db is the only irreplaceable user data, but it's tiny, so a plain
+    CSV snapshot is the most portable, future-proof backup (re-importable via
+    import_labels_csv). Defaults to STATE_DIR/backups/labels-YYYYmmdd-HHMMSS.csv.
+    The CSV itself is written atomically (export_labels_csv writes the whole
+    file in one open()) so a partially-written backup is never published under
+    a name a caller might trust.
+    """
+    if dest is None:
+        backups_dir = STATE_DIR / "backups"
+        backups_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        dest = backups_dir / f"labels-{stamp}.csv"
+    else:
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+    export_labels_csv(dest)
+    return dest
 
 
 def cache_stats() -> dict[str, dict]:
@@ -284,16 +426,22 @@ def clear_cache(kinds: list[str]) -> dict[str, int]:
 
 
 def export_labels_csv(path: Path) -> int:
-    """Write labels.db to a CSV at path. Returns count written."""
+    """Write labels.db to a CSV at path. Returns count written.
+
+    Written atomically (build in memory, fsync temp sibling, os.replace) so a
+    crash mid-export — or a reader racing the writer — never sees a truncated
+    backup at the real name.
+    """
     import csv
+    import io
 
     rows = all_labels()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as fp:
-        writer = csv.writer(fp)
-        writer.writerow(["sha256", "score", "stem", "src_path", "ts"])
-        for sha, score, stem, src, ts in rows:
-            writer.writerow([sha, score, stem, src, ts])
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["sha256", "score", "stem", "src_path", "ts"])
+    for sha, score, stem, src, ts in rows:
+        writer.writerow([sha, score, stem, src, ts])
+    _atomic_write_bytes(Path(path), buf.getvalue().encode("utf-8"))
     return len(rows)
 
 

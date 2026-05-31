@@ -4,15 +4,16 @@ build-backend = "hatchling.build"
 
 [project]
 name = "banger"
-version = "0.0.1"
 description = "Local image triage and develop pipeline for the Sony a6600"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Michael Ayles" }]
-license = { text = "Unlicensed" }
+license = { file = "LICENSE" }
+# Version is single-sourced from src/banger/__init__.py (see [tool.hatch.version]).
+dynamic = ["version"]
 dependencies = [
     "torch>=2.2",
-    "open_clip_torch>=2.24",
+    "transformers<5",  # CLIP / SigLIP backbones loaded at runtime (aesthetic.py, cli.py)
     "rawpy>=0.21",
     "imagehash>=4.3",
     "Pillow>=10.0",
@@ -20,11 +21,9 @@ dependencies = [
     "opencv-python>=4.9",
     "scikit-learn>=1.4",
     "joblib>=1.3",
+    "reverse_geocoder>=1.5",  # offline GPS -> city/region/country (library.py, gui.py)
     "flask>=3.0",
 ]
-
-# aesthetic-predictor-v2.5 is a GitHub project, not on PyPI.
-# Install it separately, see README install section.
 
 [project.optional-dependencies]
 dev = [
@@ -34,19 +33,32 @@ dev = [
 gui = [
     "pywebview>=6.0",
 ]
+# Face / eye features degrade gracefully when these are absent, so they stay
+# optional rather than core. Install with `pip install -e ".[full]"`.
+full = [
+    "insightface>=0.7",
+    "mediapipe>=0.10",
+    "pillow-heif>=0.15",
+]
 
 [project.scripts]
 banger = "banger.cli:main"
+
+[tool.hatch.version]
+path = "src/banger/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/banger"]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+# E501 (line-too-long) is not enforced: gui.py embeds large HTML/JS/CSS string
+# literals where wrapping is meaningless. Everything else stays on.
+ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -55,3 +67,44 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::UserWarning",
 ]
+
+# --- Packaging scaffolding (Briefcase) --------------------------------------
+# Intended distribution path for the pywebview desktop app: a signed .dmg
+# (macOS) and Authenticode-signed installer (Windows). Signing / notarization
+# are NOT yet wired -- see packaging/BUILD.md. This block is scaffolding.
+[tool.briefcase]
+project_name = "Banger"
+bundle = "com.michaelayles"
+version = "2.0.0.dev0"
+author = "Michael Ayles"
+author_email = "aylesm@gmail.com"
+license.file = "LICENSE"
+
+[tool.briefcase.app.banger]
+formal_name = "Banger"
+description = "Local image triage and develop pipeline"
+long_description = "Local, files-only photo culler. Index folders, export the keepers."
+sources = ["src/banger"]
+requires = [
+    "torch>=2.2",
+    "transformers<5",
+    "rawpy>=0.21",
+    "imagehash>=4.3",
+    "Pillow>=10.0",
+    "numpy>=1.26,<2",
+    "opencv-python>=4.9",
+    "scikit-learn>=1.4",
+    "joblib>=1.3",
+    "reverse_geocoder>=1.5",
+    "flask>=3.0",
+    "pywebview>=6.0",
+]
+
+[tool.briefcase.app.banger.macOS]
+universal_build = true
+# Signing identity / notarization team id come from the owner's Apple
+# Developer account and are intentionally left unset (see packaging/BUILD.md).
+entitlement_file = "packaging/macos/Entitlements.plist"
+
+[tool.briefcase.app.banger.windows]
+# Authenticode signing cert is supplied at build time, not committed.

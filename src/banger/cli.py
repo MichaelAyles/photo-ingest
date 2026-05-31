@@ -10,16 +10,33 @@ import imagehash
 import numpy as np
 
 from banger import (
-    aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
-    metrics as metrics_mod, scene_kmeans, scenes, select, server,
-    settings as settings_mod, state, taste_head,
+    aesthetic,
+    dedup,
+    face,
+    scene_kmeans,
+    scenes,
+    select,
+    server,
+    state,
+    taste_head,
+)
+from banger import (
+    eyes as eyes_mod,
+)
+from banger import (
+    face_id as face_id_mod,
+)
+from banger import (
+    metrics as metrics_mod,
+)
+from banger import (
+    settings as settings_mod,
 )
 from banger.aesthetic import NEGATIVE_PROMPTS, POSITIVE_PROMPTS
 from banger.dedup import ClusterItem
 from banger.frames import discover_frames
 from banger.preview import load_preview
 from banger.report import Row, encode_thumbnail, write_report
-from banger.sharpness import CONFIG as SHARPNESS_CONFIG
 from banger.sharpness import sharpness_from_preview
 
 DEFAULT_TOP_N = int(os.environ.get("BANGER_TOP_N", "10"))
@@ -51,6 +68,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="banger")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # Gate defaults follow the persisted settings (both ship ON). They no-op
+    # gracefully when mediapipe/insightface are absent, so defaulting them on
+    # is safe even on a bare install.
+    _cfg = settings_mod.load()
+    _face_gate_default = bool(_cfg.get("face_gate", True))
+    _eye_gate_default = bool(_cfg.get("eye_gate", True))
+
     run = sub.add_parser("run", help="Run the pipeline against a folder of images.")
     run.add_argument("input_dir", type=Path, help="Folder containing JPEGs and/or ARWs.")
     run.add_argument("-r", "--recursive", action="store_true", help="Walk subdirectories.")
@@ -78,20 +102,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run.add_argument(
         "--face-gate",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=_face_gate_default,
         help=(
             "Also reject frames whose detected faces are softer than the "
-            "configured face-sharpness threshold (tunable via the Settings tab). "
-            "Frames without a detected face still go through the global gate only."
+            "configured face-sharpness threshold, or whose eyes aren't tack-sharp "
+            "(tunable via the Settings tab). Frames without a detected face still "
+            "go through the global gate only. Use --no-face-gate to disable. "
+            f"(default {'on' if _face_gate_default else 'off'} from settings)"
         ),
     )
     run.add_argument(
         "--eye-gate",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=_eye_gate_default,
         help=(
             "Reject frames where any detected face has Eye Aspect Ratio below "
-            f"eyes.EYE_AR_THRESHOLD (={eyes_mod.EYE_AR_THRESHOLD}). Requires mediapipe; "
-            "a no-op (and a warning) if mediapipe isn't installed. Off by default."
+            "the configured eye-aspect-ratio threshold (Settings: eye_ear_threshold, "
+            f"default {settings_mod.DEFAULTS['eye_ear_threshold']}). Requires mediapipe; "
+            "a no-op (and a warning) if mediapipe isn't installed. Use --no-eye-gate "
+            f"to disable. (default {'on' if _eye_gate_default else 'off'} from settings)"
         ),
     )
     run.add_argument(
@@ -217,12 +247,25 @@ def _build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--vs", choices=["facet"], default=None,
                        help="Comparison target. Currently only 'facet'.")
     bench.add_argument("--facet-path", type=Path,
-                       default=Path("C:/Users/mikea/OneDrive/Desktop/Projects/facet"),
-                       help="Path to the facet checkout.")
+                       default=None,
+                       help="Path to the facet checkout (required when --vs facet).")
     bench.add_argument("--output", type=Path, default=None,
                        help="Where to write the markdown report (default benchmarks/<date>.md).")
 
     return parser
+
+
+def _blended_score(head, emb: np.ndarray, prior_score: float, n_labels: int) -> float:
+    """Personal taste-head score, cold-start-blended with the aesthetic prior.
+
+    When the head was trained on few labels its predictions are noisy, so we
+    fold in the generic prompt-based aesthetic prior, weighting toward the
+    personal head as the label count grows (saturating to pure-personal at
+    taste_head's full-trust label count). With a strong head (many labels) the
+    blend collapses to the personal score, so behaviour is unchanged there.
+    """
+    personal = taste_head.predict_score(head, emb)
+    return taste_head.blend_with_prior(personal, prior_score, n_labels=n_labels)
 
 
 def cmd_run(
@@ -250,7 +293,14 @@ def cmd_run(
     cfg = settings_mod.load()
     threshold = float(cfg["sharpness_threshold"])
     face_sharp_threshold = float(cfg["face_sharpness_threshold"])
+    eye_ear_threshold = float(cfg["eye_ear_threshold"])
+    dedup_enabled = bool(cfg["dedup_enabled"])
+    dedup_hamming = int(cfg["dedup_hamming"])
+    dedup_time_window = float(cfg["dedup_time_window"])
     head = taste_head.load()
+    # Live label count drives the cold-start blend: a head trained on few
+    # labels is noisy, so we fold in the generic aesthetic prior (see below).
+    n_labels = len(state.labels_dict())
 
     if eye_gate and not eyes_mod.mediapipe_available():
         log.warning(
@@ -310,6 +360,10 @@ def cmd_run(
         face_sharp = (cached_meta or {}).get("face_sharpness", 0.0)
         frame_metrics = (cached_meta or {}).get("metrics")
         frame_eyes = (cached_meta or {}).get("eyes")
+        # Eye-region focus of the most-prominent face, stashed inside metrics on
+        # the cold path (None when no face / not computed). Used by the face
+        # gate's eyes-tack-sharp check.
+        face_eye_sharp = (frame_metrics or {}).get("face_eye_sharpness")
 
         if cache_hit:
             sharp = float(cached_meta["sharpness"])
@@ -336,7 +390,8 @@ def cmd_run(
             try:
                 prompt_score, breakdown = aesthetic.score_from_embedding(emb)
                 a_score = (
-                    taste_head.predict_score(head, emb) if head is not None
+                    _blended_score(head, emb, prompt_score, n_labels)
+                    if head is not None
                     else prompt_score
                 )
                 source = "head" if head is not None else "prompts"
@@ -364,13 +419,14 @@ def cmd_run(
             emb = None
             frame_metrics = None
             frame_eyes = None
+            face_eye_sharp = None
             if sharp >= threshold:
                 try:
                     emb = aesthetic.encode_image(preview)
                     state.cache_embedding(sha, emb)
                     prompt_score, breakdown = aesthetic.score_from_embedding(emb)
                     if head is not None:
-                        a_score = taste_head.predict_score(head, emb)
+                        a_score = _blended_score(head, emb, prompt_score, n_labels)
                         source = "head"
                     else:
                         a_score = prompt_score
@@ -386,6 +442,20 @@ def cmd_run(
                     except Exception as e:
                         log.warning("metrics skip %s: %s", f.display_name, e)
                         frame_metrics = None
+                    # Eye-region focus of the most-prominent face — the
+                    # "eyes tack-sharp" check. Only worth the cost when the
+                    # face gate is active; stashed in metrics so warm runs reuse
+                    # it. None means no face detected (gate stays silent).
+                    if face_gate:
+                        try:
+                            face_eye_sharp = face.best_face_eye_sharpness(preview)
+                        except Exception as e:
+                            log.warning("eye-sharpness skip %s: %s", f.display_name, e)
+                            face_eye_sharp = None
+                        if face_eye_sharp is not None:
+                            if frame_metrics is None:
+                                frame_metrics = {}
+                            frame_metrics["face_eye_sharpness"] = float(face_eye_sharp)
                     if eye_gate:
                         try:
                             frame_eyes = eyes_mod.analyse_eyes(preview)
@@ -412,13 +482,14 @@ def cmd_run(
             thumb = encode_thumbnail(preview) if report_path else ""
 
         # Face-aware gate: only kicks in when --face-gate is set AND the frame
-        # contains a face AND the sharpest face is below the per-face threshold.
-        if (
-            face_gate
-            and a_score is not None
-            and face_count > 0
-            and face_sharp < face_sharp_threshold
-        ):
+        # contains a face. The frame is rejected when the sharpest whole face is
+        # below the per-face threshold OR — when an eye-region focus measure is
+        # available — the subject's eyes aren't tack-sharp. Restricting to the
+        # eye region catches the classic miss where focus landed on the cheek/ear
+        # but the whole-face Laplacian still squeaks past.
+        face_soft = face_count > 0 and face_sharp < face_sharp_threshold
+        eyes_soft = face_eye_sharp is not None and face_eye_sharp < face_sharp_threshold
+        if face_gate and a_score is not None and (face_soft or eyes_soft):
             face_gated += 1
             # Pretend the frame failed the global gate so it lands in REJECT.
             sharp = min(sharp, threshold - 0.01)
@@ -427,10 +498,16 @@ def cmd_run(
             source = None
             emb = None
             phash = None
-            log.info(
-                "REJECT (face soft, %.1f < %.1f) %s",
-                face_sharp, face_sharp_threshold, f.display_name,
-            )
+            if eyes_soft and not face_soft:
+                log.info(
+                    "REJECT (eyes soft, %.1f < %.1f) %s",
+                    face_eye_sharp, face_sharp_threshold, f.display_name,
+                )
+            else:
+                log.info(
+                    "REJECT (face soft, %.1f < %.1f) %s",
+                    face_sharp, face_sharp_threshold, f.display_name,
+                )
 
         # Eye-aware gate: same shape as face-gate but on EAR via mediapipe.
         if (
@@ -438,7 +515,7 @@ def cmd_run(
             and a_score is not None
             and frame_eyes is not None
             and frame_eyes.get("face_count", 0) > 0
-            and frame_eyes.get("ear_min", 1.0) < eyes_mod.EYE_AR_THRESHOLD
+            and frame_eyes.get("ear_min", 1.0) < eye_ear_threshold
         ):
             eye_gated += 1
             sharp = min(sharp, threshold - 0.01)
@@ -449,7 +526,7 @@ def cmd_run(
             phash = None
             log.info(
                 "REJECT (eyes closed, EAR=%.2f < %.2f) %s",
-                frame_eyes["ear_min"], eyes_mod.EYE_AR_THRESHOLD, f.display_name,
+                frame_eyes["ear_min"], eye_ear_threshold, f.display_name,
             )
 
         row = Row(
@@ -479,7 +556,12 @@ def cmd_run(
 
     # Burst dedup: cluster by pHash + timestamp, mark non-best siblings.
     rows_by_key = {ci.key: row for row, ci, _ in dedup_inputs}
-    clusters = dedup.cluster_bursts([ci for _, ci, _ in dedup_inputs])
+    clusters = dedup.cluster_bursts(
+        [ci for _, ci, _ in dedup_inputs],
+        hamming_dist=dedup_hamming,
+        time_window=dedup_time_window,
+        enabled=dedup_enabled,
+    )
     bursts = [c for c in clusters if len(c) > 1]
     suppressed_count = 0
     for cid, cluster in enumerate(bursts, start=1):
@@ -591,7 +673,7 @@ def cmd_run(
     if output_dir is not None:
         # Build pool of (Row, score, embedding) for cluster-best survivors.
         embs_by_row_id = {id(row): emb for row, _ci, emb in dedup_inputs}
-        candidates: list[tuple[Row, float, "np.ndarray"]] = []
+        candidates: list[tuple[Row, float, np.ndarray]] = []
         for r in rows:
             if r.sharpness < threshold or not r.cluster_best:
                 continue
@@ -643,16 +725,45 @@ def cmd_run(
 
 
 def _write_output(output_dir: Path, top_rows: list[Row]) -> None:
-    """Copy the top-N originals (RAW + JPEG sidecars) into output_dir, flat."""
+    """Copy the top-N originals (RAW + JPEG sidecars) into output_dir, flat.
+
+    Copies are atomic (temp .part -> fsync -> os.replace, then re-hash) via
+    fsutil.atomic_copy, so a kill/full-disk mid-copy never leaves a truncated
+    file at the final name. We preflight free space with fsutil.has_free_space
+    and surface any per-file copy failures in the summary instead of letting
+    them pass silently.
+    """
     import json as _json
-    import shutil
+
+    from banger import fsutil
 
     log = logging.getLogger("banger")
     output_dir.mkdir(parents=True, exist_ok=True)
     log.info("copying top %d originals to %s", len(top_rows), output_dir)
 
+    # Preflight: sum the bytes we're about to copy (skip ones already present)
+    # and fail fast with a clear error if the destination volume can't hold them.
+    needed_bytes = 0
+    for r in top_rows:
+        for src in (p for p in (r.frame.raw, r.frame.jpeg) if p is not None):
+            dst = output_dir / src.name
+            if dst.exists():
+                continue
+            try:
+                needed_bytes += src.stat().st_size
+            except OSError:
+                pass
+    if not fsutil.has_free_space(output_dir, needed_bytes):
+        log.error(
+            "not enough free space to export ~%.1f MiB to %s; aborting copy",
+            needed_bytes / (1024 * 1024),
+            output_dir,
+        )
+        return
+
     manifest_entries: list[dict] = []
     copied = 0
+    failed: list[str] = []
     for rank, r in enumerate(top_rows, start=1):
         sources = [p for p in (r.frame.raw, r.frame.jpeg) if p is not None]
         copied_names: list[str] = []
@@ -661,12 +772,21 @@ def _write_output(output_dir: Path, top_rows: list[Row]) -> None:
             if dst.exists():
                 copied_names.append(src.name)
                 continue
+            # We only know a trusted sha for the frame's classify_path; for
+            # the matching source pass it so atomic_copy can verify the copy.
+            expected_sha = None
+            if src == r.frame.classify_path:
+                try:
+                    expected_sha = state.sha256_of(src)
+                except OSError:
+                    expected_sha = None
             try:
-                shutil.copy2(src, dst)
+                fsutil.atomic_copy(src, dst, expected_sha=expected_sha)
                 copied += 1
                 copied_names.append(src.name)
             except OSError as e:
                 log.warning("copy %s -> %s failed: %s", src, dst, e)
+                failed.append(src.name)
         manifest_entries.append({
             "rank": rank,
             "stem": r.frame.stem,
@@ -680,7 +800,13 @@ def _write_output(output_dir: Path, top_rows: list[Row]) -> None:
 
     manifest_path = output_dir / "manifest.json"
     manifest_path.write_text(_json.dumps(manifest_entries, indent=2), encoding="utf-8")
-    log.info("copied %d files to %s; manifest at %s", copied, output_dir, manifest_path)
+    if failed:
+        log.warning(
+            "copied %d files to %s (%d FAILED: %s); manifest at %s",
+            copied, output_dir, len(failed), ", ".join(failed), manifest_path,
+        )
+    else:
+        log.info("copied %d files to %s; manifest at %s", copied, output_dir, manifest_path)
 
 
 def cmd_explain(input_dir: Path, recursive: bool, stems: list[str]) -> int:
@@ -910,8 +1036,41 @@ def cmd_version() -> int:
     return 0
 
 
+def _install_file_logging() -> None:
+    """Tee log output to a rotating file under STATE_DIR/logs/banger.log.
+
+    Best-effort: if the logs dir can't be created (read-only home, etc.) we
+    just skip the file handler and keep console logging. Idempotent — re-runs
+    in the same process won't stack duplicate handlers.
+    """
+    from logging.handlers import RotatingFileHandler
+
+    root = logging.getLogger()
+    log_dir = state.STATE_DIR / "logs"
+    log_path = log_dir / "banger.log"
+    if any(
+        isinstance(h, RotatingFileHandler)
+        and getattr(h, "baseFilename", None) == str(log_path)
+        for h in root.handlers
+    ):
+        return
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            log_path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        root.addHandler(handler)
+    except OSError:
+        logging.getLogger("banger").debug("file logging unavailable", exc_info=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    _install_file_logging()
     args = _build_parser().parse_args(argv)
     if args.command == "run":
         return cmd_run(
@@ -933,6 +1092,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "train":
         return cmd_train()
     if args.command == "benchmark":
+        if args.vs == "facet" and args.facet_path is None:
+            logging.getLogger("banger").error(
+                "--vs facet requires --facet-path <path to facet checkout>"
+            )
+            return 2
         from banger import benchmark as bench_mod
         return bench_mod.cmd_benchmark(
             input_dir=args.input_dir,

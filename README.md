@@ -49,14 +49,30 @@ All of it lives in `~/.local/share/banger-pipeline/` — SQLite indices plus a p
 
 ## Quickstart
 
+### macOS (primary)
+
+The default PyTorch wheel ships arm64 / Apple-Silicon MPS support, so no special
+index URL is needed:
+
 ```sh
-python -m venv .venv
-.venv\Scripts\activate                # Linux: source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cu126
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev,gui]"
-pip install "transformers<5"
 
 python -m banger gui                  # native desktop window
+```
+
+### Windows + NVIDIA CUDA (secondary)
+
+On a CUDA box, install the CUDA torch build first, then the package:
+
+```sh
+python -m venv .venv
+.venv\Scripts\activate
+pip install torch --index-url https://download.pytorch.org/whl/cu126
+pip install -e ".[dev,gui]"
+
+python -m banger gui
 ```
 
 First launch auto-loads CLIP, fits scene clusters on any cached embeddings, backfills GPS / geocoding for any pre-indexed frames, and installs mediapipe in the background. A splash screen shows progress.
@@ -219,7 +235,7 @@ Warm runs (everything cached) are ~7× faster than cold. `banger cache clear --k
 
 ## Stack
 
-Python 3.11+, PyTorch + CUDA, transformers (CLIP ViT-B/32), insightface (ArcFace), mediapipe (FaceMesh / EAR), rawpy, imagehash, scikit-learn, reverse_geocoder, Flask, pywebview. Optional: pillow-heif, gphoto2 (Linux).
+Python 3.11+, PyTorch (CUDA / Apple-Silicon MPS / CPU), transformers (CLIP ViT-B/32), insightface (ArcFace), mediapipe (FaceMesh / EAR), rawpy, imagehash, scikit-learn, reverse_geocoder, Flask, pywebview. Optional: pillow-heif, gphoto2 (Linux).
 
 128 tests, ~10 s.
 

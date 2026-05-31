@@ -40,12 +40,32 @@ import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 from banger import (
-    aesthetic, dedup, eyes as eyes_mod, face,
-    face_id as face_id_mod, face_names, library, tagger as tagger_mod,
-    tags as tags_mod,
+    aesthetic,
+    dedup,
+    face,
+    face_names,
+    fsutil,
+    library,
+    scene_kmeans,
+    scenes,
+    select,
+    state,
+    taste_head,
+)
+from banger import (
+    eyes as eyes_mod,
+)
+from banger import (
+    face_id as face_id_mod,
 )
 from banger import metrics as metrics_mod
-from banger import scene_kmeans, scenes, select, settings as settings_mod, state, taste_head
+from banger import settings as settings_mod
+from banger import (
+    tagger as tagger_mod,
+)
+from banger import (
+    tags as tags_mod,
+)
 from banger import xmp as xmp_mod
 from banger.frames import discover_frames
 from banger.preview import load_preview
@@ -403,7 +423,8 @@ def _format_exposure(secs: float | None) -> str | None:
 
 _METERING_MODES = {0: "unknown", 1: "average", 2: "centre-weighted", 3: "spot",
                    4: "multi-spot", 5: "matrix", 6: "partial"}
-_FLASH_FIRED = lambda v: "fired" if (isinstance(v, int) and v & 1) else "no flash"
+def _FLASH_FIRED(v):
+    return "fired" if (isinstance(v, int) and v & 1) else "no flash"
 
 
 def _render_gallery_html(title: str, items: list[dict]) -> str:
@@ -419,15 +440,23 @@ def _render_gallery_html(title: str, items: list[dict]) -> str:
             return ""
         bits = []
         cam = " ".join(filter(None, [exif.get("camera_make"), exif.get("camera_model")])).strip()
-        if cam: bits.append(esc(cam))
-        if exif.get("lens_model"): bits.append(esc(exif["lens_model"]))
+        if cam:
+            bits.append(esc(cam))
+        if exif.get("lens_model"):
+            bits.append(esc(exif["lens_model"]))
         details = []
-        if exif.get("focal_length"): details.append(f"{exif['focal_length']:.0f}mm")
-        if exif.get("f_number"): details.append(f"f/{exif['f_number']:.1f}")
-        if exif.get("shutter"): details.append(exif["shutter"])
-        if exif.get("iso"): details.append(f"ISO {exif['iso']}")
-        if details: bits.append(esc(" · ".join(details)))
-        if exif.get("date_taken"): bits.append(esc(exif["date_taken"]))
+        if exif.get("focal_length"):
+            details.append(f"{exif['focal_length']:.0f}mm")
+        if exif.get("f_number"):
+            details.append(f"f/{exif['f_number']:.1f}")
+        if exif.get("shutter"):
+            details.append(exif["shutter"])
+        if exif.get("iso"):
+            details.append(f"ISO {exif['iso']}")
+        if details:
+            bits.append(esc(" · ".join(details)))
+        if exif.get("date_taken"):
+            bits.append(esc(exif["date_taken"]))
         return "<br>".join(bits)
 
     cards = []
@@ -790,7 +819,6 @@ def build_app(window_holder: dict | None = None) -> Flask:
         """
         import base64
         import datetime as _dt
-        import shutil
 
         data = request.get_json(silent=True) or {}
         shas = data.get("shas") or []
@@ -807,35 +835,73 @@ def build_app(window_holder: dict | None = None) -> Flask:
         if label_hint:
             ts = f"{ts}_{label_hint}"
         folder = root / ts
-        folder.mkdir(parents=True, exist_ok=True)
 
-        copied = 0
+        # Resolve sources first so we can preflight free space against the
+        # summed source size and reject up front rather than dying mid-copy
+        # with a half-populated folder. We also remember which sha "owns" each
+        # source path so atomic_copy can verify the copy against the known
+        # library hash (siblings have their own hashes we don't know, so they
+        # copy unverified).
         errors: list[str] = []
-        manifest: list[dict] = []
-        head = taste_head.load()
-
+        # plan: list of (rank, sha, [(src_path, expected_sha|None), ...])
+        plan: list[tuple[int, str, list[tuple[Path, str | None]]]] = []
+        needed_bytes = 0
         for rank, sha in enumerate(shas, start=1):
             src = _resolve_path(sha)
             if src is None:
                 errors.append(f"unknown sha: {sha}")
                 continue
-            siblings = [src]
+            siblings: list[tuple[Path, str | None]] = [(src, sha)]
+            seen = {src}
             for suffix in (".ARW", ".CR2", ".CR3", ".NEF", ".RAF", ".DNG",
                            ".RW2", ".ORF", ".PEF", ".JPG", ".JPEG"):
                 sib = src.with_suffix(suffix)
-                if sib != src and sib.exists() and sib not in siblings:
-                    siblings.append(sib)
-            copied_names = []
-            for s in siblings:
-                dst = folder / s.name
-                if dst.exists():
-                    copied_names.append(s.name)
-                    continue
+                if sib != src and sib.exists() and sib not in seen:
+                    siblings.append((sib, None))
+                    seen.add(sib)
+            for sp, _exp in siblings:
                 try:
-                    shutil.copy2(s, dst)
+                    needed_bytes += sp.stat().st_size
+                except OSError:
+                    pass
+            plan.append((rank, sha, siblings))
+
+        if not plan:
+            return jsonify({"error": "no resolvable sources", "errors": errors[:10]}), 400
+
+        folder.mkdir(parents=True, exist_ok=True)
+        # Preflight: refuse to start if the destination can't hold the originals
+        # (plus a little headroom for the manifest + gallery thumbnails).
+        if not fsutil.has_free_space(folder, needed_bytes + (8 << 20)):
+            return jsonify({
+                "error": "insufficient free space",
+                "folder": str(folder),
+                "needed_bytes": needed_bytes,
+            }), 507
+
+        copied = 0
+        manifest: list[dict] = []
+        head = taste_head.load()
+
+        for rank, sha, siblings in plan:
+            src = siblings[0][0]
+            copied_names = []
+            for s, expected_sha in siblings:
+                dst = folder / s.name
+                # Only treat a pre-existing dst as done if it's byte-for-byte
+                # the same size; a truncated/partial leftover must be re-copied.
+                if dst.exists():
+                    try:
+                        if dst.stat().st_size == s.stat().st_size:
+                            copied_names.append(s.name)
+                            continue
+                    except OSError:
+                        pass
+                try:
+                    fsutil.atomic_copy(s, dst, expected_sha=expected_sha)
                     copied += 1
                     copied_names.append(s.name)
-                except OSError as e:
+                except (OSError, ValueError) as e:
                     errors.append(f"copy {s.name}: {e}")
 
             # Gather stats for the gallery.
@@ -914,11 +980,87 @@ def build_app(window_holder: dict | None = None) -> Flask:
         except OSError as e:
             errors.append(f"gallery write: {e}")
 
-        return jsonify({
+        # A non-empty errors list means the export is partial (some originals
+        # failed to copy or verify). Surface that as a 207-ish result the
+        # client can flag, NOT a bare 200 "success".
+        body = {
             "folder": str(folder),
             "copied": copied,
             "errors": errors[:10],
-        })
+            "error_count": len(errors),
+            "partial": bool(errors),
+        }
+        return jsonify(body), (207 if errors else 200)
+
+    @app.route("/api/xmp-writeback", methods=["POST"])
+    def xmp_writeback():
+        """Write XMP sidecars (ratings + colour labels + subjects) next to the
+        ORIGINAL files for the given scope, leaving the source pixels untouched.
+
+        Body: {shas: [...]}. This is the local-first "annotate the catalog you
+        already own" action — previously XMP was only reachable from the legacy
+        Quick-run path. We rank the frames by their effective score (taste head
+        if trained, else aesthetic, else sharpness fallback) so stars_from_rank
+        matches the Export ranking, then delegate to xmp.write_for_rows.
+        """
+        from banger.report import Row as _Row
+
+        data = request.get_json(silent=True) or {}
+        shas = data.get("shas") or []
+        if not shas:
+            return jsonify({"error": "shas list required"}), 400
+
+        head = taste_head.load()
+        rows: list = []
+        errors: list[str] = []
+        for sha in shas:
+            f = _resolve_frame(sha)
+            if f is None:
+                errors.append(f"unknown sha: {sha}")
+                continue
+            meta = state.load_frame_metadata(sha) or {}
+            emb = state.load_embedding(sha)
+            aesthetic_score = None
+            aesthetic_source = None
+            if emb is not None:
+                try:
+                    if head is not None:
+                        aesthetic_score = float(head.predict(emb.reshape(1, -1))[0])
+                        aesthetic_source = "head"
+                    else:
+                        aesthetic_score, _ = aesthetic.score_from_embedding(emb)
+                        aesthetic_source = "prompts"
+                except Exception as e:
+                    log.warning("xmp score fail %s: %s", sha, e)
+            sharp = float(meta.get("sharpness") or 0.0)
+            rows.append(_Row(
+                frame=f,
+                sharpness=sharp,
+                aesthetic=aesthetic_score,
+                aesthetic_breakdown=None,
+                aesthetic_source=aesthetic_source,
+                thumb_b64="",
+                scene_preset=(meta.get("scene_preset") or None),
+                metrics=meta.get("metrics"),
+                eyes=meta.get("eyes"),
+            ))
+
+        written = 0
+        if rows:
+            try:
+                written = xmp_mod.write_for_rows(rows)
+            except Exception as e:
+                log.warning("xmp writeback failed: %s", e)
+                errors.append(f"xmp write: {e}")
+
+        body = {
+            "written": written,
+            "considered": len(rows),
+            "errors": errors[:10],
+            "error_count": len(errors),
+            "partial": bool(errors),
+        }
+        return jsonify(body), (207 if errors else 200)
 
     @app.route("/api/import", methods=["POST"])
     def import_files():
@@ -930,9 +1072,6 @@ def build_app(window_holder: dict | None = None) -> Flask:
         background-job version with progress would come if the typical
         import grows past ~1k files.
         """
-        import shutil
-        from datetime import datetime as _dt
-
         data = request.get_json(silent=True) or {}
         src_raw = (data.get("source") or "").strip()
         dst_raw = (data.get("destination") or "").strip()
@@ -947,8 +1086,29 @@ def build_app(window_holder: dict | None = None) -> Flask:
 
         from banger.frames import discover_frames as _discover
         frames = _discover(src, recursive=True)
+
+        # Preflight free space against the summed source sizes (over-estimates
+        # slightly because of files we'll skip as already-present, which is the
+        # safe direction).
+        needed_bytes = 0
+        for f in frames:
+            for p in (f.classify_path, f.raw, f.jpeg):
+                if p is None:
+                    continue
+                try:
+                    needed_bytes += p.stat().st_size
+                except OSError:
+                    pass
+        if not fsutil.has_free_space(dst, needed_bytes):
+            return jsonify({
+                "error": "insufficient free space at destination",
+                "destination": str(dst),
+                "needed_bytes": needed_bytes,
+            }), 507
+
         copied = 0
         skipped = 0
+        errors: list[str] = []
         for f in frames:
             srcp = f.classify_path
             subfolder = _subfolder_for(srcp, scheme)
@@ -958,12 +1118,17 @@ def build_app(window_holder: dict | None = None) -> Flask:
             if target.exists() and target.stat().st_size == srcp.stat().st_size:
                 skipped += 1
                 continue
-            shutil.copy2(srcp, target)
-            # Also copy the sibling RAW or JPEG if present.
-            other = f.raw if f.classify_path == f.jpeg else f.jpeg
-            if other is not None and other != srcp and other.exists():
-                shutil.copy2(other, target_dir / other.name)
-            copied += 1
+            try:
+                fsutil.atomic_copy(srcp, target)
+                # Also copy the sibling RAW or JPEG if present.
+                other = f.raw if f.classify_path == f.jpeg else f.jpeg
+                if other is not None and other != srcp and other.exists():
+                    osib = target_dir / other.name
+                    if not (osib.exists() and osib.stat().st_size == other.stat().st_size):
+                        fsutil.atomic_copy(other, osib)
+                copied += 1
+            except (OSError, ValueError) as e:
+                errors.append(f"copy {srcp.name}: {e}")
 
         root = library.add_root(dst)
         # Kick a scan (synchronous so the response reflects the new frames).
@@ -973,12 +1138,16 @@ def build_app(window_holder: dict | None = None) -> Flask:
         with _scan_lock:
             _scan_progress[root.id] = progress
         library.scan_root(root.id, progress=progress)
-        return jsonify({
+        body = {
             "copied": copied,
             "skipped": skipped,
             "root_id": root.id,
             "scan": progress.to_view(),
-        })
+            "errors": errors[:10],
+            "error_count": len(errors),
+            "partial": bool(errors),
+        }
+        return jsonify(body), (207 if errors else 200)
 
     @app.route("/api/library/roots", methods=["GET"])
     def library_roots():
@@ -1081,6 +1250,11 @@ def build_app(window_holder: dict | None = None) -> Flask:
                         for n, c in library.folder_tree(root_id)],
         })
 
+    # SQL pages are pulled this many rows at a time when a Python-side filter is
+    # active, so face/place/text/rating filters scan the WHOLE matching set
+    # rather than just the first page the client asked for.
+    _SQL_PAGE = 2000
+
     @app.route("/api/library/frames")
     def library_frames():
         # All filters are optional; missing = no filter.
@@ -1096,22 +1270,37 @@ def build_app(window_holder: dict | None = None) -> Flask:
         q = (request.args.get("q") or "").strip().lower() or None
         place_filter = (request.args.get("place") or "").strip() or None
 
-        rows = library.query_frames(
-            root_id=root_id, subdir=subdir, camera=camera,
-            after=after, before=before, limit=limit, offset=offset,
+        # Python-side filters live outside the SQL DB (labels.db + metadata/*.json),
+        # so the library can't paginate them. If ANY is active we must scan the
+        # full SQL-matching set to filter correctly and report an honest total.
+        py_filter_active = (
+            face_name is not None or min_score is not None
+            or q is not None or place_filter is not None
         )
-        # Enrich each frame with whatever the existing metadata cache + label DB
-        # carry. We're crossing a boundary here: library has fast SQL filters
-        # for root/camera/date, label/metadata filters happen in Python over
-        # the returned page. That's fine while pages stay <1k frames.
-        labels_map = state.labels_dict() if min_score is not None else None
-        out = []
-        for r in rows:
-            meta = state.load_frame_metadata(r.sha) or {}
-            label = labels_map.get(r.sha) if labels_map is not None else state.get_label(r.sha)
-            # Face-name post-filter: any of the matched names equals `face_name`.
+
+        # Labels are read ONCE per request (a single dict) instead of a SQLite
+        # round-trip per row.
+        labels_map = state.labels_dict()
+        # Cache metadata per sha so we hash/parse each frame's JSON at most once
+        # per request even though filtering and view-building both consult it.
+        meta_cache: dict[str, dict] = {}
+
+        def _meta(sha: str) -> dict:
+            m = meta_cache.get(sha)
+            if m is None:
+                m = state.load_frame_metadata(sha) or {}
+                meta_cache[sha] = m
+            return m
+
+        def _passes(r) -> bool:
+            if place_filter is not None and r.place_city != place_filter:
+                return False
+            if min_score is not None:
+                label = labels_map.get(r.sha)
+                if label is None or label < min_score:
+                    return False
             if face_name is not None:
-                detections = meta.get("face_detections") or []
+                detections = _meta(r.sha).get("face_detections") or []
                 matched_names = set()
                 for d in detections:
                     emb = np.asarray(d.get("embedding") or [], dtype=np.float32)
@@ -1120,34 +1309,94 @@ def build_app(window_holder: dict | None = None) -> Flask:
                         if n:
                             matched_names.add(n)
                 if face_name not in matched_names:
-                    continue
-            if min_score is not None and (label is None or label < min_score):
-                continue
-            if place_filter is not None and r.place_city != place_filter:
-                continue
+                    return False
             if q is not None:
-                # Search across stem, rel_path, camera, place, and tags. Cheap
-                # substring match; not BM25 but good enough for a 50k-frame
-                # library where the user already has root+camera filters.
+                # Substring match over stem / rel_path / camera / place / tags.
                 blob_parts = [r.stem.lower(), r.rel_path.lower()]
                 if r.camera_model:
                     blob_parts.append(r.camera_model.lower())
                 for place in (r.place_city, r.place_region, r.place_country):
                     if place:
                         blob_parts.append(place.lower())
-                for t in (meta.get("tags") or []):
+                for t in (_meta(r.sha).get("tags") or []):
                     if isinstance(t, (list, tuple)) and t:
                         blob_parts.append(str(t[0]).lower())
                 if q not in " | ".join(blob_parts):
-                    continue
-            out.append({
+                    return False
+            return True
+
+        def _view(r) -> dict:
+            meta = _meta(r.sha)
+            return {
                 **r.to_view(),
-                "label": label,
+                "label": labels_map.get(r.sha),
                 "tags": meta.get("tags"),
                 "has_face_data": bool(meta.get("face_detections")),
                 "scored": "metrics" in meta,
+            }
+
+        if not py_filter_active:
+            # Fast path: SQL does ALL the filtering, so we can paginate directly
+            # and count without scanning every row.
+            rows = library.query_frames(
+                root_id=root_id, subdir=subdir, camera=camera,
+                after=after, before=before, limit=limit, offset=offset,
+            )
+            # Accurate total for the SQL-expressible filter set. count_frames
+            # only honours root_id, so when subdir/camera/date narrow further we
+            # fall back to counting via a wide query (sha-only, no metadata).
+            if subdir is None and camera is None and after is None and before is None:
+                total = library.count_frames(root_id)
+            else:
+                total = 0
+                page_off = 0
+                while True:
+                    page = library.query_frames(
+                        root_id=root_id, subdir=subdir, camera=camera,
+                        after=after, before=before, limit=_SQL_PAGE, offset=page_off,
+                    )
+                    if not page:
+                        break
+                    total += len(page)
+                    if len(page) < _SQL_PAGE:
+                        break
+                    page_off += _SQL_PAGE
+            out = [_view(r) for r in rows]
+            return jsonify({
+                "frames": out, "total": total,
+                "offset": offset, "limit": limit,
+                "returned": len(out),
+                "has_more": offset + len(out) < total,
             })
-        return jsonify({"frames": out, "total": len(out)})
+
+        # Slow (but correct) path: walk the full SQL set in pages, apply the
+        # Python filters, and slice the requested window out of the matches.
+        # We only build views for the rows in the returned window.
+        matched: list = []
+        page_off = 0
+        while True:
+            page = library.query_frames(
+                root_id=root_id, subdir=subdir, camera=camera,
+                after=after, before=before, limit=_SQL_PAGE, offset=page_off,
+            )
+            if not page:
+                break
+            for r in page:
+                if _passes(r):
+                    matched.append(r)
+            if len(page) < _SQL_PAGE:
+                break
+            page_off += _SQL_PAGE
+
+        total = len(matched)
+        window = matched[offset:offset + limit] if limit else matched[offset:]
+        out = [_view(r) for r in window]
+        return jsonify({
+            "frames": out, "total": total,
+            "offset": offset, "limit": limit,
+            "returned": len(out),
+            "has_more": offset + len(out) < total,
+        })
 
     @app.route("/api/recent-folders")
     def recent_folders():
@@ -1330,8 +1579,10 @@ def build_app(window_holder: dict | None = None) -> Flask:
         x1, y1, x2, y2 = bbox
         # Pad 25% around the bbox so we get hair + chin, not just face plane.
         pw, ph = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
-        x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
-        x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+        x1 = max(0, x1 - pw)
+        y1 = max(0, y1 - ph)
+        x2 = min(w, x2 + pw)
+        y2 = min(h, y2 + ph)
         if x2 <= x1 or y2 <= y1:
             return ("empty crop", 500)
         crop = preview[y1:y2, x1:x2]
@@ -1373,8 +1624,10 @@ def build_app(window_holder: dict | None = None) -> Flask:
                 h, w = preview.shape[:2]
                 x1, y1, x2, y2 = bbox
                 pw, ph = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
-                x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
-                x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+                x1 = max(0, x1 - pw)
+                y1 = max(0, y1 - ph)
+                x2 = min(w, x2 + pw)
+                y2 = min(h, y2 + ph)
                 if x2 > x1 and y2 > y1:
                     crop = cv2.resize(preview[y1:y2, x1:x2], (128, 128),
                                       interpolation=cv2.INTER_AREA)
@@ -1497,6 +1750,22 @@ def build_app(window_holder: dict | None = None) -> Flask:
                 place = ", ".join(p for p in parts if p)
                 if place:
                     exif["place"] = place
+        # Eye-region sharpness: the "are the eyes tack-sharp" check. Prefer a
+        # cached value if the pipeline already wrote one; otherwise compute it
+        # lazily from the preview here (detail-open is a fine place to pay that
+        # cost). `None` = no face found, which the panel renders as "no face" —
+        # distinct from 0.0 (face found, eyes carry no detail).
+        eye_sharpness = meta.get("eye_sharpness")
+        eye_sharpness_present = "eye_sharpness" in meta
+        if not eye_sharpness_present:
+            try:
+                preview_arr = load_preview(f.classify_path)
+                eye_sharpness = face.best_face_eye_sharpness(preview_arr)
+                eye_sharpness_present = True
+            except Exception as e:
+                log.warning("eye sharpness fail %s: %s", f.display_name, e)
+                eye_sharpness_present = False
+
         # The original pick dict is held in the job; we don't have it here
         # without the job_id, so the SPA passes the pick info client-side and
         # this endpoint just adds the heavy-to-fetch bits (metrics, EXIF).
@@ -1509,11 +1778,72 @@ def build_app(window_holder: dict | None = None) -> Flask:
             "eyes": meta.get("eyes"),
             "face_count": meta.get("face_count"),
             "face_sharpness": meta.get("face_sharpness"),
+            "eye_sharpness": eye_sharpness,
+            "eye_sharpness_present": eye_sharpness_present,
             "sharpness": meta.get("sharpness"),
+            "label": state.get_label(sha),
             "tags": meta.get("tags"),
             "caption": meta.get("caption"),
             "exif": exif,
         })
+
+    @app.route("/api/label", methods=["POST"])
+    def set_label():
+        """Set a personal taste label on a frame from the main GUI.
+
+        The README has long promised that labels show "in the corner", but
+        until now there was no way to SET one without spawning the legacy
+        labelling subprocess. This closes that loop: number keys / +/- in the
+        Library grid + detail overlay post here. Works for any sha the library
+        knows about, not just frames from the current scoring job.
+        """
+        data = request.get_json(silent=True) or {}
+        sha = data.get("sha")
+        score = data.get("score")
+        if not sha:
+            return jsonify({"error": "missing sha"}), 400
+        f = _resolve_frame(sha)
+        if f is None:
+            return jsonify({"error": "unknown sha"}), 404
+        if score is None:
+            return jsonify({"error": "missing score"}), 400
+        try:
+            score = int(score)
+        except (TypeError, ValueError):
+            return jsonify({"error": "score must be an integer"}), 400
+        if not state.SCORE_MIN <= score <= state.SCORE_MAX:
+            return jsonify({
+                "error": f"score out of [{state.SCORE_MIN}, {state.SCORE_MAX}]"
+            }), 400
+
+        # Cache an embedding lazily so the taste head can later train on this
+        # label (mirrors server.py's set_label). Best-effort; a label is still
+        # recorded even if the embedding can't be computed.
+        if state.load_embedding(sha) is None:
+            try:
+                preview_arr = load_preview(f.classify_path)
+                state.cache_embedding(sha, aesthetic.encode_image(preview_arr))
+            except Exception as e:
+                log.warning("embedding fail %s: %s", getattr(f, "display_name", sha), e)
+
+        state.add_label(sha, score, f.stem, str(f.classify_path))
+        return jsonify({"sha": sha, "score": score})
+
+    @app.route("/api/label", methods=["DELETE"])
+    def clear_label():
+        """Clear a frame's taste label. Accepts the sha in the JSON body
+        (DELETE /api/label {sha}) per the cross-module contract."""
+        data = request.get_json(silent=True) or {}
+        sha = data.get("sha") or request.args.get("sha")
+        if not sha:
+            return jsonify({"error": "missing sha"}), 400
+        if _resolve_frame(sha) is None:
+            return jsonify({"error": "unknown sha"}), 404
+        import sqlite3
+
+        with sqlite3.connect(state.LABELS_DB) as conn:
+            conn.execute("DELETE FROM labels WHERE sha256=?", (sha,))
+        return jsonify({"sha": sha, "score": None})
 
     @app.route("/api/label-spawn", methods=["POST"])
     def label_spawn():
@@ -1600,9 +1930,56 @@ def build_app(window_holder: dict | None = None) -> Flask:
     return app
 
 
+def _install_file_logging() -> None:
+    """Route logs to a rotating file under STATE_DIR/logs.
+
+    The pywebview GUI has no terminal, so without this every warning, traceback
+    and pipeline diagnostic vanishes — the only place to look after a crash is
+    this file. Best-effort: if the log dir can't be created we just keep going
+    with whatever handlers are already attached. Idempotent (won't double-add
+    its handler across repeated serve() calls in the same process).
+    """
+    from logging.handlers import RotatingFileHandler
+
+    try:
+        log_dir = state.STATE_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / "banger.log"
+
+        root_logger = logging.getLogger("banger")
+        # Don't stack duplicate file handlers if serve() is called twice.
+        for h in root_logger.handlers:
+            if isinstance(h, RotatingFileHandler) and getattr(h, "_banger_file", False):
+                return
+        handler = RotatingFileHandler(
+            log_path, maxBytes=2 << 20, backupCount=5, encoding="utf-8"
+        )
+        handler._banger_file = True  # type: ignore[attr-defined]
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s"
+        ))
+        root_logger.addHandler(handler)
+        if root_logger.level == logging.NOTSET or root_logger.level > logging.INFO:
+            root_logger.setLevel(logging.INFO)
+        log.info("file logging installed at %s", log_path)
+    except Exception as e:  # never let logging setup take down startup
+        log.warning("file logging setup failed: %s", e)
+
+    # Opportunistic, best-effort snapshot of the only irreplaceable user data
+    # (labels.db) at startup. Tiny + idempotent; swallow every failure.
+    try:
+        backup = state.backup_labels()
+        log.info("labels backed up to %s", backup)
+    except Exception as e:
+        log.warning("startup labels backup skipped: %s", e)
+
+
 def serve(port: int = 8765, open_window: bool = True) -> None:
     """Entry point used by `banger gui`. Launches Flask in a background thread
     and pywebview on the main thread (which has to be the main thread on macOS)."""
+
+    _install_file_logging()
 
     window_holder: dict = {}
     app = build_app(window_holder)
@@ -1902,6 +2279,9 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .overlay-panel .head .rank { font-family: ui-monospace, monospace; color: var(--accent); font-size: .85rem; }
   .overlay-panel .head .stars { color: #ffd56a; font-size: 1rem; letter-spacing: -1px; }
   .overlay-panel .head .stem { font-family: ui-monospace, monospace; font-size: .85rem; word-break: break-all; }
+  .overlay-panel .rating-bar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin: .4rem 0 .2rem; }
+  .overlay-panel .overlay-rating { color: #ffd56a; font-size: .85rem; font-family: ui-monospace, monospace; }
+  .overlay-panel .rating-hint { color: var(--dim); font-size: .65rem; }
   .overlay-panel dl { display: grid; grid-template-columns: minmax(110px, auto) 1fr; gap: .25rem .8rem; margin: 0; font-size: .8rem; }
   .overlay-panel dt { color: var(--dim); font-size: .75rem; }
   .overlay-panel dd { margin: 0; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; color: #ddd; word-break: break-all; }
@@ -1971,6 +2351,7 @@ _SPA_TEMPLATE = r"""<!doctype html>
   .lib-grid { flex: 1 1 auto; overflow-y: auto; padding: .8rem; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); grid-auto-rows: 200px; gap: .5rem; align-content: start; }
   .lib-cell { background: var(--bg2); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; cursor: pointer; transition: border-color .12s; position: relative; height: 200px; display: flex; flex-direction: column; }
   .lib-cell:hover { border-color: var(--accent); }
+  .lib-cell.focused { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
   .lib-cell .lib-img-wrap { flex: 1 1 auto; min-height: 0; background: #000; position: relative; overflow: hidden; }
   .lib-cell .lib-img-wrap img { width: 100%; height: 100%; object-fit: contain; display: block; }
   .lib-cell .lib-label { padding: .3rem .5rem; font-size: .7rem; color: #ccc; font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2156,12 +2537,13 @@ _SPA_TEMPLATE = r"""<!doctype html>
         <button id="lib-scan">Rescan</button>
         <button id="lib-index" title="Pre-compute tags, faces, scenes, scores for everything in the library so culling later is instant">Index all</button>
         <button id="lib-score">Score this view</button>
+        <button id="lib-xmp" title="Write ratings + colour labels to XMP sidecars next to your originals (source files untouched). Opens in Lightroom / Bridge / digiKam.">Write ratings to source (XMP)</button>
         <button id="lib-export" class="primary" title="Cull current view + copy top N originals to ~/Pictures/bangers/&lt;timestamp&gt;/">Export bangers ↗</button>
       </div>
       <div class="lib-grid" id="lib-grid">
         <div class="lib-onboarding" id="lib-onboarding">
           <h2>Welcome to your library</h2>
-          <p>Point banger at the folders you already keep your photos in, or pull them in from a camera / SD card. We'll index, score, tag, name faces, and let you edit; nothing leaves your machine.</p>
+          <p>Point banger at the folders you already keep your photos in, or pull them in from a camera / SD card. We'll index, score, cull, tag, name faces, and write ratings back to your files — nothing leaves your machine.</p>
           <div class="onboarding-actions">
             <button id="onb-add-folder">📁 Open folder</button>
             <button id="onb-import">📷 Import from device</button>
@@ -2561,6 +2943,7 @@ function renderResults(j) {
 }
 
 async function openHero(pick) {
+  overlaySha = pick.sha;
   $("#overlay-img").src = "/api/preview/" + pick.sha;
   $("#overlay-panel").innerHTML = renderPanelLoading(pick);
   $("#overlay").classList.add("show");
@@ -2570,6 +2953,7 @@ async function openHero(pick) {
     if (!res.ok) throw new Error(await res.text());
     details = await res.json();
     $("#overlay-panel").innerHTML = renderPanel(pick, details);
+    updateLabelChips(pick.sha, details.label);
   } catch (e) {
     $("#overlay-panel").innerHTML = renderPanelLoading(pick) +
       `<p class="empty">details fetch failed: ${escapeHtml(e.message)}</p>`;
@@ -2727,12 +3111,22 @@ function renderPanel(pick, d) {
     ? `<dl>${extra.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`
     : "";
 
-  // Face / eyes block. Names + thumbs get loaded async after openHero.
+  // Eye-region sharpness ("are the eyes tack-sharp"): null = no face found,
+  // a number = eye-region Laplacian variance. Render "no face" for null so the
+  // empty result is legible rather than a bare dash.
+  const eyesSharpText = (d.eye_sharpness === null || d.eye_sharpness === undefined)
+    ? "no face"
+    : d.eye_sharpness.toFixed(0);
+
+  // Face / eyes block. Names + thumbs get loaded async after openHero. We show
+  // the block whenever we have a face count OR a computed eye-sharpness value
+  // so the "eyes sharpness" metric is always surfaced.
   let faceBlock = "";
-  if (d.face_count) {
+  if (d.face_count || d.eye_sharpness_present) {
     const faceRows = [
-      ["faces detected", d.face_count],
+      ["faces detected", d.face_count || 0],
       ["face sharpness", d.face_sharpness !== null && d.face_sharpness !== undefined ? d.face_sharpness.toFixed(0) : "—"],
+      ["eyes sharpness", eyesSharpText],
     ];
     if (d.eyes) {
       faceRows.push(["min EAR", d.eyes.ear_min !== undefined ? d.eyes.ear_min.toFixed(3) : "—"]);
@@ -2741,7 +3135,7 @@ function renderPanel(pick, d) {
     faceBlock = `
       <h3>Faces</h3>
       <dl>${faceRows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>
-      <div id="faces-slot-${pick.sha}"><p class="empty">loading faces…</p></div>`;
+      ${d.face_count ? `<div id="faces-slot-${pick.sha}"><p class="empty">loading faces…</p></div>` : ""}`;
   }
 
   // EXIF block.
@@ -2775,11 +3169,17 @@ function renderPanel(pick, d) {
     ? renderTagChips(d.tags)
     : `<div id="tags-slot-${pick.sha}"><p class="empty">loading tags…</p></div>`;
 
+  const ratingText = (d.label === null || d.label === undefined)
+    ? "no rating" : `rating ${d.label >= 0 ? "+" : ""}${d.label}`;
   return `
     <div class="head">
       <span class="rank">#${pick.rank}</span>
       <span class="stars">${stars}</span>
       <span class="stem">${escapeHtml(pick.display)}</span>
+    </div>
+    <div class="rating-bar">
+      <span id="overlay-rating" class="overlay-rating">${ratingText}</span>
+      <span class="rating-hint">1–5 / +/- rate · Bksp clear · ←→ navigate</span>
     </div>
     <h3>Tags</h3>
     ${tagsHtml}
@@ -2804,15 +3204,120 @@ function renderPanel(pick, d) {
     </dl>`;
 }
 
-function closeOverlay() { $("#overlay").classList.remove("show"); }
+function closeOverlay() { $("#overlay").classList.remove("show"); overlaySha = null; }
 
 $("#overlay-close").addEventListener("click", closeOverlay);
 // Click on the overlay backdrop closes; clicks inside .overlay-inner don't.
 $("#overlay").addEventListener("click", e => {
   if (e.target === $("#overlay")) closeOverlay();
 });
+
+// Build a minimal "pick" from a Library grid cell so the detail overlay can be
+// opened by keyboard navigation (mirrors the click handler in refreshLibraryGrid).
+function _pickFromCell(cell) {
+  const display = cell.dataset.display || "";
+  return {
+    sha: cell.dataset.sha, rank: 0,
+    stem: display.split("/").pop().replace(/\.[^.]+$/, ""),
+    subdir: display.includes("/") ? display.substring(0, display.lastIndexOf("/")) : "",
+    display, kind: "jpeg", sharpness: 0, aesthetic: null, aesthetic_source: null,
+    scene_preset: null,
+  };
+}
+
+// In-overlay navigation: move the underlying grid focus and re-open the hero.
+function overlayNavigate(delta) {
+  const cells = _libCells();
+  if (!cells.length) return;
+  setLibFocus(libFocusIdx + delta);
+  const cell = cells[libFocusIdx];
+  if (cell) openHero(_pickFromCell(cell));
+}
+
+// Is the library tab the active view? Keyboard culling only applies there
+// (currentView is the SPA's view switch, set by show()).
+function _libraryActive() { return currentView === "library"; }
+
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") closeOverlay();
+  // Never hijack typing in inputs / textareas / contenteditable.
+  const t = e.target;
+  if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+    if (e.key === "Escape" && overlaySha) closeOverlay();
+    return;
+  }
+
+  // Undo works globally (Cmd/Ctrl+Z) as long as we have a stack.
+  if ((e.metaKey || e.ctrlKey) && (e.key === "z" || e.key === "Z")) {
+    e.preventDefault();
+    undoLastLabel();
+    return;
+  }
+
+  if (e.key === "Escape") { if (overlaySha) closeOverlay(); return; }
+
+  const overlayOpen = !!overlaySha;
+  // Culling shortcuts only apply in the Library tab (grid) or its overlay.
+  if (!overlayOpen && !_libraryActive()) return;
+
+  const sha = activeSha();
+
+  // Navigation. In the overlay, arrows step prev/next; in the grid, arrows move
+  // the focus (left/right by one, up/down by a row). Space advances.
+  if (e.key === "ArrowLeft") {
+    e.preventDefault();
+    if (overlayOpen) overlayNavigate(-1); else setLibFocus(libFocusIdx - 1);
+    return;
+  }
+  if (e.key === "ArrowRight" || e.key === " " || e.key === "Spacebar") {
+    e.preventDefault();
+    if (overlayOpen) overlayNavigate(1); else setLibFocus(libFocusIdx + 1);
+    return;
+  }
+  if (e.key === "ArrowUp") {
+    e.preventDefault();
+    if (overlayOpen) overlayNavigate(-1); else setLibFocus(libFocusIdx - _libCols());
+    return;
+  }
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    if (overlayOpen) overlayNavigate(1); else setLibFocus(libFocusIdx + _libCols());
+    return;
+  }
+  // Enter opens the focused cell in the grid.
+  if (e.key === "Enter" && !overlayOpen) {
+    const cell = _libCells()[libFocusIdx];
+    if (cell) { e.preventDefault(); openHero(_pickFromCell(cell)); }
+    return;
+  }
+
+  if (!sha) return;
+
+  // Number keys 1–5 set a star-like positive taste label; P = pick (+5),
+  // X = reject (-5); +/- nudge; Backspace / Delete / 0 clears.
+  if (e.key >= "1" && e.key <= "5") {
+    e.preventDefault();
+    applyLabel(sha, parseInt(e.key, 10));
+    return;
+  }
+  if (e.key === "p" || e.key === "P") { e.preventDefault(); applyLabel(sha, 5); return; }
+  if (e.key === "x" || e.key === "X") { e.preventDefault(); applyLabel(sha, -5); return; }
+  if (e.key === "+" || e.key === "=") {
+    e.preventDefault();
+    const cur = _currentLabelForSha(sha) || 0;
+    applyLabel(sha, Math.min(5, cur + 1));
+    return;
+  }
+  if (e.key === "-" || e.key === "_") {
+    e.preventDefault();
+    const cur = _currentLabelForSha(sha) || 0;
+    applyLabel(sha, Math.max(-5, cur - 1));
+    return;
+  }
+  if (e.key === "0" || e.key === "Backspace" || e.key === "Delete") {
+    e.preventDefault();
+    clearLabel(sha);
+    return;
+  }
 });
 
 $("#btn-rerun").addEventListener("click", () => show("welcome"));
@@ -2888,9 +3393,144 @@ let libState = {
   starFilter: "",
   placeFilter: "",
   searchQuery: "",
+  // Pagination: we fetch a page at a time and append (infinite scroll), so a
+  // big library renders incrementally instead of jamming 500+ <img> into the
+  // DOM at once.
+  loaded: 0,      // rows currently rendered
+  total: 0,       // total matching (from the server, over the FULL filter set)
+  loading: false, // a page fetch is in flight
 };
+const LIB_PAGE = 200;
+let _libObserver = null;
 let libSearchTimer = null;
 let taggerPollTimer = null;
+
+// ----- In-app rating / keyboard culling / undo -----
+// Focused cell index within the current Library grid (for arrow-key nav).
+let libFocusIdx = -1;
+// Sha of the frame currently open in the detail overlay (null = grid focus).
+let overlaySha = null;
+// Small client-side undo stack of label mutations: each entry is
+// {sha, prev, next} where prev/next are score|null (null = no label).
+let _undoStack = [];
+const UNDO_MAX = 50;
+
+function pushUndo(sha, prev, next) {
+  _undoStack.push({sha, prev, next});
+  if (_undoStack.length > UNDO_MAX) _undoStack.shift();
+}
+
+// Update every visible chip for a sha (grid corner + overlay header) and the
+// cell's data attribute so re-renders and undo stay in sync.
+function updateLabelChips(sha, score) {
+  document.querySelectorAll(`.lib-cell[data-sha="${sha}"]`).forEach(cell => {
+    if (score === null || score === undefined) delete cell.dataset.label;
+    else cell.dataset.label = String(score);
+    const labelEl = cell.querySelector(".lib-label");
+    if (!labelEl) return;
+    const existing = labelEl.querySelector(".lib-rating");
+    if (score === null || score === undefined) {
+      if (existing) existing.remove();
+    } else {
+      const txt = `${score >= 0 ? "+" : ""}${score}`;
+      if (existing) existing.textContent = txt;
+      else labelEl.insertAdjacentHTML("afterbegin", `<span class="lib-rating">${txt}</span>`);
+    }
+  });
+  const ov = document.getElementById("overlay-rating");
+  if (ov && overlaySha === sha) {
+    ov.textContent = (score === null || score === undefined)
+      ? "no rating" : `rating ${score >= 0 ? "+" : ""}${score}`;
+  }
+}
+
+function _currentLabelForSha(sha) {
+  const cell = document.querySelector(`.lib-cell[data-sha="${sha}"]`);
+  if (cell && cell.dataset.label !== undefined && cell.dataset.label !== "")
+    return parseInt(cell.dataset.label, 10);
+  return null;
+}
+
+// Core mutators. recordUndo=false is used when replaying an undo so we don't
+// push the revert back onto the stack.
+async function applyLabel(sha, score, {recordUndo = true} = {}) {
+  if (!sha) return;
+  const prev = _currentLabelForSha(sha);
+  try {
+    const res = await fetch("/api/label", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({sha, score}),
+    });
+    if (!res.ok) { toast("rating failed: " + await res.text()); return; }
+    updateLabelChips(sha, score);
+    if (recordUndo) pushUndo(sha, prev, score);
+    toast(`rated ${score >= 0 ? "+" : ""}${score}`, 900);
+  } catch (e) { toast("rating failed: " + e.message); }
+}
+
+async function clearLabel(sha, {recordUndo = true} = {}) {
+  if (!sha) return;
+  const prev = _currentLabelForSha(sha);
+  try {
+    const res = await fetch("/api/label", {
+      method: "DELETE", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({sha}),
+    });
+    if (!res.ok) { toast("clear failed: " + await res.text()); return; }
+    updateLabelChips(sha, null);
+    if (recordUndo) pushUndo(sha, prev, null);
+    toast("rating cleared", 900);
+  } catch (e) { toast("clear failed: " + e.message); }
+}
+
+async function undoLastLabel() {
+  const entry = _undoStack.pop();
+  if (!entry) { toast("nothing to undo", 900); return; }
+  // Revert to entry.prev without re-recording.
+  if (entry.prev === null || entry.prev === undefined) {
+    await clearLabel(entry.sha, {recordUndo: false});
+  } else {
+    await applyLabel(entry.sha, entry.prev, {recordUndo: false});
+  }
+  toast("undid rating change", 1100);
+}
+
+function _libCells() { return Array.from(document.querySelectorAll("#lib-grid .lib-cell")); }
+
+function setLibFocus(idx) {
+  const cells = _libCells();
+  if (!cells.length) { libFocusIdx = -1; return; }
+  idx = Math.max(0, Math.min(idx, cells.length - 1));
+  cells.forEach(c => c.classList.remove("focused"));
+  cells[idx].classList.add("focused");
+  cells[idx].scrollIntoView({block: "nearest"});
+  libFocusIdx = idx;
+  // Pull the next page when keyboard nav approaches the end of what's loaded.
+  if (typeof libState !== "undefined" && idx >= cells.length - 5
+      && libState.loaded < libState.total) {
+    loadMoreLibrary(false);
+  }
+}
+
+function _focusedSha() {
+  const cells = _libCells();
+  if (libFocusIdx < 0 || libFocusIdx >= cells.length) return null;
+  return cells[libFocusIdx].dataset.sha;
+}
+
+// The sha the keyboard acts on: overlay frame if open, else focused grid cell.
+function activeSha() { return overlaySha || _focusedSha(); }
+
+// Number of grid columns, to make up/down arrows move a row at a time.
+function _libCols() {
+  const grid = $("#lib-grid");
+  const cells = _libCells();
+  if (!grid || cells.length < 2) return 1;
+  const top = cells[0].offsetTop;
+  let cols = 0;
+  for (const c of cells) { if (c.offsetTop !== top) break; cols++; }
+  return Math.max(1, cols);
+}
 
 async function loadLibrary() {
   await refreshLibraryRoots();
@@ -3077,7 +3717,7 @@ async function refreshLibraryGrid() {
     grid.innerHTML = `
       <div class="lib-onboarding">
         <h2>Welcome to your library</h2>
-        <p>Point banger at the folders you already keep your photos in, or pull them in from a camera / SD card. We'll index, score, tag, name faces, and let you edit; nothing leaves your machine.</p>
+        <p>Point banger at the folders you already keep your photos in, or pull them in from a camera / SD card. We'll index, score, cull, tag, name faces, and write ratings back to your files — nothing leaves your machine.</p>
         <div class="onboarding-actions">
           <button onclick="document.getElementById('lib-add-root').click()">📁 Open folder</button>
           <button onclick="openImporter()">📷 Import from device</button>
@@ -3086,6 +3726,19 @@ async function refreshLibraryGrid() {
     meta.textContent = "";
     return;
   }
+  // Fresh query → reset pagination and load the first page.
+  libState.loaded = 0;
+  libState.total = 0;
+  libState.loading = false;
+  libFocusIdx = -1;
+  if (_libObserver) { _libObserver.disconnect(); _libObserver = null; }
+  grid.innerHTML = "";
+  meta.textContent = "loading…";
+  await loadMoreLibrary(true);
+}
+
+// Build the query params for the current filter scope, with a paging window.
+function _libFrameParams(offset, limit) {
   const params = new URLSearchParams();
   params.set("root_id", libState.activeRootId);
   if (libState.activeSubdir) params.set("subdir", libState.activeSubdir);
@@ -3094,49 +3747,98 @@ async function refreshLibraryGrid() {
   if (libState.starFilter !== "") params.set("min_score", libState.starFilter);
   if (libState.placeFilter) params.set("place", libState.placeFilter);
   if (libState.searchQuery) params.set("q", libState.searchQuery);
-  params.set("limit", "500");
+  params.set("offset", String(offset));
+  params.set("limit", String(limit));
+  return params;
+}
 
-  meta.textContent = "loading…";
+// Render one cell's HTML. idx is its absolute position in the loaded grid so
+// keyboard nav (which indexes _libCells()) stays in lockstep.
+function _libCellHtml(f, idx) {
+  const hasLabel = (f.label !== null && f.label !== undefined);
+  const ratingChip = hasLabel
+    ? `<span class="lib-rating">${f.label >= 0 ? '+' : ''}${f.label}</span>` : "";
+  const badges = [];
+  if (f.scored) badges.push('<span class="lib-badge scored">S</span>');
+  if (f.has_face_data) badges.push('<span class="lib-badge face">F</span>');
+  return `
+    <div class="lib-cell" data-sha="${f.sha}" data-idx="${idx}" data-display="${escapeHtml(f.rel_path)}"${hasLabel ? ` data-label="${f.label}"` : ""}>
+      <div class="lib-img-wrap">
+        <img loading="lazy" src="/api/thumb/${f.sha}" alt="${escapeHtml(f.rel_path)}">
+        ${badges.length ? `<div class="lib-badges">${badges.join("")}</div>` : ""}
+      </div>
+      <div class="lib-label">${ratingChip}${escapeHtml(f.stem)}</div>
+    </div>`;
+}
+
+function _wireLibCell(cell) {
+  const sha = cell.dataset.sha;
+  const display = cell.dataset.display;
+  cell.addEventListener("click", () => {
+    setLibFocus(parseInt(cell.dataset.idx, 10));
+    const pick = {
+      sha, rank: 0, stem: display.split("/").pop().replace(/\.[^.]+$/, ""),
+      subdir: display.includes("/") ? display.substring(0, display.lastIndexOf("/")) : "",
+      display, kind: "jpeg", sharpness: 0, aesthetic: null, aesthetic_source: null,
+      scene_preset: null,
+    };
+    openHero(pick);
+  });
+}
+
+// Fetch + append the next page. `first` resets focus to the top of the grid.
+async function loadMoreLibrary(first = false) {
+  const grid = $("#lib-grid");
+  const meta = $("#lib-meta");
+  if (libState.activeRootId === null || libState.loading) return;
+  if (!first && libState.loaded >= libState.total) return;
+  libState.loading = true;
   try {
-    const res = await fetch("/api/library/frames?" + params);
+    const res = await fetch("/api/library/frames?" + _libFrameParams(libState.loaded, LIB_PAGE));
     const d = await res.json();
-    meta.textContent = `${d.total} frame${d.total === 1 ? '' : 's'}`;
-    if (!d.frames.length) {
+    libState.total = d.total;
+    if (first && !d.frames.length) {
       grid.innerHTML = '<p class="empty" style="grid-column:1/-1;color:var(--dim);text-align:center;padding:3rem">No frames match (try clearing filters or rescanning).</p>';
+      meta.textContent = "0 frames";
       return;
     }
-    grid.innerHTML = d.frames.map(f => {
-      const ratingChip = (f.label !== null && f.label !== undefined)
-        ? `<span class="lib-rating">${f.label >= 0 ? '+' : ''}${f.label}</span>` : "";
-      const badges = [];
-      if (f.scored) badges.push('<span class="lib-badge scored">S</span>');
-      if (f.has_face_data) badges.push('<span class="lib-badge face">F</span>');
-      return `
-        <div class="lib-cell" data-sha="${f.sha}" data-display="${escapeHtml(f.rel_path)}">
-          <div class="lib-img-wrap">
-            <img loading="lazy" src="/api/thumb/${f.sha}" alt="${escapeHtml(f.rel_path)}">
-            ${badges.length ? `<div class="lib-badges">${badges.join("")}</div>` : ""}
-          </div>
-          <div class="lib-label">${ratingChip}${escapeHtml(f.stem)}</div>
-        </div>`;
-    }).join("");
-    grid.querySelectorAll(".lib-cell").forEach(cell => {
-      const sha = cell.dataset.sha;
-      const display = cell.dataset.display;
-      cell.addEventListener("click", () => {
-        const pick = {
-          sha, rank: 0, stem: display.split("/").pop().replace(/\.[^.]+$/, ""),
-          subdir: display.includes("/") ? display.substring(0, display.lastIndexOf("/")) : "",
-          display, kind: "jpeg", sharpness: 0, aesthetic: null, aesthetic_source: null,
-          scene_preset: null,
-        };
-        openHero(pick);
-      });
-    });
+    // Drop any prior sentinel before appending.
+    const oldSentinel = document.getElementById("lib-sentinel");
+    if (oldSentinel) oldSentinel.remove();
+
+    const startIdx = libState.loaded;
+    const html = d.frames.map((f, i) => _libCellHtml(f, startIdx + i)).join("");
+    grid.insertAdjacentHTML("beforeend", html);
+    // Wire only the newly-added cells.
+    Array.from(grid.querySelectorAll(".lib-cell")).slice(startIdx).forEach(_wireLibCell);
+    libState.loaded += d.frames.length;
+
+    meta.textContent = `${libState.loaded} of ${libState.total} frame${libState.total === 1 ? '' : 's'}`;
+
+    // Re-arm infinite scroll if there's more to load.
+    if (libState.loaded < libState.total) {
+      grid.insertAdjacentHTML("beforeend",
+        '<div id="lib-sentinel" style="grid-column:1/-1;text-align:center;color:var(--dim);padding:1rem;cursor:pointer">Load more…</div>');
+      const sentinel = document.getElementById("lib-sentinel");
+      sentinel.addEventListener("click", () => loadMoreLibrary(false));
+      if ("IntersectionObserver" in window) {
+        if (_libObserver) _libObserver.disconnect();
+        _libObserver = new IntersectionObserver((entries) => {
+          if (entries.some(e => e.isIntersecting)) loadMoreLibrary(false);
+        }, {root: grid, rootMargin: "400px"});
+        _libObserver.observe(sentinel);
+      }
+    } else if (_libObserver) {
+      _libObserver.disconnect(); _libObserver = null;
+    }
+
+    if (first) setLibFocus(0);
   } catch (e) {
     console.error("grid:", e);
     meta.textContent = "load failed";
-    grid.innerHTML = `<p class="empty" style="grid-column:1/-1;color:var(--red);text-align:center;padding:3rem">${escapeHtml(e.message)}</p>`;
+    if (first) grid.innerHTML = `<p class="empty" style="grid-column:1/-1;color:var(--red);text-align:center;padding:3rem">${escapeHtml(e.message)}</p>`;
+  } finally {
+    libState.loading = false;
   }
 }
 
@@ -3164,9 +3866,16 @@ $("#imp-go").addEventListener("click", async () => {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({source, destination, scheme}),
     });
-    if (!res.ok) throw new Error(await res.text());
-    const d = await res.json();
-    $("#imp-status").textContent = `Imported ${d.copied}, skipped ${d.skipped} duplicates. Scanned: ${d.scan.indexed_new} new frames.`;
+    let d;
+    try { d = await res.json(); } catch { d = null; }
+    if (!res.ok && res.status !== 207) {
+      throw new Error(d && d.error ? d.error : await res.text());
+    }
+    if (d && d.partial) {
+      $("#imp-status").textContent = `Imported ${d.copied}, skipped ${d.skipped}, but ${d.error_count} FAILED: ${(d.errors || []).join("; ")}`;
+    } else {
+      $("#imp-status").textContent = `Imported ${d.copied}, skipped ${d.skipped} duplicates. Scanned: ${d.scan.indexed_new} new frames.`;
+    }
     libState.activeRootId = d.root_id;
     setTimeout(() => {
       $("#import-modal").style.display = "none";
@@ -3257,6 +3966,32 @@ $("#lib-score").addEventListener("click", async () => {
 $("#lib-export").addEventListener("click", () => {
   if (libState.activeRootId === null) { toast("Select a folder first"); return; }
   openExportModal({source: "library", defaultName: libState.activeSubdir || ""});
+});
+
+$("#lib-xmp").addEventListener("click", async () => {
+  if (libState.activeRootId === null) { toast("Select a folder first"); return; }
+  let shas;
+  try { shas = await fetchLibraryShas(); }
+  catch (e) { toast("Couldn't read library: " + e.message); return; }
+  if (!shas.length) { toast("Nothing in scope"); return; }
+  if (!confirm(`Write XMP sidecars next to ${shas.length} original file(s)?\\n\\nRatings + colour labels land in .xmp files alongside your photos (source pixels untouched). Lightroom / Bridge / digiKam read them.`)) return;
+  const btn = $("#lib-xmp");
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = "Writing…";
+  try {
+    const res = await fetch("/api/xmp-writeback", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({shas}),
+    });
+    let d;
+    try { d = await res.json(); } catch { d = null; }
+    if (!res.ok && res.status !== 207) throw new Error(d && d.error ? d.error : await res.text());
+    if (d && d.partial) toast(`Wrote ${d.written} XMP, ${d.error_count} failed: ${(d.errors || []).join("; ")}`, 5000);
+    else toast(`Wrote ${d.written} XMP sidecar${d.written === 1 ? "" : "s"} next to your originals`, 2600);
+  } catch (e) {
+    toast("XMP writeback failed: " + e.message, 4000);
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
 });
 
 let _pendingExportLabel = null;
@@ -3371,14 +4106,26 @@ $("#exp-go").addEventListener("click", async () => {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({shas: pickShas, label}),
     });
-    if (!res.ok) throw new Error(await res.text());
-    const d = await res.json();
-    $("#exp-status").textContent = `Done. Copied ${d.copied} files.`;
+    // A 207 is a *partial* export (some files failed to copy/verify) and still
+    // returns a JSON body with a folder + error list — don't treat it as a hard
+    // failure, but flag it clearly. Only non-JSON / 4xx-5xx outside 207 throws.
+    let d;
+    try { d = await res.json(); } catch { d = null; }
+    if (!res.ok && res.status !== 207) {
+      throw new Error(d && d.error ? d.error : await res.text());
+    }
+    if (d && d.partial) {
+      $("#exp-status").textContent =
+        `Copied ${d.copied}, but ${d.error_count} file(s) FAILED: ${(d.errors || []).join("; ")}`;
+    } else {
+      $("#exp-status").textContent = `Done. Copied ${d.copied} files.`;
+    }
     await fetch("/api/open-folder", {
       method: "POST", headers: {"Content-Type": "application/json"},
       body: JSON.stringify({path: d.folder}),
     });
-    setTimeout(() => $("#export-modal").style.display = "none", 1500);
+    // Leave the modal up longer on a partial export so the user reads the error.
+    setTimeout(() => $("#export-modal").style.display = "none", d && d.partial ? 6000 : 1500);
   } catch (e) {
     $("#exp-status").textContent = "Failed: " + e.message;
   } finally {
@@ -3393,11 +4140,15 @@ async function fetchLibraryShas() {
   const params = new URLSearchParams();
   if (libState.activeRootId) params.set("root_id", libState.activeRootId);
   if (libState.activeSubdir) params.set("subdir", libState.activeSubdir);
-  if (libState.searchQ) params.set("q", libState.searchQ);
-  if (libState.filterCamera) params.set("camera", libState.filterCamera);
-  if (libState.filterFace) params.set("face", libState.filterFace);
-  if (libState.filterPlace) params.set("place", libState.filterPlace);
-  if (libState.filterMinStar) params.set("min_score", libState.filterMinStar);
+  // NB: these must mirror the exact libState field names the handlers write
+  // (searchQuery / cameraFilter / faceFilter / placeFilter / starFilter).
+  // The old names (searchQ/filterCamera/…) silently read undefined, so the
+  // export ignored every active filter and culled the whole root.
+  if (libState.searchQuery) params.set("q", libState.searchQuery);
+  if (libState.cameraFilter) params.set("camera", libState.cameraFilter);
+  if (libState.faceFilter) params.set("face", libState.faceFilter);
+  if (libState.placeFilter) params.set("place", libState.placeFilter);
+  if (libState.starFilter !== "") params.set("min_score", libState.starFilter);
   params.set("limit", "5000");
   const res = await fetch("/api/library/frames?" + params.toString());
   if (!res.ok) throw new Error(await res.text());

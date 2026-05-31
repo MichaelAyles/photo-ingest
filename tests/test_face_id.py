@@ -88,7 +88,8 @@ def test_select_faces_top_n_picks_one_per_person(tmp_path):
     person_c = _emb(2)
 
     rows = [_row(tmp_path, f"DSC{i:05d}") for i in range(6)]
-    fake_emb = lambda: _emb(99 + 0)  # CLIP embedding, value doesn't matter for face strategy
+    def fake_emb():  # CLIP embedding, value doesn't matter for face strategy
+        return _emb(99)
     items = [(rows[i], float(10 - i), fake_emb()) for i in range(6)]
     face_embs = [
         [_jitter(person_a, 100)],          # 0: A, best score (10)
@@ -96,11 +97,12 @@ def test_select_faces_top_n_picks_one_per_person(tmp_path):
         [_jitter(person_b, 200)],          # 2: B (score 8)
         [_jitter(person_b, 201)],          # 3: B
         [_jitter(person_c, 300)],          # 4: C (score 6)
-        [],                                # 5: no face
+        [_jitter(person_c, 301)],          # 5: C — 2nd detection so C is a real cluster (MIN_SAMPLES=2)
     ]
     chosen = select_faces_top_n(items, face_embs_per_item=face_embs, n=3)
     stems = [r.frame.stem for r, _, _ in chosen]
-    # Best frame per person, sorted by score descending.
+    # Best frame per person, sorted by score descending. (Each person needs >=2
+    # detections to survive DBSCAN noise rejection — lone faces are dropped.)
     assert stems == ["DSC00000", "DSC00002", "DSC00004"]
 
 
@@ -111,7 +113,7 @@ def test_select_faces_top_n_fills_with_kmeans_when_few_people(tmp_path):
     items = [(rows[i], float(10 - i), _emb(900 + i)) for i in range(5)]
     face_embs = [
         [_jitter(person_a, 100)],   # 0: A (score 10) → chosen as person rep
-        [],                         # 1
+        [_jitter(person_a, 101)],   # 1: A — 2nd detection so A survives MIN_SAMPLES=2
         [],                         # 2
         [],                         # 3
         [],                         # 4

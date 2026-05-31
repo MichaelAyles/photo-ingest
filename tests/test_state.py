@@ -186,3 +186,115 @@ def test_csv_import_skips_malformed_rows(isolated_state, tmp_path):
     assert imported == 1
     assert skipped == 3
     assert isolated_state.labels_dict() == {"good-sha": 3}
+
+
+# --------------------------------------------------------------------------
+# Concurrency / durability hardening (robustness audit).
+# --------------------------------------------------------------------------
+
+def test_migration_runs_only_once(isolated_state, monkeypatch):
+    """Schema setup/migration must run ONCE per DB, not on every connection
+    open. We force a clean init state, then count _migrate_and_init calls
+    across many _conn() opens."""
+    # _inited_db is keyed on the DB path; reset it so init fires for this fresh
+    # isolated DB exactly once below.
+    monkeypatch.setattr(isolated_state, "_inited_db", None)
+
+    calls = {"n": 0}
+    real_migrate = isolated_state._migrate_and_init
+
+    def counting_migrate(conn):
+        calls["n"] += 1
+        return real_migrate(conn)
+
+    monkeypatch.setattr(isolated_state, "_migrate_and_init", counting_migrate)
+
+    # Open the connection factory many times.
+    for _ in range(10):
+        with isolated_state._conn() as conn:
+            conn.execute("SELECT 1")
+
+    assert calls["n"] == 1, "migration/schema setup should run exactly once"
+
+
+def test_migration_is_idempotent(isolated_state, monkeypatch):
+    """Running the migration twice on an already-v2 DB must not corrupt data."""
+    isolated_state.add_label("sha-1", 4, "DSC1", "/p.JPG")
+    # Force re-init and call _migrate_and_init directly on a fresh connection.
+    monkeypatch.setattr(isolated_state, "_inited_db", None)
+    with isolated_state._conn() as conn:
+        isolated_state._migrate_and_init(conn)  # second time, should be a no-op
+    assert isolated_state.get_label("sha-1") == 4
+    assert len(isolated_state.all_labels()) == 1
+
+
+def test_wal_mode_enabled(isolated_state):
+    """labels.db connections should be in WAL journal mode for concurrency."""
+    with isolated_state._conn() as conn:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+
+
+def test_update_frame_metadata_is_atomic(isolated_state):
+    """A concurrent-ish read-modify-write must not lose fields, and a crash
+    can't leave a truncated sidecar (we assert no leftover .tmp + valid JSON)."""
+    sha = "atomic-sha"
+    isolated_state.cache_frame_metadata(sha, sharpness=1.0, phash_hex="abc", timestamp=0.0)
+
+    import threading
+
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def worker(i):
+        try:
+            barrier.wait()
+            isolated_state.update_frame_metadata(sha, **{f"field_{i}": i})
+        except Exception as e:  # pragma: no cover - surfaced via assert
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors
+    loaded = isolated_state.load_frame_metadata(sha)
+    assert loaded is not None  # never truncated/corrupt
+    # The _sha_lock serializes the RMW cycle, so every field must survive.
+    for i in range(8):
+        assert loaded[f"field_{i}"] == i
+    # No stray temp file left at the real name's sibling.
+    assert not (isolated_state.METADATA_DIR / f"{sha}.json.tmp").exists()
+
+
+def test_integrity_check_ok(isolated_state):
+    isolated_state.add_label("sha-1", 2, "DSC1", "/p.JPG")
+    assert isolated_state.integrity_check() is True
+
+
+def test_backup_labels_writes_reimportable_csv(isolated_state, tmp_path):
+    isolated_state.add_label("sha-a", 5, "DSC1", "/a.JPG")
+    isolated_state.add_label("sha-b", -3, "DSC2", "/b.JPG")
+
+    # Default destination (timestamped, under STATE_DIR/backups).
+    dest = isolated_state.backup_labels()
+    assert dest.exists()
+    assert dest.suffix == ".csv"
+
+    # Wipe and restore from the backup to prove it's a real snapshot.
+    import sqlite3 as _sq
+
+    with _sq.connect(isolated_state.LABELS_DB) as conn:
+        conn.execute("DELETE FROM labels")
+    assert isolated_state.all_labels() == []
+    n_imp, n_skip = isolated_state.import_labels_csv(dest)
+    assert (n_imp, n_skip) == (2, 0)
+    assert isolated_state.labels_dict() == {"sha-a": 5, "sha-b": -3}
+
+    # Explicit destination path is honored.
+    explicit = tmp_path / "mybackup.csv"
+    out = isolated_state.backup_labels(explicit)
+    assert out == explicit
+    assert explicit.exists()

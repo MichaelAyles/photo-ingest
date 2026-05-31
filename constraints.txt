@@ -1,0 +1,9 @@
+# Pins required for a reproducible, green test suite (per prod-readiness audit).
+#
+# numpy<2 : transformers / siglip C extensions still expect the NumPy 1.x ABI;
+#           NumPy 2.x triggers import-time crashes in the model backbones.
+# threadpoolctl==3.1.0 : newer releases interact badly with the torch+sklearn
+#           OpenMP setup and contribute to the segfault the audit hit. Pin it
+#           alongside the OMP_NUM_THREADS=1 / KMP_DUPLICATE_LIB_OK=TRUE env in CI.
+numpy<2
+threadpoolctl==3.1.0

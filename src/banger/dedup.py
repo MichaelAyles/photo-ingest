@@ -55,10 +55,12 @@ class Cluster:
         return len(self.items)
 
 
-def phash_from_preview(preview_bgr: np.ndarray) -> imagehash.ImageHash:
+def phash_from_preview(
+    preview_bgr: np.ndarray, hash_size: int = HASH_SIZE
+) -> imagehash.ImageHash:
     """imagehash needs a PIL Image; convert from cv2's BGR uint8."""
     rgb = cv2.cvtColor(preview_bgr, cv2.COLOR_BGR2RGB)
-    return imagehash.phash(Image.fromarray(rgb), hash_size=HASH_SIZE)
+    return imagehash.phash(Image.fromarray(rgb), hash_size=hash_size)
 
 
 def exif_timestamp(path: Path) -> float | None:
@@ -89,10 +91,27 @@ def cluster_bursts(
     items: list[ClusterItem],
     hamming_dist: int = HAMMING_DIST_DEFAULT,
     time_window: float = TIME_WINDOW_DEFAULT,
+    hash_size: int = HASH_SIZE,
+    enabled: bool = True,
 ) -> list[Cluster]:
+    """Greedily group near-duplicate frames (bursts).
+
+    Knobs default to the module constants so existing callers/tests are
+    unaffected. ``hash_size`` is accepted for symmetry with
+    :func:`phash_from_preview` (the actual phash bit-width is fixed at hash
+    time, so this only matters if a caller threads a non-default size all the
+    way through); it does not change the clustering math here.
+
+    When ``enabled`` is False, dedup is skipped entirely: every frame is
+    returned as its own singleton cluster (time-ordered), so downstream
+    best-per-cluster selection surfaces all frames untouched.
+    """
     if not items:
         return []
     ordered = sorted(items, key=lambda it: it.timestamp)
+    if not enabled:
+        # No grouping: each frame is its own singleton cluster.
+        return [Cluster(items=[it]) for it in ordered]
     clusters: list[Cluster] = []
     for it in ordered:
         placed = False

@@ -29,7 +29,6 @@ from __future__ import annotations
 import logging
 import sqlite3
 import time
-from pathlib import Path
 
 import numpy as np
 
@@ -220,6 +219,7 @@ def discover_clusters(eps: float = 0.5, min_samples: int = 3) -> dict:
     can name them manually via the detail overlay.
     """
     import json
+
     from banger import state
 
     # Collect every face embedding from every metadata file.
@@ -266,7 +266,7 @@ def discover_clusters(eps: float = 0.5, min_samples: int = 3) -> dict:
 
     added = 0
     matched = 0
-    for cid, member_indices in by_cluster.items():
+    for _cid, member_indices in by_cluster.items():
         # Centroid = mean of L2-normalised embeddings, re-normalised.
         cluster_embs = X[member_indices]
         centroid = cluster_embs.mean(axis=0)
@@ -333,7 +333,8 @@ def _try_crop_thumbnail(sha: str, bbox: list[int] | None) -> bytes | None:
         return None
     try:
         import cv2
-        from banger import state, library  # noqa: PLC0415
+
+        from banger import library  # noqa: PLC0415
         from banger.preview import load_preview  # noqa: PLC0415
         src = library.lookup_path(sha)
         if src is None:
@@ -342,8 +343,10 @@ def _try_crop_thumbnail(sha: str, bbox: list[int] | None) -> bytes | None:
         h, w = img.shape[:2]
         x1, y1, x2, y2 = bbox
         pw, ph = int((x2 - x1) * 0.25), int((y2 - y1) * 0.25)
-        x1 = max(0, x1 - pw); y1 = max(0, y1 - ph)
-        x2 = min(w, x2 + pw); y2 = min(h, y2 + ph)
+        x1 = max(0, x1 - pw)
+        y1 = max(0, y1 - ph)
+        x2 = min(w, x2 + pw)
+        y2 = min(h, y2 + ph)
         if x2 <= x1 or y2 <= y1:
             return None
         crop = cv2.resize(img[y1:y2, x1:x2], (128, 128), interpolation=cv2.INTER_AREA)

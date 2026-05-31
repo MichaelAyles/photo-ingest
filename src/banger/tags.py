@@ -95,6 +95,10 @@ def _encoded_tags() -> tuple[torch.Tensor, list[str]]:
     """CLIP-encode every TAG_VOCAB entry once. Returns (NxD tensor, labels)."""
     from banger.aesthetic import _load as _load_clip_internals
 
+    # `device` here is whatever banger.aesthetic._pick_device chose
+    # (cuda → mps → cpu, honoring BANGER_AESTHETIC_DEVICE). We reuse the
+    # one CLIP load rather than picking a device independently so tagging
+    # always runs on the same accelerator as aesthetic scoring.
     model, processor, device, _, _ = _load_clip_internals()
     prompts = [TAG_PROMPT_TEMPLATE.format(t) for t in TAG_VOCAB]
     with torch.inference_mode():

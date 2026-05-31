@@ -1,0 +1,25 @@
+# Dev / test dependency set. Always install with the shared constraints so the
+# reproducibility pins (numpy<2, threadpoolctl==3.1.0) are honoured:
+#
+#     pip install -c constraints.txt -r requirements-dev.txt
+#
+-c constraints.txt
+
+# Test + lint tooling
+pytest>=8.0
+ruff>=0.4
+
+# Runtime deps exercised by the test suite. Mirrors the core deps in
+# pyproject.toml so a fresh checkout can run `pytest` without the full extras.
+torch>=2.2
+transformers<5
+imagehash>=4.3
+Pillow>=10.0
+opencv-python>=4.9
+scikit-learn>=1.4
+joblib>=1.3
+reverse_geocoder>=1.5
+flask>=3.0
+
+# rawpy needs libraw headers; install it explicitly when RAW tests are run.
+# rawpy>=0.21

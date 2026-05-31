@@ -1,22 +1,27 @@
-"""Head-to-head benchmark harness: banger vs facet on the same input.
+"""Benchmark harness: banger's own picks + measured detector quality.
 
-Runs banger end-to-end on the given input dir, then attempts to run facet
-on the same dir. Writes a markdown report at benchmarks/<date>.md with:
+Runs banger end-to-end on the given input dir and writes a markdown report
+at benchmarks/<date>.md with:
   - banger top-N (rank, stem, scores)
-  - facet top-N (or "facet not available" + reason)
-  - overlap stats (Jaccard, Spearman if both rank the same set)
-  - disagreement gallery (frames one tool picked and the other didn't)
+  - measured detector quality vs a labelled ground-truth set, when one is
+    supplied (precision / recall / F1 for blur, blink, duplicate, keeper)
+  - an OPTIONAL head-to-head against facet, but ONLY when facet actually
+    runs. When it doesn't, the report says so plainly instead of printing
+    an empty "comparison" that pretends a measurement happened.
 
-The "if facet isn't runnable, skip gracefully" rule (build plan) means
-we never let a facet failure abort the report. The report explicitly
-calls out missing data so a blog-post comparison can't be made to look
-better than it is by quiet omission.
+Honesty rule: there is no ground-truth set shipped in the repo yet, and
+facet does not run on the reference host (see ``run_facet``). The harness
+therefore does NOT manufacture a comparison out of thin air. It reports
+banger's picks on their own and, where a caller passes labels via
+``evaluate_against_truth``, reports *measured* accuracy. The "vs facet"
+section only appears when facet produced real output.
 
-Facet path: I tried the Docker compose route from this machine and it
-OOMs at the multi-pass model swap on a 4 GB RTX 3050 (legacy profile
-mis-sized, see auto-memory). The harness still tries, facet on another
-machine, or a CPU-only profile, would let this actually run, but the
-default outcome on this hardware is the "skip" branch.
+Facet path: the Docker compose route OOMs at the multi-pass model swap on
+a 4 GB RTX 3050 (legacy profile mis-sized, see auto-memory). ``run_facet``
+still probes for it so a host with a working install gets a real
+head-to-head, but the default outcome on the reference hardware is the
+explicit "not available" branch -- which is reported as such, not as a
+zero-overlap comparison.
 """
 
 from __future__ import annotations
@@ -69,7 +74,8 @@ def run_banger(input_dir: Path, recursive: bool, top_n: int) -> tuple[list[Pick]
     from banger.frames import discover_frames
     from banger.preview import load_preview
     from banger.report import Row
-    from banger.sharpness import CONFIG as SHARP_CFG, sharpness_from_preview
+    from banger.sharpness import CONFIG as SHARP_CFG
+    from banger.sharpness import sharpness_from_preview
 
     threshold = SHARP_CFG["threshold"]
     head = taste_head.load()
@@ -154,14 +160,29 @@ def run_banger(input_dir: Path, recursive: bool, top_n: int) -> tuple[list[Pick]
     return picks, _time.monotonic() - t0
 
 
+# Sentinel prefix for every "facet did not produce real output" status. The
+# report and cmd_benchmark key off this so a non-run is never rendered as a
+# comparison with zero overlap (which would read as "banger and facet agreed
+# on nothing"). A status NOT starting with this prefix means facet really ran.
+FACET_UNAVAILABLE_PREFIX = "facet not available: "
+
+
 def run_facet(input_dir: Path, facet_path: Path, top_n: int) -> tuple[list[Pick] | None, str, float | None]:
-    """Best-effort facet invocation. Returns (picks, status, elapsed)."""
+    """Best-effort facet invocation. Returns ``(picks, status, elapsed)``.
+
+    This is a real, documented "facet not available" path, not a fake
+    comparison. When facet cannot run (no checkout, no docker, broken
+    profile) we return ``picks=None`` and a status string prefixed with
+    ``FACET_UNAVAILABLE_PREFIX`` so callers can distinguish "did not run"
+    from "ran and disagreed". The harness never claims a head-to-head
+    happened when it didn't.
+    """
     import time as _time
 
     if not facet_path.is_dir():
-        return None, f"skipped: facet path not found at {facet_path}", None
+        return None, f"{FACET_UNAVAILABLE_PREFIX}facet path not found at {facet_path}", None
     if shutil.which("docker") is None:
-        return None, "skipped: docker CLI not on PATH", None
+        return None, f"{FACET_UNAVAILABLE_PREFIX}docker CLI not on PATH", None
 
     # Try `docker compose run facet python facet.py score <input>` style.
     # On this hardware the legacy profile OOMs at multi-pass, so this is
@@ -173,19 +194,19 @@ def run_facet(input_dir: Path, facet_path: Path, top_n: int) -> tuple[list[Pick]
             cwd=facet_path, capture_output=True, text=True, timeout=10,
         )
         if proc.returncode != 0:
-            return None, f"skipped: docker compose unavailable ({proc.stderr.strip()[:80]})", None
+            return None, f"{FACET_UNAVAILABLE_PREFIX}docker compose unavailable ({proc.stderr.strip()[:80]})", None
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        return None, f"skipped: docker probe failed ({e})", None
+        return None, f"{FACET_UNAVAILABLE_PREFIX}docker probe failed ({e})", None
 
     # Without a stable facet CLI on this box we don't try to actually run it.
     # The auto-memory says the build path is broken on this XPS+Windows setup.
-    # Leave the actual invocation as a TODO and return skipped, the harness
-    # still produces a useful banger-only report.
+    # Leave the actual invocation as a TODO and return the not-available branch;
+    # the harness still produces a useful banger-only report.
     elapsed = _time.monotonic() - t0
     return None, (
-        "skipped: facet docker path known-broken on this host (legacy profile "
-        "OOMs at multi-pass model swap on 4 GB GPU; re-enable when running "
-        "from a host with ≥8 GB VRAM or a working CPU-only profile)"
+        f"{FACET_UNAVAILABLE_PREFIX}facet docker path known-broken on this host "
+        "(legacy profile OOMs at multi-pass model swap on 4 GB GPU; re-enable "
+        "when running from a host with >=8 GB VRAM or a working CPU-only profile)"
     ), elapsed
 
 
@@ -221,25 +242,183 @@ def _spearman(x: list[int], y: list[int]) -> float:
     return round(num / (dx * dy), 3)
 
 
-def write_report(out_path: Path, result: BenchmarkResult) -> None:
-    cmp = compare(result.banger_top, result.facet_top)
+# --------------------------------------------------------------------------- #
+# Measured detector accuracy.
+#
+# The audit's core complaint is that nothing here measures accuracy. These
+# helpers make it measurable: given the detectors' boolean predictions and a
+# hand-labelled ground-truth, they compute precision / recall / F1. No
+# ground-truth set ships in the repo yet, so callers supply their own labels;
+# the point is that the *machinery* exists and is tested, so the moment a
+# labelled set is available the numbers are real rather than asserted.
+#
+# Convention: for each detector a prediction of True means "this frame is a
+# positive" -- blurry, blinking, a duplicate, or a keeper, depending on the
+# detector. Precision/recall are computed against the matching truth labels.
+# --------------------------------------------------------------------------- #
+
+# Detectors we know how to score. Kept as a tuple so the report can iterate in
+# a stable order and so callers can validate detector names.
+DETECTORS = ("blur", "blink", "duplicate", "keeper")
+
+
+@dataclass
+class PRF:
+    """Precision / recall / F1 plus the raw confusion counts for one detector."""
+
+    tp: int
+    fp: int
+    fn: int
+    tn: int
+
+    @property
+    def precision(self) -> float:
+        denom = self.tp + self.fp
+        return round(self.tp / denom, 4) if denom else 0.0
+
+    @property
+    def recall(self) -> float:
+        denom = self.tp + self.fn
+        return round(self.tp / denom, 4) if denom else 0.0
+
+    @property
+    def f1(self) -> float:
+        p, r = self.precision, self.recall
+        return round(2 * p * r / (p + r), 4) if (p + r) else 0.0
+
+    @property
+    def support(self) -> int:
+        """Number of true positives in the ground-truth (tp + fn)."""
+        return self.tp + self.fn
+
+    def as_dict(self) -> dict[str, float | int]:
+        return {
+            "precision": self.precision,
+            "recall": self.recall,
+            "f1": self.f1,
+            "support": self.support,
+            "tp": self.tp,
+            "fp": self.fp,
+            "fn": self.fn,
+            "tn": self.tn,
+        }
+
+
+def precision_recall_f1(predictions: dict[str, bool], truth: dict[str, bool]) -> PRF:
+    """Score one detector's boolean predictions against boolean ground-truth.
+
+    Only frames present in BOTH mappings are scored -- a frame the detector
+    never saw (or that was never labelled) can't be a true/false anything, so
+    silently scoring it as a negative would inflate the true-negative count and
+    flatter precision. We intersect the keys instead.
+
+    Args:
+        predictions: ``{frame_id: predicted_positive}``
+        truth:       ``{frame_id: actually_positive}``
+
+    Returns a :class:`PRF` with confusion counts and derived metrics.
+    """
+    keys = predictions.keys() & truth.keys()
+    tp = fp = fn = tn = 0
+    for k in keys:
+        pred = bool(predictions[k])
+        actual = bool(truth[k])
+        if pred and actual:
+            tp += 1
+        elif pred and not actual:
+            fp += 1
+        elif not pred and actual:
+            fn += 1
+        else:
+            tn += 1
+    return PRF(tp=tp, fp=fp, fn=fn, tn=tn)
+
+
+def evaluate_against_truth(
+    predictions: dict[str, dict[str, bool]],
+    truth: dict[str, dict[str, bool]],
+) -> dict[str, dict[str, float | int]]:
+    """Measure every detector's precision/recall/F1 against a labelled set.
+
+    Both arguments are keyed by detector name (``blur``, ``blink``,
+    ``duplicate``, ``keeper``); each value is a ``{frame_id: bool}`` mapping.
+    Detectors absent from either side are skipped (you can't score what you
+    didn't predict or didn't label). Unknown detector names are ignored so a
+    caller's extra columns don't blow up the report.
+
+    Returns ``{detector: {precision, recall, f1, support, tp, fp, fn, tn}}``.
+
+    Example::
+
+        evaluate_against_truth(
+            {"blur": {"a": True, "b": False}},
+            {"blur": {"a": True, "b": True}},
+        )
+        # -> {"blur": {"precision": 1.0, "recall": 0.5, "f1": 0.6667, ...}}
+    """
+    out: dict[str, dict[str, float | int]] = {}
+    for det in DETECTORS:
+        if det in predictions and det in truth:
+            out[det] = precision_recall_f1(predictions[det], truth[det]).as_dict()
+    return out
+
+
+def format_accuracy_table(scores: dict[str, dict[str, float | int]]) -> list[str]:
+    """Render :func:`evaluate_against_truth` output as markdown report lines."""
+    if not scores:
+        return [
+            "## Detector accuracy",
+            "",
+            "No ground-truth labels supplied, so detector accuracy is unmeasured. "
+            "Pass a labelled set to `evaluate_against_truth` to populate this.",
+        ]
     lines = [
-        f"# banger vs facet benchmark, {datetime.date.today().isoformat()}",
+        "## Detector accuracy (measured vs ground-truth)",
+        "",
+        "| detector | precision | recall | F1 | support |",
+        "|----------|----------:|-------:|---:|--------:|",
+    ]
+    for det in DETECTORS:
+        if det not in scores:
+            continue
+        s = scores[det]
+        lines.append(
+            f"| {det} | {s['precision']:.3f} | {s['recall']:.3f} | "
+            f"{s['f1']:.3f} | {s['support']} |"
+        )
+    return lines
+
+
+def write_report(out_path: Path, result: BenchmarkResult) -> None:
+    facet_ran = result.facet_top is not None
+    # Title reflects what actually happened: a head-to-head only when facet ran.
+    title = (
+        f"# banger vs facet benchmark, {datetime.date.today().isoformat()}"
+        if facet_ran
+        else f"# banger benchmark, {datetime.date.today().isoformat()}"
+    )
+    lines = [
+        title,
         "",
         f"Input: `{result.input_dir}`",
         f"Banger top-{len(result.banger_top)} in {result.elapsed_banger:.1f}s",
     ]
-    if result.facet_top is not None:
+    if facet_ran:
         lines.append(f"Facet top-{len(result.facet_top)} in {result.elapsed_facet:.1f}s")
+        cmp = compare(result.banger_top, result.facet_top)
+        lines.extend([
+            "",
+            "## Overlap",
+            "",
+            f"- Jaccard: {cmp['jaccard']}",
+            f"- Frames in both top-N: {cmp['overlap']}",
+            f"- Spearman (over intersection): {cmp['spearman']}",
+        ])
     else:
+        # No comparison happened: say so plainly instead of printing a
+        # zero-overlap "Overlap" block that would misread as disagreement.
         lines.append(f"Facet: {result.facet_status}")
     lines.extend([
-        "",
-        "## Overlap",
-        "",
-        f"- Jaccard: {cmp['jaccard']}",
-        f"- Frames in both top-N: {cmp['overlap']}",
-        f"- Spearman (over intersection): {cmp['spearman']}",
         "",
         "## Banger top-N",
         "",
@@ -250,7 +429,7 @@ def write_report(out_path: Path, result: BenchmarkResult) -> None:
         a = f"{p.aesthetic:.2f}" if p.aesthetic is not None else "-"
         lines.append(f"| {p.rank} | {p.display} | {a} | {p.sharpness:.0f} | {p.scene_preset or '-'} |")
 
-    if result.facet_top is not None:
+    if facet_ran:
         lines.extend(["", "## Facet top-N", "", "| rank | frame |", "|-----:|-------|"])
         for p in result.facet_top:
             lines.append(f"| {p.rank} | {p.display} |")
@@ -279,9 +458,11 @@ def write_report(out_path: Path, result: BenchmarkResult) -> None:
             "",
             "## Note",
             "",
-            "Facet did not run on this host, so the comparison section is intentionally "
-            "blank rather than misleadingly empty. Banger's picks above stand on their own; "
-            "rerun on a host with a working facet install to populate the head-to-head.",
+            "Facet did not run on this host, so there is intentionally no comparison "
+            "section: an empty overlap table would misread as 'banger and facet agreed "
+            "on nothing'. Banger's picks above stand on their own. Rerun on a host with "
+            "a working facet install to populate the head-to-head, and pass a labelled "
+            "ground-truth set via `evaluate_against_truth` to get measured precision/recall.",
         ])
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -305,7 +486,7 @@ def cmd_benchmark(
     log.info("banger: %d picks in %.1fs", len(banger_picks), banger_t)
 
     facet_picks: list[Pick] | None = None
-    facet_status = "skipped: --vs not requested"
+    facet_status = f"{FACET_UNAVAILABLE_PREFIX}--vs not requested"
     facet_t: float | None = None
     if vs_facet:
         facet_picks, facet_status, facet_t = run_facet(input_dir, facet_path, top_n)
@@ -322,12 +503,15 @@ def cmd_benchmark(
     out = output or (Path("benchmarks") / f"{datetime.date.today().isoformat()}.md")
     write_report(out, result)
     log.info("wrote benchmark report: %s", out)
+    # Only emit an overlap block when facet actually ran; otherwise null it so
+    # a non-run isn't reported as "overlap: 0" (which reads as disagreement).
+    overlap = compare(banger_picks, facet_picks) if facet_picks is not None else None
     print(json.dumps(
         {
             "banger_picks": len(banger_picks),
             "facet": facet_status,
             "report": str(out),
-            "overlap": compare(banger_picks, facet_picks),
+            "overlap": overlap,
         },
         indent=2,
     ))

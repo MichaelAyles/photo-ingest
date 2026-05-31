@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  STUB entitlements for the macOS hardened runtime.
+
+  These relaxations are what a bundled CPython + native extensions (torch,
+  opencv, rawpy) typically need to launch under the hardened runtime. They are
+  intentionally permissive for now; tighten to the minimum before shipping a
+  signed/notarized build. See packaging/BUILD.md.
+-->
+<plist version="1.0">
+<dict>
+    <!-- Bundled interpreter loads .so/.dylib that aren't part of the signed app. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Just-in-time / writable-executable memory used by some native deps. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- App reads user-selected photo folders. -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+</dict>
+</plist>

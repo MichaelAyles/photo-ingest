@@ -40,7 +40,12 @@ log = logging.getLogger("banger.face_id")
 # insightface community settled on; tighter cuts the same-person recall,
 # looser merges similar-looking people into one cluster.
 SAME_PERSON_COS_DIST = 0.5
-MIN_SAMPLES = 1  # one face is enough to be a cluster; otherwise everything's "noise"
+# A person needs at least two corroborating detections to form a cluster.
+# At MIN_SAMPLES=1 every isolated/rogue side-of-head detection became its
+# own "person" (DBSCAN never emits noise when min_samples==1), defeating
+# the noise-rejection this module's docstring promises. At 2, singletons
+# fall to the -1 noise label and are dropped from the per-frame results.
+MIN_SAMPLES = 2
 
 
 def insightface_available() -> bool:
@@ -51,26 +56,49 @@ def insightface_available() -> bool:
         return False
 
 
+# ONNXRuntime execution providers, most-to-least preferred. insightface
+# probes this list in order and silently skips any provider whose shared
+# libs aren't installed, so listing CUDA + CoreML first lets the GPU path
+# light up on an NVIDIA box or Apple Silicon while CPU stays the universal
+# fallback. ctx_id=0 below targets the first GPU when one is selected.
+_FACE_PROVIDERS = [
+    "CUDAExecutionProvider",
+    "CoreMLExecutionProvider",
+    "CPUExecutionProvider",
+]
+
+
 @lru_cache(maxsize=1)
 def _app():
     """Load the buffalo_l detector + recogniser once per process.
 
     First call downloads ~280 MB of model weights from the insightface
     GitHub release if they aren't already on disk. Subsequent calls
-    return the cached app. We force CPU here because the user's box
-    has 4 GB GPU shared with CLIP; insightface is fast enough on CPU
-    (~80 ms per 1024 px preview on a modern laptop).
+    return the cached app. We offer CUDA → CoreML → CPU providers and let
+    onnxruntime pick the first one whose libraries are present, so the
+    detector rides the GPU on machines that have one and still works
+    everywhere via the CPU fallback.
     """
     try:
         from insightface.app import FaceAnalysis
     except ImportError:
         return None
-    app = FaceAnalysis(
-        name="buffalo_l",
-        allowed_modules=["detection", "recognition"],
-        providers=["CPUExecutionProvider"],
-    )
-    app.prepare(ctx_id=-1, det_size=(640, 640))
+    try:
+        app = FaceAnalysis(
+            name="buffalo_l",
+            allowed_modules=["detection", "recognition"],
+            providers=list(_FACE_PROVIDERS),
+        )
+    except Exception as e:  # provider negotiation can raise on odd ORT builds
+        log.warning("FaceAnalysis init with GPU providers failed (%s); CPU only", e)
+        app = FaceAnalysis(
+            name="buffalo_l",
+            allowed_modules=["detection", "recognition"],
+            providers=["CPUExecutionProvider"],
+        )
+    # ctx_id=0 uses the first GPU if a GPU provider was selected; onnxruntime
+    # ignores it for the CPU provider, so this is safe in all three cases.
+    app.prepare(ctx_id=0, det_size=(640, 640))
     return app
 
 

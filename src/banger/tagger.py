@@ -22,15 +22,33 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from banger import (
-    aesthetic, dedup, eyes as eyes_mod, face, face_id as face_id_mod,
-    library, scene_kmeans, state, tags as tags_mod, taste_head,
+    aesthetic,
+    dedup,
+    face,
+    library,
+    scene_kmeans,
+    state,
+    taste_head,
+)
+from banger import (
+    face_id as face_id_mod,
+)
+from banger import (
+    tags as tags_mod,
 )
 from banger.preview import load_preview
 
 log = logging.getLogger("banger.tagger")
+
+# Frames are streamed from the library one page at a time so memory stays
+# bounded regardless of library size (the old code accumulated every frame
+# into one RAM list, silently capped at 100k). Within a page, CLIP previews
+# are encoded in batches — the dominant scale win over one-image-at-a-time.
+_PAGE_SIZE = 512
+_CLIP_BATCH = 32
 
 
 @dataclass
@@ -65,7 +83,7 @@ def status() -> TaggerProgress:
     return _progress
 
 
-def _tag_one(sha: str, src_path, full: bool = False) -> dict:
+def _tag_one(sha: str, src_path, full: bool = False, *, emb=None, preview=None) -> dict:
     """Enrich one frame. Returns a dict of what was newly computed.
 
     Keys: embedded, tagged, faces, scored, scene. Each True only when that
@@ -75,6 +93,12 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
     and taste head scoring on top of the default tags-only pass. The full
     pass is slow (~1s/frame for insightface) but means later cull/sort
     operations don't need to touch the original file at all.
+
+    `emb` / `preview` are optional pre-computed inputs. `_run` encodes CLIP
+    embeddings in batches (the big scale win) and hands the resulting vector
+    plus the already-decoded preview here so we don't re-embed or re-decode
+    per frame. When both are None this falls back to the old single-frame
+    path (still used by any direct caller / tests), embedding inline.
     """
     from pathlib import Path
     # Library passes abs_path as a string; load_preview wants Path so the
@@ -83,7 +107,10 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
     # 1000 frames never actually get faces extracted.
     src_path = Path(src_path) if not isinstance(src_path, Path) else src_path
     meta = state.load_frame_metadata(sha) or {}
-    have_emb = state.load_embedding(sha) is not None
+    # Single read of the cached embedding (was loaded twice before). `emb`
+    # supplied by the batch path counts as "have it" without touching disk.
+    cached_emb = None if emb is not None else state.load_embedding(sha)
+    have_emb = emb is not None or cached_emb is not None
     have_tags = bool(meta.get("tags"))
     have_faces = "face_detections" in meta
     have_score = "taste_score" in meta
@@ -93,16 +120,22 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
         return {}
 
     out = {"embedded": False, "tagged": False, "faces": False, "scored": False, "scene": False}
-    preview = None
 
-    if have_emb:
-        emb = state.load_embedding(sha)
+    if emb is not None:
+        # Freshly batch-encoded by _run; persist it and record the win. The
+        # caller passes the matching preview so the side-cache below is free.
+        state.cache_embedding(sha, emb)
+        out["embedded"] = True
+    elif cached_emb is not None:
+        emb = cached_emb
     else:
-        try:
-            preview = load_preview(src_path)
-        except Exception as e:
-            log.warning("tagger: preview fail %s: %s", src_path, e)
-            return out
+        # Fallback single-frame path (no batch driver / direct caller).
+        if preview is None:
+            try:
+                preview = load_preview(src_path)
+            except Exception as e:
+                log.warning("tagger: preview fail %s: %s", src_path, e)
+                return out
         try:
             emb = aesthetic.encode_image(preview)
             state.cache_embedding(sha, emb)
@@ -110,6 +143,11 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
         except Exception as e:
             log.warning("tagger: embed fail %s: %s", src_path, e)
             return out
+
+    # Side-cache (sharpness / phash / timestamp / face) belongs with a fresh
+    # embedding: it's the first time we've decoded this frame's pixels. Runs
+    # whenever we just embedded (batch or fallback) and have the preview.
+    if out["embedded"] and preview is not None:
         try:
             from banger.sharpness import sharpness_from_preview
             sharp = sharpness_from_preview(preview)
@@ -176,6 +214,101 @@ def _tag_one(sha: str, src_path, full: bool = False) -> dict:
     return out
 
 
+def _needs_embedding(sha: str, full: bool) -> tuple[bool, bool]:
+    """Cheap pre-check for one frame, mirroring _tag_one's skip logic.
+
+    Returns (do_work, want_embed):
+      do_work    - any enrichment is still missing (False => fully cached)
+      want_embed - no .npy cached yet, so this frame needs a CLIP forward pass
+
+    Lets _run decide which previews to decode + batch-encode without paying
+    the per-frame embed cost itself.
+    """
+    meta = state.load_frame_metadata(sha) or {}
+    have_emb = state.load_embedding(sha) is not None
+    have_tags = bool(meta.get("tags"))
+    if full:
+        fully = have_emb and have_tags and (
+            "face_detections" in meta and "taste_score" in meta and "scene_cluster" in meta
+        )
+    else:
+        fully = have_emb and have_tags
+    return (not fully, not have_emb)
+
+
+def _process_page(frames: list[tuple[str, str]], full: bool, p: TaggerProgress) -> None:
+    """Embed (in batches) + enrich one page of (sha, abs_path) frames.
+
+    Frames already fully cached are counted as skipped without decoding.
+    Frames missing only their embedding have their previews decoded and
+    encoded together via aesthetic.encode_images_batch, then each frame is
+    enriched with its in-hand embedding + preview so nothing is re-read.
+    """
+    from pathlib import Path
+
+    # Phase 1: triage. Build the batch of previews to embed in one shot.
+    batch_previews: list = []
+    batch_idx: list[int] = []        # index into `frames` for each batched preview
+    page_emb: dict[int, object] = {}      # frame index -> fresh embedding
+    page_preview: dict[int, object] = {}  # frame index -> decoded preview
+    skip_idx: set[int] = set()
+
+    for i, (sha, abs_path) in enumerate(frames):
+        do_work, want_embed = _needs_embedding(sha, full)
+        if not do_work:
+            skip_idx.add(i)
+            continue
+        if want_embed:
+            try:
+                preview = load_preview(Path(abs_path))
+            except Exception as e:
+                log.warning("tagger: preview fail %s: %s", abs_path, e)
+                skip_idx.add(i)
+                continue
+            page_preview[i] = preview
+            batch_previews.append(preview)
+            batch_idx.append(i)
+
+    # Phase 2: one batched CLIP forward pass for every preview in the page.
+    if batch_previews:
+        try:
+            embs = aesthetic.encode_images_batch(batch_previews, batch_size=_CLIP_BATCH)
+            for j, idx in enumerate(batch_idx):
+                page_emb[idx] = embs[j]
+        except Exception as e:
+            # Batch failed wholesale; fall back to per-frame embedding inside
+            # _tag_one (preview already decoded, so no double read).
+            log.warning("tagger: batch embed fail (%d frames): %s", len(batch_previews), e)
+
+    # Phase 3: per-frame enrichment, feeding the batched embedding + preview.
+    for i, (sha, abs_path) in enumerate(frames):
+        p.current = abs_path
+        p.processed += 1
+        if i in skip_idx:
+            p.skipped += 1
+            continue
+        try:
+            r = _tag_one(
+                sha, abs_path, full=full,
+                emb=page_emb.get(i), preview=page_preview.get(i),
+            )
+        except Exception as e_:
+            log.warning("tagger: skip %s: %s", abs_path, e_)
+            p.skipped += 1
+            continue
+        if not any(r.values()):
+            p.skipped += 1
+            continue
+        if r.get("embedded"):
+            p.embedded += 1
+        if r.get("tagged"):
+            p.tagged += 1
+        if r.get("faces"):
+            p.faces_done += 1
+        if r.get("scored"):
+            p.scored += 1
+
+
 def _run(full: bool = False) -> None:
     p = _progress
     p.phase = "running"
@@ -189,33 +322,25 @@ def _run(full: bool = False) -> None:
     p.skipped = 0
     p.error = None
     try:
-        # Pull every frame from every root. We could batch by root for
-        # better progress granularity but a single list is simpler.
+        # Stream frames root-by-root in fixed-size pages. count_frames gives
+        # the up-front total for progress; query_frames(offset=...) walks each
+        # root without ever holding more than one page in RAM. (The old code
+        # built one giant list capped at 100k, truncating bigger libraries.)
         roots = library.all_roots()
-        all_frames: list[tuple[str, str]] = []
-        for r in roots:
-            rows = library.query_frames(root_id=r.id, limit=100_000, offset=0)
-            for row in rows:
-                all_frames.append((row.sha, row.abs_path))
-        p.total = len(all_frames)
+        p.total = sum(library.count_frames(root_id=r.id) for r in roots)
         log.info("tagger: starting over %d frames across %d roots", p.total, len(roots))
 
-        for sha, abs_path in all_frames:
-            p.current = abs_path
-            p.processed += 1
-            try:
-                r = _tag_one(sha, abs_path, full=full)
-            except Exception as e_:
-                log.warning("tagger: skip %s: %s", abs_path, e_)
-                p.skipped += 1
-                continue
-            if not any(r.values()):
-                p.skipped += 1
-                continue
-            if r.get("embedded"): p.embedded += 1
-            if r.get("tagged"): p.tagged += 1
-            if r.get("faces"): p.faces_done += 1
-            if r.get("scored"): p.scored += 1
+        for r in roots:
+            offset = 0
+            while True:
+                rows = library.query_frames(root_id=r.id, limit=_PAGE_SIZE, offset=offset)
+                if not rows:
+                    break
+                page = [(row.sha, row.abs_path) for row in rows]
+                _process_page(page, full, p)
+                if len(rows) < _PAGE_SIZE:
+                    break
+                offset += _PAGE_SIZE
 
         # Full pass implies the user wants every signal computed. Cluster
         # face embeddings into named-or-anonymous people so the library shows

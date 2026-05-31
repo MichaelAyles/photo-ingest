@@ -64,16 +64,43 @@ def select_diverse_top_n(
     pool.sort(key=lambda it: -it[3])
     selected = [pool.pop(0)]
 
+    if not pool or len(selected) >= n:
+        return [(payload, score, emb) for payload, score, emb, _ in selected]
+
+    # Vectorized MMR. The original recomputed max-cosine-to-selected with a
+    # Python double loop on every pick (O(n*|pool|*d)); instead we stack the
+    # remaining pool once and keep a running per-candidate max-similarity
+    # vector, extending it with np.maximum against each newly selected
+    # embedding. Results are byte-identical because we use the same float
+    # dot products, the same `mmr > best_mmr` (strict, lowest-index-wins)
+    # tie-break (np.argmax returns the first maximum), and remove the chosen
+    # row from the pool exactly as pool.pop(best_idx) did.
+    pool_emb = np.stack([emb for _, _, emb, _ in pool])  # (P, d), pre-stacked once
+    pool_ns = np.array([ns for _, _, _, ns in pool], dtype=np.float64)  # (P,)
+    # The original did the dot products and MMR arithmetic in Python float
+    # (float64); the dot products themselves come from `float(emb @ s_emb)`.
+    # We keep similarities and MMR in float64 so argmax sees identical values
+    # and the selection matches the old loop byte-for-byte. Each row dot is
+    # cast to float to mirror `float(...)` on the per-pair products.
+    first_emb = selected[0][2]
+    max_sim = (pool_emb @ first_emb).astype(np.float64)  # (P,)
+
     while len(selected) < n and pool:
-        best_mmr = -float("inf")
-        best_idx = 0
-        for i, (_, _, emb, ns) in enumerate(pool):
-            max_sim = max(float(emb @ s_emb) for _, _, s_emb, _ in selected)
-            mmr = diversity_lambda * ns - (1.0 - diversity_lambda) * max_sim
-            if mmr > best_mmr:
-                best_mmr = mmr
-                best_idx = i
-        selected.append(pool.pop(best_idx))
+        mmr = diversity_lambda * pool_ns - (1.0 - diversity_lambda) * max_sim
+        best_idx = int(np.argmax(mmr))  # first maximum == lowest index, matches the loop
+        selected.append(pool[best_idx])
+
+        # Remove the chosen candidate from every parallel structure.
+        chosen_emb = pool_emb[best_idx]
+        pool.pop(best_idx)
+        keep = np.arange(pool_emb.shape[0]) != best_idx
+        pool_emb = pool_emb[keep]
+        pool_ns = pool_ns[keep]
+        max_sim = max_sim[keep]
+        if pool_emb.shape[0] == 0:
+            break
+        # Fold the newly selected embedding into the running max-similarity.
+        max_sim = np.maximum(max_sim, (pool_emb @ chosen_emb).astype(np.float64))
 
     return [(payload, score, emb) for payload, score, emb, _ in selected]
 

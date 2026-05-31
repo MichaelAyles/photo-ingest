@@ -69,6 +69,9 @@ class SceneMatch:
 @lru_cache(maxsize=1)
 def _encoded_prompts() -> torch.Tensor:
     """Cache the CLIP text embeddings for SCENE_PROMPTS — one CLIP forward total."""
+    # `device` is chosen by banger.aesthetic._pick_device (cuda → mps → cpu,
+    # honoring BANGER_AESTHETIC_DEVICE). Reusing the shared CLIP load keeps
+    # scene classification on the same accelerator as aesthetic scoring.
     model, processor, device, _, _ = _load_clip_internals()
     with torch.inference_mode():
         text_inputs = processor(text=SCENE_PROMPTS, return_tensors="pt", padding=True)

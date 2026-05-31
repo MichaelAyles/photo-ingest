@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install ruff
+      - name: Ruff
+        run: ruff check src tests
+
+  test:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The audit found a torch+sklearn OpenMP segfault without these.
+      OMP_NUM_THREADS: "1"
+      KMP_DUPLICATE_LIB_OK: "TRUE"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies (CPU torch, constraint-pinned)
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch wheels keep CI fast and avoid CUDA on the runners.
+          pip install -c constraints.txt -e ".[dev]" \
+            opencv-python scikit-learn joblib imagehash \
+            reverse_geocoder transformers torch
+      - name: Run tests
+        run: pytest -q

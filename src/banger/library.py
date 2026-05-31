@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from banger import state
-from banger.frames import discover_frames
+from banger.frames import Frame, discover_frames
 from banger.preview import JPEG_SUFFIXES, RAW_SUFFIXES
 
 log = logging.getLogger("banger.library")
@@ -312,6 +312,66 @@ def _extract_camera_and_date(path: Path) -> tuple[
     return model, date_taken, lat, lon, city, region, country
 
 
+def _discover_frames_resilient(root_path: Path) -> list[Frame]:
+    """Recursively discover frames under root_path, tolerating unreadable
+    subdirectories.
+
+    frames.discover_frames() walks the whole tree with a single rglob("*").
+    rglob is lazy: a single PermissionError / OSError on one unreadable
+    subdirectory raises mid-iteration and aborts the entire walk, so one
+    locked folder would lose the index for every sibling. frames.py is out of
+    scope to change, so we do our own os.walk-based discovery here that skips
+    the offending entry and keeps going, then fall back to the canonical
+    discover_frames() only if our resilient walk turns up nothing (e.g. an
+    environment where os.walk behaves differently).
+    """
+    import os
+
+    by_key: dict[tuple[str, str], dict[str, Path]] = {}
+    found_any = False
+    # onerror gets the OSError raised while scandir-ing a directory; log+skip.
+    def _on_walk_error(err: OSError) -> None:
+        log.warning("scan: skipping unreadable path %s: %s", getattr(err, "filename", "?"), err)
+
+    for dirpath, _dirnames, filenames in os.walk(root_path, onerror=_on_walk_error):
+        for name in filenames:
+            try:
+                p = Path(dirpath) / name
+                suffix = p.suffix
+                if suffix in JPEG_SUFFIXES:
+                    kind = "jpeg"
+                elif suffix in RAW_SUFFIXES:
+                    kind = "raw"
+                else:
+                    continue
+                if not p.is_file():
+                    continue
+                rel_parent = p.parent.relative_to(root_path)
+                subdir = "" if rel_parent == Path(".") else str(rel_parent).replace("\\", "/")
+                by_key.setdefault((subdir, p.stem), {})[kind] = p
+                found_any = True
+            except (OSError, PermissionError, ValueError) as e:
+                # A single bad dirent (stat fails, vanished mid-walk, symlink
+                # loop, etc.) must not abort indexing the rest of the tree.
+                log.warning("scan: skipping unreadable entry %s/%s: %s", dirpath, name, e)
+                continue
+
+    if not found_any:
+        # Nothing readable via os.walk; defer to the canonical implementation
+        # so behaviour matches discover_frames() on a normal (or empty) tree.
+        try:
+            return discover_frames(root_path, recursive=True)
+        except (OSError, PermissionError) as e:
+            log.warning("scan: discover_frames fallback failed for %s: %s", root_path, e)
+            return []
+
+    frames = [
+        Frame(stem=stem, subdir=subdir, jpeg=files.get("jpeg"), raw=files.get("raw"))
+        for (subdir, stem), files in by_key.items()
+    ]
+    return sorted(frames, key=lambda f: (f.subdir, f.stem))
+
+
 def scan_root(root_id: int, progress: ScanProgress | None = None) -> ScanProgress:
     """Incrementally index every photo under the root.
 
@@ -336,7 +396,9 @@ def scan_root(root_id: int, progress: ScanProgress | None = None) -> ScanProgres
 
     try:
         root_path = Path(root.path)
-        frames = discover_frames(root_path, recursive=True)
+        # Resilient walk: one unreadable subdir (PermissionError) must not abort
+        # indexing the rest of the tree. discover_frames()'s single rglob would.
+        frames = _discover_frames_resilient(root_path)
         progress.discovered = len(frames)
         progress.total = len(frames)
 
@@ -467,19 +529,24 @@ class LibraryFrame:
         }
 
 
-def query_frames(
+def _frame_filter_sql(
     root_id: int | None = None,
     subdir: str | None = None,
     camera: str | None = None,
     after: int | None = None,
     before: int | None = None,
-    limit: int = 500,
-    offset: int = 0,
-) -> list[LibraryFrame]:
-    """Return library frames matching the filters. SQL-side filtering only;
-    face/tag/rating filtering happens in the API layer because those live
-    outside this DB (in metadata/<sha>.json and labels.db)."""
-    clauses = []
+    place: str | None = None,
+    q: str | None = None,
+) -> tuple[str, list]:
+    """Build the shared WHERE clause + params for the SQL-expressible frame
+    filters. query_frames and count_frames both go through here so a page and
+    its total count always agree on what "matching" means.
+
+    Only filters that map cleanly to indexed SQL columns live here. Face / tag
+    / rating filtering stays in the API layer (it reads metadata/<sha>.json and
+    labels.db, which aren't in this DB).
+    """
+    clauses: list[str] = []
     params: list = []
     if root_id is not None:
         clauses.append("frames.root_id=?")
@@ -498,7 +565,49 @@ def query_frames(
     if before is not None:
         clauses.append("frames.taken_at <= ?")
         params.append(before)
+    if place is not None:
+        # Exact city match, mirroring the API layer's r.place_city == place.
+        clauses.append("frames.place_city=?")
+        params.append(place)
+    if q is not None:
+        # Text search over the SQL-resident columns only (stem, rel_path,
+        # camera, place). Tag text lives outside this DB so it can't be matched
+        # here; the API layer widens the search to tags over the returned page.
+        needle = f"%{q.lower()}%"
+        clauses.append(
+            "(LOWER(frames.stem) LIKE ? OR LOWER(frames.rel_path) LIKE ? "
+            "OR LOWER(COALESCE(frames.camera_model, '')) LIKE ? "
+            "OR LOWER(COALESCE(frames.place_city, '')) LIKE ? "
+            "OR LOWER(COALESCE(frames.place_region, '')) LIKE ? "
+            "OR LOWER(COALESCE(frames.place_country, '')) LIKE ?)"
+        )
+        params.extend([needle] * 6)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def query_frames(
+    root_id: int | None = None,
+    subdir: str | None = None,
+    camera: str | None = None,
+    after: int | None = None,
+    before: int | None = None,
+    limit: int = 500,
+    offset: int = 0,
+    place: str | None = None,
+    q: str | None = None,
+) -> list[LibraryFrame]:
+    """Return library frames matching the filters. SQL-side filtering only;
+    face/tag/rating filtering happens in the API layer because those live
+    outside this DB (in metadata/<sha>.json and labels.db).
+
+    `offset` applies as a SQL OFFSET after ORDER BY / LIMIT, so callers can
+    page through results. `place` / `q` are optional SQL-expressible filters
+    (additive; existing callers that don't pass them get identical results)."""
+    where, params = _frame_filter_sql(
+        root_id=root_id, subdir=subdir, camera=camera,
+        after=after, before=before, place=place, q=q,
+    )
 
     sql = (
         "SELECT frames.sha, frames.root_id, roots.label, frames.rel_path, "
@@ -527,12 +636,24 @@ def query_frames(
     return out
 
 
-def count_frames(root_id: int | None = None) -> int:
-    sql = "SELECT COUNT(*) FROM frames"
-    params: list = []
-    if root_id is not None:
-        sql += " WHERE root_id=?"
-        params.append(root_id)
+def count_frames(
+    root_id: int | None = None,
+    subdir: str | None = None,
+    camera: str | None = None,
+    after: int | None = None,
+    before: int | None = None,
+    place: str | None = None,
+    q: str | None = None,
+) -> int:
+    """Total number of frames matching the same SQL-expressible filters
+    query_frames accepts (no limit/offset). gui + tagger call this to size
+    pagination. Passing only root_id (or nothing) preserves the old behaviour
+    of this function."""
+    where, params = _frame_filter_sql(
+        root_id=root_id, subdir=subdir, camera=camera,
+        after=after, before=before, place=place, q=q,
+    )
+    sql = f"SELECT COUNT(*) FROM frames {where}".rstrip()
     with _conn() as conn:
         return int(conn.execute(sql, params).fetchone()[0])
 
@@ -559,10 +680,23 @@ def places() -> list[tuple[str, int]]:
     return [(p, int(c)) for p, c in rows]
 
 
+# How many row UPDATEs to accumulate before a commit in the backfill loops.
+# Batching trades a slightly larger window of un-fsync'd work for far fewer
+# fsyncs (WAL synchronous=NORMAL): a kill loses at most the current uncommitted
+# chunk, and because both backfills only re-select rows still missing the data
+# they write, a re-run simply resumes from where the kill left off.
+_BACKFILL_BATCH = 200
+
+
 def backfill_gps() -> int:
     """Walk every frame with no GPS data, re-read EXIF, persist any GPS+place
     we find. Lets a library indexed before geotag-aware scan catch up
-    without re-hashing every file. Returns the count updated."""
+    without re-hashing every file. Returns the count updated.
+
+    Batched: a single connection commits every _BACKFILL_BATCH updates instead
+    of opening a fresh connection + transaction per row. Resumable and
+    idempotent -- it only selects frames that still have lat IS NULL, so a
+    re-run after a mid-loop kill picks up exactly the unprocessed remainder."""
     with _conn() as conn:
         rows = conn.execute(
             "SELECT frames.sha, roots.path, frames.rel_path "
@@ -570,20 +704,30 @@ def backfill_gps() -> int:
             "WHERE frames.lat IS NULL"
         ).fetchall()
     n = 0
-    for sha, root_path, rel in rows:
-        src = Path(root_path) / rel
-        if not src.exists():
-            continue
-        _, _, lat, lon, city, region, country = _extract_camera_and_date(src)
-        if lat is None and lon is None:
-            continue
-        with _conn() as conn:
+    pending = 0
+    conn = _conn()
+    try:
+        for sha, root_path, rel in rows:
+            src = Path(root_path) / rel
+            if not src.exists():
+                continue
+            _, _, lat, lon, city, region, country = _extract_camera_and_date(src)
+            if lat is None and lon is None:
+                continue
             conn.execute(
                 "UPDATE frames SET lat=?, lon=?, place_city=?, "
                 "place_region=?, place_country=? WHERE sha=?",
                 (lat, lon, city, region, country, sha),
             )
-        n += 1
+            n += 1
+            pending += 1
+            if pending >= _BACKFILL_BATCH:
+                conn.commit()
+                pending = 0
+        if pending:
+            conn.commit()
+    finally:
+        conn.close()
     return n
 
 
@@ -591,24 +735,39 @@ def reverse_geocode_unreferenced() -> int:
     """Backfill place_city / region / country for frames that have lat/lon but
     no place data. Returns the count updated. Cheap to call after the
     reverse_geocoder package becomes available (the user installs it after
-    a scan)."""
+    a scan).
+
+    Batched: a single connection commits every _BACKFILL_BATCH updates.
+    Resumable and idempotent -- it only selects frames that still have
+    place_city IS NULL, so a re-run after a mid-loop kill resumes from the
+    unprocessed remainder."""
     with _conn() as conn:
         rows = conn.execute(
             "SELECT sha, lat, lon FROM frames "
             "WHERE lat IS NOT NULL AND lon IS NOT NULL AND place_city IS NULL"
         ).fetchall()
     n = 0
-    for sha, lat, lon in rows:
-        city, region, country = _maybe_reverse_geocode(lat, lon)
-        if city is None:
-            continue
-        with _conn() as conn:
+    pending = 0
+    conn = _conn()
+    try:
+        for sha, lat, lon in rows:
+            city, region, country = _maybe_reverse_geocode(lat, lon)
+            if city is None:
+                continue
             conn.execute(
                 "UPDATE frames SET place_city=?, place_region=?, place_country=? "
                 "WHERE sha=?",
                 (city, region, country, sha),
             )
-        n += 1
+            n += 1
+            pending += 1
+            if pending >= _BACKFILL_BATCH:
+                conn.commit()
+                pending = 0
+        if pending:
+            conn.commit()
+    finally:
+        conn.close()
     return n
 
 

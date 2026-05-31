@@ -21,8 +21,16 @@ DEFAULTS: dict[str, Any] = {
     "strategy": "kmeans",
     "mmr_diversity": 0.5,
     "tag_min_sim": 0.22,
-    "face_gate": False,
-    "eye_gate": False,
+    # Cull gates ship ON: a culler that ships with blink/soft-face detection
+    # disabled fails basic expectations. These no-op gracefully when
+    # mediapipe/insightface are absent (see face/eye gate impls).
+    "face_gate": True,
+    "eye_gate": True,
+    # Burst / near-duplicate dedup knobs (defaults mirror dedup.py constants).
+    "dedup_enabled": True,
+    "dedup_hamming": 6,
+    "dedup_time_window": 3.0,
+    "eye_ear_threshold": 0.21,
 }
 
 FIELD_META: dict[str, dict[str, Any]] = {
@@ -66,6 +74,26 @@ FIELD_META: dict[str, dict[str, Any]] = {
         "label": "Eye gate",
         "type": "bool",
         "info": "Reject frames where someone's eyes appear closed (Eye Aspect Ratio below threshold). Requires mediapipe. No-op if mediapipe isn't installed.",
+    },
+    "dedup_enabled": {
+        "label": "Dedup bursts",
+        "type": "bool",
+        "info": "Group near-duplicate frames (bursts) and keep only the best of each. Turn off to score and surface every frame independently.",
+    },
+    "dedup_hamming": {
+        "label": "Dedup Hamming distance",
+        "min": 0, "max": 32, "step": 1, "type": "number",
+        "info": "perceptual-hash Hamming distance for near-duplicate grouping; lower = stricter",
+    },
+    "dedup_time_window": {
+        "label": "Dedup time window (s)",
+        "min": 0, "max": 30, "step": 0.5, "type": "number",
+        "info": "max time gap to treat frames as a burst",
+    },
+    "eye_ear_threshold": {
+        "label": "Eye-aspect-ratio threshold",
+        "min": 0.05, "max": 0.4, "step": 0.01, "type": "number",
+        "info": "eye-aspect-ratio below which an eye counts as closed",
     },
 }
 
